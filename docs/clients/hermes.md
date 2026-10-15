@@ -104,6 +104,14 @@ The plugin supports Intaris's behavioral analysis pipeline:
 
 ## Session Recording
 
+In-process Hermes profiles have separate config/client snapshots, sessions,
+MCP tools/caches, and recording timers. Configure non-secret per-profile values
+under `plugins.entries.intaris.settings`; these override scoped env values.
+Keep `INTARIS_API_KEY` in Hermes' profile credentials. The adapter reads Hermes'
+secret scope and keeps env-only single-profile behavior. Current Hermes also
+requires `tools.override` or `allow_tool_override: true` to wrap built-ins.
+See [profile configuration and precedence](../../integrations/hermes/README.md#profiles-in-one-process).
+
 When `INTARIS_SESSION_RECORDING=true`, the plugin buffers events in-memory per session and flushes them in batches:
 
 - **Buffer size**: `INTARIS_RECORDING_FLUSH_SIZE` events (default: 50) triggers a flush

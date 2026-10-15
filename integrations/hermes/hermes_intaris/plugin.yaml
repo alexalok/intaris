@@ -6,6 +6,22 @@ description: >-
   evaluation guards, forwards reasoning context, manages sessions, and
   optionally proxies MCP tools.
 author: Filip Pytloun
+capabilities:
+  - tools.override
+config_schema:
+  url: {type: str, description: "Intaris server URL"}
+  api_key: {type: secret, env: INTARIS_API_KEY, description: "Intaris API key"}
+  user_id: {type: str, description: "Tenant identity when the API key is not user-bound"}
+  agent_id: {type: str, description: "Optional agent metadata"}
+  allow_paths: {type: str, description: "Comma-separated allowed parent directories"}
+  fail_open: {type: bool, description: "Allow calls when Intaris is unreachable"}
+  escalation_timeout: {type: float, description: "Approval wait timeout in seconds; 0 is unlimited"}
+  checkpoint_interval: {type: int, description: "Tool calls between checkpoints; 0 disables"}
+  session_recording: {type: bool, description: "Record messages, tool arguments, and results"}
+  recording_flush_size: {type: int, description: "Events per recording batch"}
+  recording_flush_interval: {type: float, description: "Recording flush interval in seconds"}
+  mcp_tools: {type: bool, description: "Expose this profile's authenticated Intaris MCP tools"}
+  mcp_tools_cache_ttl_s: {type: float, description: "MCP tool cache lifetime in seconds"}
 provides_hooks:
   - pre_tool_call
   - post_tool_call

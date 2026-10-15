@@ -45,6 +45,57 @@ export INTARIS_API_KEY=your-api-key
 export INTARIS_URL=http://localhost:8060  # default
 ```
 
+Enable the plugin in the profile's `config.yaml`. Current Hermes requires the
+`tools.override` capability to wrap built-in tools; the supported legacy grant
+is also accepted:
+
+```yaml
+plugins:
+  enabled: [intaris]
+  entries:
+    intaris:
+      allow_tool_override: true
+      settings:
+        url: https://intaris.example.com
+        user_id: work
+        agent_id: hermes-work
+        allow_paths: ~/work
+        mcp_tools: true
+        session_recording: false
+```
+
+### Profiles in one process
+
+Each resolved Hermes home owns its config snapshot, HTTP client, sessions,
+authenticated MCP cache and tool registrations, recording buffers, and timer.
+Identical Hermes session IDs in different profiles create distinct Intaris
+sessions. Loading another profile cannot redirect existing callbacks. Unloading
+or reloading a profile cancels its timer and releases its registrations; an
+already-running flush retains its original client.
+
+Non-secret options can be set under `plugins.entries.intaris.settings`, using
+the environment variable name below without `INTARIS_`, in lowercase (for
+example, `escalation_timeout`, `session_recording`, `mcp_tools_cache_ttl_s`).
+Precedence is **explicit plugin setting → Hermes profile-scoped env value →
+built-in default**. Explicit `false`, `0`, and empty strings override defaults.
+Hermes' `ctx.get_config()` also supports its legacy `config` subtree. Config is
+captured at registration; use Hermes' plugin reload to apply changes.
+
+Store `INTARIS_API_KEY` through Hermes' profile credentials or Desktop secret
+field, not in YAML. The adapter uses `agent.secret_scope.get_secret()` for env
+and credential lookup, preserving Hermes' fail-closed behavior when a required
+secret scope is missing. It never reads credential files or changes
+`os.environ`. Single-profile process-env configuration still works. Merely
+changing `HERMES_HOME` does not load credentials: embedded hosts must install
+the matching Hermes secret scope and propagate context to workers, as Hermes
+does. Process env is shared, so use profile settings/scopes for distinct values.
+
+Multiple profiles require Hermes' scoped tool registry. Older global-only
+registries retain single-profile support and reject a second profile instead
+of sharing guards or authenticated MCP tools. A handler called with a foreign
+or unloaded profile is blocked even when fail-open is enabled. Hooks and timer
+callbacks remain bound to their originating manager.
+
 ### Configuration Options
 
 | Env Var | Default | Description |
@@ -52,6 +103,7 @@ export INTARIS_URL=http://localhost:8060  # default
 | `INTARIS_URL` | `http://localhost:8060` | Intaris server URL |
 | `INTARIS_API_KEY` | (required) | API key for authentication |
 | `INTARIS_USER_ID` | (empty) | User ID (optional if API key maps to user) |
+| `INTARIS_AGENT_ID` | (empty) | Optional agent metadata |
 | `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable |
 | `INTARIS_ALLOW_PATHS` | (empty) | Comma-separated parent directories for policy allow_paths |
 | `INTARIS_ESCALATION_TIMEOUT` | `0` | Max seconds to wait for escalation (0 = no timeout) |
@@ -87,11 +139,32 @@ This works because Hermes plugins load **after** built-in tools, and the tool re
 
 When `INTARIS_MCP_TOOLS=true` (default), the plugin fetches MCP tools from Intaris and registers them as native Hermes tools. These tools proxy execution through `POST /api/v1/mcp/call` with full safety evaluation server-side.
 
+## Tests
+
+From the Intaris repository root:
+
+```bash
+PYTHONPATH=integrations/hermes uv run pytest integrations/hermes/tests -q
+HERMES_SOURCE=/path/to/hermes-agent PYTHONPATH=integrations/hermes uv run pytest integrations/hermes/tests -q
+```
+
+The first command uses controlled Hermes boundary doubles and no network. The
+second additionally exercises Hermes' real profile/secret contexts, worker
+context propagation, tool registry, plugin settings, managers, hooks, and unload
+handles. It requires an environment that can import that checkout's
+`hermes_cli.plugins`. All HTTP responses and profile credentials are synthetic;
+no live Hermes service or real credential files are used.
+
 ## Risks and Caveats
 
-### Registry internal access
+### Registry compatibility
 
-The plugin accesses `registry._tools` (a private attribute of Hermes's `ToolRegistry`) to enumerate and wrap existing tool handlers. While this is a stable internal API used by Hermes's own `model_tools.py`, it is not part of the public plugin contract and could change in future Hermes versions. The public `registry.register()` method is used for re-registration.
+Current Hermes is enumerated through `registry.get_all_entries()` and wrapped
+through `ctx.register_tool(override=True)`, preserving profile overlays and host
+unload tracking. The host must grant `tools.override` (or
+`allow_tool_override: true`); the adapter does not bypass that check. Legacy
+global-only versions use `registry._tools` and `registry.register()` for one
+profile. Tool discovery after registration still depends on Hermes load order.
 
 ### Latency on every tool call
 

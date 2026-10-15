@@ -22,10 +22,11 @@ Flow:
   6. post_llm_call: Captures assistant response for reasoning context
   7. on_session_end: Signals session completion to Intaris
 
-Configuration via environment variables:
+Configuration via profile-scoped Hermes env/credentials and plugin settings:
   INTARIS_URL                      - Intaris server URL (default: http://localhost:8060)
   INTARIS_API_KEY                  - API key for authentication (required)
   INTARIS_USER_ID                  - User ID (optional if API key maps to user)
+  INTARIS_AGENT_ID                 - Agent metadata (optional)
   INTARIS_FAIL_OPEN                - Allow tool calls if Intaris is unreachable (default: false)
   INTARIS_ALLOW_PATHS              - Comma-separated parent directories for policy allow_paths
   INTARIS_ESCALATION_TIMEOUT       - Max seconds to wait for escalation (default: 0 = no timeout)
@@ -39,13 +40,15 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable
 
@@ -65,8 +68,20 @@ MAX_RECENT_TOOLS = 10
 # ============================================================================
 
 
+def _profile_env(name: str, default: str) -> str:
+    """Read Hermes' installed secret/env scope without opening credential files."""
+    try:
+        from agent.secret_scope import get_secret
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("agent", "agent.secret_scope"):
+            raise
+        # Older Hermes and standalone env-only installations.
+        return os.environ.get(name, default)
+    return get_secret(name, default)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
-    return os.environ.get(name, str(default)).strip().lower() in (
+    return _profile_env(name, str(default)).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -76,23 +91,24 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(os.environ.get(name, str(default)))
+        return int(_profile_env(name, str(default)))
     except (ValueError, TypeError):
         return default
 
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.environ.get(name, str(default)))
+        return float(_profile_env(name, str(default)))
     except (ValueError, TypeError):
         return default
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
     url: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     user_id: str = ""
+    agent_id: str = ""
     fail_open: bool = False
     allow_paths: str = ""
     escalation_timeout_s: float = 0.0
@@ -104,13 +120,21 @@ class Config:
     mcp_tools_cache_ttl_s: float = 900.0
 
 
-def _resolve_config() -> Config:
-    return Config(
-        url=os.environ.get("INTARIS_URL", "http://localhost:8060"),
-        api_key=os.environ.get("INTARIS_API_KEY", ""),
-        user_id=os.environ.get("INTARIS_USER_ID", ""),
+def _resolve_config(ctx: Any = None) -> Config:
+    """Snapshot scoped environment defaults and this profile's plugin settings.
+
+    PluginContext.get_config reads plugins.entries.intaris.settings (with
+    Hermes' legacy config subtree fallback). Explicit settings, including
+    false/zero/empty values, take precedence over scoped environment. Credentials
+    come only from Hermes' secret API (process env on older, single-profile hosts).
+    """
+    cfg = Config(
+        url=_profile_env("INTARIS_URL", "http://localhost:8060"),
+        api_key=_profile_env("INTARIS_API_KEY", ""),
+        user_id=_profile_env("INTARIS_USER_ID", ""),
+        agent_id=_profile_env("INTARIS_AGENT_ID", ""),
         fail_open=_env_bool("INTARIS_FAIL_OPEN"),
-        allow_paths=os.environ.get("INTARIS_ALLOW_PATHS", ""),
+        allow_paths=_profile_env("INTARIS_ALLOW_PATHS", ""),
         escalation_timeout_s=_env_float("INTARIS_ESCALATION_TIMEOUT", 0.0),
         checkpoint_interval=_env_int("INTARIS_CHECKPOINT_INTERVAL", 25),
         recording=_env_bool("INTARIS_SESSION_RECORDING"),
@@ -119,6 +143,36 @@ def _resolve_config() -> Config:
         mcp_tools=_env_bool("INTARIS_MCP_TOOLS", True),
         mcp_tools_cache_ttl_s=_env_float("INTARIS_MCP_TOOLS_CACHE_TTL_S", 900.0),
     )
+    get_config = getattr(ctx, "get_config", None)
+    if not callable(get_config):
+        return cfg
+    setting_names = {
+        "recording": "session_recording",
+        "escalation_timeout_s": "escalation_timeout",
+        "recording_flush_interval_s": "recording_flush_interval",
+    }
+    missing = object()
+    overrides = {}
+    for item in fields(cfg):
+        if item.name == "api_key":
+            continue  # Hermes stores secret fields outside config.yaml.
+        name = setting_names.get(item.name, item.name)
+        value = get_config(name, missing)
+        if value is missing:
+            continue
+        default = getattr(cfg, item.name)
+        if isinstance(default, bool):
+            value = str(value).strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(default, (int, float)):
+            try:
+                value = type(default)(value)
+            except (TypeError, ValueError):
+                value = default
+        elif not isinstance(value, str):
+            # Do not include the value: settings can contain credentials.
+            raise ValueError(f"Intaris setting {name} must be a string")
+        overrides[item.name] = value
+    return replace(cfg, **overrides)
 
 
 # ============================================================================
@@ -128,6 +182,9 @@ def _resolve_config() -> Config:
 
 @dataclass
 class SessionState:
+    working_directory: str = field(default_factory=os.getcwd)
+    intention: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
     intaris_session_id: str | None = None
     session_created: bool = False
     call_count: int = 0
@@ -147,31 +204,61 @@ class SessionState:
 
 
 # ============================================================================
-# Module-level shared state
+# Profile-owned runtime state
 # ============================================================================
 
-_sessions: dict[str, SessionState] = {}
-_sessions_lock = threading.Lock()
-_mcp_tool_cache: list[dict[str, Any]] | None = None
-_mcp_tool_cache_at: float = 0.0
-_mcp_tool_cache_lock = threading.Lock()
-_flush_timer: threading.Timer | None = None
-_cfg: Config | None = None
-_client: IntarisClient | None = None
+
+@dataclass
+class ProfileRuntime:
+    """One registration generation; callbacks retain this owner for life."""
+
+    home: str
+    cfg: Config
+    client: IntarisClient
+    context: Any = field(default=None, repr=False)
+    policy: dict[str, Any] = field(default_factory=dict)
+    sessions: dict[str, SessionState] = field(default_factory=dict)
+    sessions_lock: Any = field(default_factory=threading.Lock, repr=False)
+    mcp_tool_cache: list[dict[str, Any]] | None = None
+    mcp_tool_cache_at: float = 0.0
+    mcp_tool_cache_lock: Any = field(default_factory=threading.Lock, repr=False)
+    recording_lock: Any = field(default_factory=threading.RLock, repr=False)
+    lifecycle_lock: Any = field(default_factory=threading.RLock, repr=False)
+    flush_timer: threading.Timer | None = field(default=None, repr=False)
+    registrations: list[Any] = field(default_factory=list, repr=False)
+    active: bool = True
 
 
-def _get_or_create_state(task_id: str) -> SessionState:
-    with _sessions_lock:
-        state = _sessions.get(task_id)
+# Used only to coordinate registration/unload. Calls never resolve a client
+# from a mutable "current profile" pointer.
+_profiles: dict[str, ProfileRuntime] = {}
+_profiles_lock = threading.RLock()
+_registration_locks: dict[str, Any] = {}
+
+
+def _profile_key() -> str:
+    """Use Hermes' context-local home, including worker-thread overrides."""
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        home = Path(os.environ.get("HERMES_HOME", "~/.hermes"))
+    else:
+        home = get_hermes_home()
+    return str(home.expanduser().resolve())
+
+
+def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
+    with profile.sessions_lock:
+        state = profile.sessions.get(task_id)
         if state is None:
             state = SessionState()
-            _sessions[task_id] = state
+            profile.sessions[task_id] = state
             # Evict oldest entries if over limit
-            if len(_sessions) > MAX_SESSIONS:
-                excess = len(_sessions) - MAX_SESSIONS
-                keys = list(_sessions.keys())[:excess]
+            if len(profile.sessions) > MAX_SESSIONS:
+                excess = len(profile.sessions) - MAX_SESSIONS
+                keys = list(profile.sessions.keys())[:excess]
                 for k in keys:
-                    _sessions.pop(k, None)
+                    profile.sessions.pop(k, None)
         return state
 
 
@@ -228,22 +315,27 @@ def _build_policy(allow_paths: str) -> dict[str, Any]:
     return {"allow_paths": default_paths + user_paths}
 
 
-def _build_intention(platform: str = "", model: str = "") -> str:
+def _build_intention(
+    platform: str = "", model: str = "", working_directory: str | None = None
+) -> str:
     parts = ["Hermes Agent"]
     if platform:
         parts.append(f"({platform})")
     parts.append("session")
-    cwd = os.getcwd()
+    cwd = os.getcwd() if working_directory is None else working_directory
     if cwd:
         parts.append(f"in {cwd}")
     return " ".join(parts)
 
 
 def _build_details(
-    platform: str = "", model: str = "", session_id: str = ""
+    platform: str = "",
+    model: str = "",
+    session_id: str = "",
+    working_directory: str | None = None,
 ) -> dict[str, Any]:
     details: dict[str, Any] = {"source": "hermes"}
-    cwd = os.getcwd()
+    cwd = os.getcwd() if working_directory is None else working_directory
     if cwd:
         details["working_directory"] = cwd
     if platform:
@@ -255,11 +347,10 @@ def _build_details(
     return details
 
 
-def _build_checkpoint_content(state: SessionState) -> str:
-    assert _cfg is not None
+def _build_checkpoint_content(profile: ProfileRuntime, state: SessionState) -> str:
     interval = (
-        state.call_count // _cfg.checkpoint_interval
-        if _cfg.checkpoint_interval > 0
+        state.call_count // profile.cfg.checkpoint_interval
+        if profile.cfg.checkpoint_interval > 0
         else 0
     )
     tools = ", ".join(state.recent_tools) or "none"
@@ -275,7 +366,7 @@ def _build_agent_summary(state: SessionState) -> str:
         f"Hermes session completed. {state.call_count} tool calls "
         f"({state.approved_count} approved, {state.denied_count} denied, "
         f"{state.escalated_count} escalated). "
-        f"Working directory: {os.getcwd() or 'unknown'}"
+        f"Working directory: {state.working_directory or 'unknown'}"
     )
 
 
@@ -285,13 +376,13 @@ def _build_agent_summary(state: SessionState) -> str:
 
 
 def _ensure_session(
+    profile: ProfileRuntime,
     task_id: str,
     state: SessionState,
     platform: str = "",
     model: str = "",
 ) -> str | None:
     """Ensure an Intaris session exists.  Returns the session ID or None."""
-    assert _cfg is not None and _client is not None
 
     if state.intaris_session_id:
         return state.intaris_session_id
@@ -303,11 +394,13 @@ def _ensure_session(
     state._creating = True
     try:
         intaris_id = f"hm-{uuid.uuid4()}"
-        intention = _build_intention(platform, model)
-        details = _build_details(platform, model, task_id)
-        policy = _build_policy(_cfg.allow_paths)
-
-        result = _client.create_intention(intaris_id, intention, details, policy)
+        state.intention = _build_intention(platform, model, state.working_directory)
+        state.details = _build_details(
+            platform, model, task_id, state.working_directory
+        )
+        result = profile.client.create_intention(
+            intaris_id, state.intention, state.details, profile.policy
+        )
 
         if result.data:
             state.intaris_session_id = intaris_id
@@ -317,7 +410,7 @@ def _ensure_session(
             # Session already exists — reuse
             state.intaris_session_id = intaris_id
             logger.info("[intaris] Session already exists, reusing: %s", intaris_id)
-            _client.update_status(intaris_id, "active")
+            profile.client.update_status(intaris_id, "active")
         elif result.status is not None and 400 <= result.status < 500:
             state.last_error = result.error or f"HTTP {result.status}"
             return None
@@ -335,31 +428,38 @@ def _ensure_session(
 # ============================================================================
 
 
-def _record_event(task_id: str, event: dict[str, Any]) -> None:
+def _record_event(profile: ProfileRuntime, task_id: str, event: dict[str, Any]) -> None:
     """Buffer a recording event."""
-    assert _cfg is not None
-    if not _cfg.recording:
+    if not profile.cfg.recording:
         return
-    state = _sessions.get(task_id)
+    state = profile.sessions.get(task_id)
     if not state or not state.intaris_session_id:
         return
-    state.recording_buffer.append(event)
-    if len(state.recording_buffer) >= _cfg.recording_flush_size:
-        _flush_recording_buffer(task_id)
+    with profile.recording_lock:
+        state.recording_buffer.append(event)
+        # A hook admitted before unload may reach this point after the final
+        # flush. Send its event through the original client immediately; no
+        # timer remains to drain an inactive generation's buffer.
+        should_flush = (
+            not profile.active
+            or len(state.recording_buffer) >= profile.cfg.recording_flush_size
+        )
+    if should_flush:
+        _flush_recording_buffer(profile, task_id)
 
 
-def _flush_recording_buffer(task_id: str) -> None:
+def _flush_recording_buffer(profile: ProfileRuntime, task_id: str) -> None:
     """Flush buffered recording events to Intaris."""
-    assert _client is not None
-    state = _sessions.get(task_id)
+    state = profile.sessions.get(task_id)
     if not state or not state.intaris_session_id:
         return
-    if not state.recording_buffer:
-        return
-    events = state.recording_buffer[:]
-    state.recording_buffer.clear()
+    with profile.recording_lock:
+        if not state.recording_buffer:
+            return
+        events = state.recording_buffer[:]
+        state.recording_buffer.clear()
     try:
-        _client.append_events(state.intaris_session_id, events)
+        profile.client.append_events(state.intaris_session_id, events)
     except Exception as exc:
         logger.warning(
             "[intaris] Recording flush failed for %s: %s (%d events)",
@@ -369,20 +469,30 @@ def _flush_recording_buffer(task_id: str) -> None:
         )
 
 
-def _periodic_flush() -> None:
+def _periodic_flush(profile: ProfileRuntime) -> None:
     """Flush all recording buffers periodically."""
-    assert _cfg is not None
-    for task_id in list(_sessions.keys()):
+    if not profile.active:
+        return
+    with profile.sessions_lock:
+        task_ids = list(profile.sessions)
+    for task_id in task_ids:
         try:
-            _flush_recording_buffer(task_id)
+            _flush_recording_buffer(profile, task_id)
         except Exception:
             pass
-    # Re-schedule
-    global _flush_timer
-    if _cfg.recording:
-        _flush_timer = threading.Timer(_cfg.recording_flush_interval_s, _periodic_flush)
-        _flush_timer.daemon = True
-        _flush_timer.start()
+    _schedule_flush(profile)
+
+
+def _schedule_flush(profile: ProfileRuntime) -> None:
+    """Bind even context-free timer threads to the originating runtime."""
+    with profile.lifecycle_lock:
+        if profile.active and profile.cfg.recording:
+            profile.flush_timer = threading.Timer(
+                profile.cfg.recording_flush_interval_s,
+                partial(_periodic_flush, profile),
+            )
+            profile.flush_timer.daemon = True
+            profile.flush_timer.start()
 
 
 # ============================================================================
@@ -390,37 +500,37 @@ def _periodic_flush() -> None:
 # ============================================================================
 
 
-def _signal_completion(task_id: str, state: SessionState) -> None:
+def _signal_completion(
+    profile: ProfileRuntime, task_id: str, state: SessionState
+) -> None:
     """Signal session completion to Intaris."""
-    assert _client is not None
     if not state.intaris_session_id:
         return
 
-    _flush_recording_buffer(task_id)
+    _flush_recording_buffer(profile, task_id)
 
     sid = state.intaris_session_id
     try:
-        _client.update_status(sid, "completed")
+        profile.client.update_status(sid, "completed")
     except Exception:
         pass
     try:
-        _client.submit_agent_summary(sid, _build_agent_summary(state))
+        profile.client.submit_agent_summary(sid, _build_agent_summary(state))
     except Exception:
         pass
 
 
-def _send_checkpoint(state: SessionState) -> None:
+def _send_checkpoint(profile: ProfileRuntime, state: SessionState) -> None:
     """Send a periodic checkpoint if interval reached."""
-    assert _cfg is not None and _client is not None
-    if _cfg.checkpoint_interval <= 0:
+    if profile.cfg.checkpoint_interval <= 0:
         return
-    if state.call_count % _cfg.checkpoint_interval != 0:
+    if state.call_count % profile.cfg.checkpoint_interval != 0:
         return
     if not state.intaris_session_id:
         return
     try:
-        _client.submit_checkpoint(
-            state.intaris_session_id, _build_checkpoint_content(state)
+        profile.client.submit_checkpoint(
+            state.intaris_session_id, _build_checkpoint_content(profile, state)
         )
     except Exception:
         pass
@@ -431,16 +541,14 @@ def _send_checkpoint(state: SessionState) -> None:
 # ============================================================================
 
 
-def _refresh_mcp_tool_cache() -> list[dict[str, Any]]:
+def _refresh_mcp_tool_cache(profile: ProfileRuntime) -> list[dict[str, Any]]:
     """Refresh the MCP tool cache from Intaris."""
-    global _mcp_tool_cache, _mcp_tool_cache_at
-    assert _client is not None
 
-    with _mcp_tool_cache_lock:
+    with profile.mcp_tool_cache_lock:
         try:
-            tools = _client.list_mcp_tools()
-            _mcp_tool_cache = tools
-            _mcp_tool_cache_at = time.monotonic()
+            tools = profile.client.list_mcp_tools()
+            profile.mcp_tool_cache = tools
+            profile.mcp_tool_cache_at = time.monotonic()
             if tools:
                 servers = {t.get("server", "?") for t in tools}
                 logger.info(
@@ -451,21 +559,22 @@ def _refresh_mcp_tool_cache() -> list[dict[str, Any]]:
             return tools
         except Exception as exc:
             logger.warning("[intaris] MCP tool cache refresh failed: %s", exc)
-            return _mcp_tool_cache or []
+            return profile.mcp_tool_cache or []
 
 
-def _is_mcp_cache_stale() -> bool:
-    assert _cfg is not None
-    if _mcp_tool_cache is None:
+def _is_mcp_cache_stale(profile: ProfileRuntime) -> bool:
+    if profile.mcp_tool_cache is None:
         return True
-    return (time.monotonic() - _mcp_tool_cache_at) > _cfg.mcp_tools_cache_ttl_s
+    return (
+        time.monotonic() - profile.mcp_tool_cache_at
+    ) > profile.cfg.mcp_tools_cache_ttl_s
 
 
-def _get_mcp_tool_names() -> set[str]:
+def _get_mcp_tool_names(profile: ProfileRuntime) -> set[str]:
     """Return the set of registered MCP tool names (server_tool format)."""
-    if not _mcp_tool_cache:
+    if not profile.mcp_tool_cache:
         return set()
-    return {f"{t['server']}_{t['name']}" for t in _mcp_tool_cache}
+    return {f"{t['server']}_{t['name']}" for t in profile.mcp_tool_cache}
 
 
 # ============================================================================
@@ -473,9 +582,8 @@ def _get_mcp_tool_names() -> set[str]:
 # ============================================================================
 
 
-def _poll_escalation(call_id: str, tool_name: str) -> str:
+def _poll_escalation(profile: ProfileRuntime, call_id: str, tool_name: str) -> str:
     """Poll for escalation resolution.  Returns 'approve' or 'deny'."""
-    assert _cfg is not None and _client is not None
 
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
@@ -485,7 +593,10 @@ def _poll_escalation(call_id: str, tool_name: str) -> str:
     while True:
         # Check timeout
         elapsed = time.monotonic() - start
-        if _cfg.escalation_timeout_s > 0 and elapsed > _cfg.escalation_timeout_s:
+        if (
+            profile.cfg.escalation_timeout_s > 0
+            and elapsed > profile.cfg.escalation_timeout_s
+        ):
             return "timeout"
 
         # Periodic reminder every 60s
@@ -505,7 +616,7 @@ def _poll_escalation(call_id: str, tool_name: str) -> str:
         attempt += 1
 
         # Check resolution
-        result = _client.get_audit(call_id)
+        result = profile.client.get_audit(call_id)
         if not result.data:
             continue  # Server unreachable — keep polling
 
@@ -526,9 +637,10 @@ def _poll_escalation(call_id: str, tool_name: str) -> str:
         # No decision yet — continue polling
 
 
-def _poll_session_status(session_id: str, tool_name: str) -> str:
+def _poll_session_status(
+    profile: ProfileRuntime, session_id: str, tool_name: str
+) -> str:
     """Poll for session reactivation.  Returns 'active', 'terminated', or 'timeout'."""
-    assert _cfg is not None and _client is not None
 
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
@@ -537,7 +649,10 @@ def _poll_session_status(session_id: str, tool_name: str) -> str:
 
     while True:
         elapsed = time.monotonic() - start
-        if _cfg.escalation_timeout_s > 0 and elapsed > _cfg.escalation_timeout_s:
+        if (
+            profile.cfg.escalation_timeout_s > 0
+            and elapsed > profile.cfg.escalation_timeout_s
+        ):
             return "timeout"
 
         now = time.monotonic()
@@ -552,7 +667,7 @@ def _poll_session_status(session_id: str, tool_name: str) -> str:
         time.sleep(delay)
         attempt += 1
 
-        result = _client.get_session(session_id)
+        result = profile.client.get_session(session_id)
         if not result.data:
             continue
 
@@ -570,34 +685,63 @@ def _poll_session_status(session_id: str, tool_name: str) -> str:
 
 
 def _make_guarded_handler(
+    profile: ProfileRuntime,
     original_handler: Callable,
     tool_name: str,
     toolset: str,
     is_async: bool,
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
+    try:
+        parameters = inspect.signature(original_handler).parameters
+    except (TypeError, ValueError):
+        accepted_kwargs = None
+    else:
+        accepted_kwargs = (
+            None
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            else {
+                name
+                for name, p in parameters.items()
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+        )
 
-    def guarded_handler(args: dict, **kwargs: Any) -> str:
-        assert _cfg is not None and _client is not None
+    def invoke_original(args: dict, **kwargs: Any) -> Any:
+        # Keep all Hermes context available to the guard, but honor the original
+        # handler's narrow signature just as registry.dispatch() does.
+        if accepted_kwargs is not None:
+            kwargs = {
+                name: value for name, value in kwargs.items() if name in accepted_kwargs
+            }
+        return original_handler(args, **kwargs)
+
+    def guarded_handler(args: dict, **kwargs: Any) -> Any:
+        if not profile.active or _profile_key() != profile.home:
+            return json.dumps(
+                {"error": "[intaris] Tool belongs to a different or unloaded profile"}
+            )
 
         # Find the active session — use the most recent non-idle session
-        task_id: str | None = None
         state: SessionState | None = None
-        with _sessions_lock:
-            for tid, s in reversed(list(_sessions.items())):
+        with profile.sessions_lock:
+            for s in reversed(list(profile.sessions.values())):
                 if s.intaris_session_id:
-                    task_id = tid
                     state = s
                     if not s.is_idle:
                         break
 
         if not state or not state.intaris_session_id:
-            if _cfg.fail_open:
+            if profile.cfg.fail_open:
                 logger.warning(
                     "[intaris] No active session for %s — allowing (fail-open)",
                     tool_name,
                 )
-                return original_handler(args, **kwargs)
+                return invoke_original(args, **kwargs)
             return json.dumps(
                 {
                     "error": f"[intaris] No active Intaris session. Cannot evaluate {tool_name}."
@@ -606,7 +750,7 @@ def _make_guarded_handler(
 
         # Evaluate the tool call
         intention_pending = state.intention_pending
-        result = _client.evaluate(
+        result = profile.client.evaluate(
             state.intaris_session_id,
             tool_name,
             args,
@@ -625,11 +769,11 @@ def _make_guarded_handler(
                         "error": f"[intaris] Evaluation rejected for {tool_name}: {result.error}"
                     }
                 )
-            if _cfg.fail_open:
+            if profile.cfg.fail_open:
                 logger.warning(
                     "[intaris] Evaluate failed for %s — allowing (fail-open)", tool_name
                 )
-                return original_handler(args, **kwargs)
+                return invoke_original(args, **kwargs)
             return json.dumps(
                 {
                     "error": (
@@ -670,16 +814,16 @@ def _make_guarded_handler(
         )
 
         # Send periodic checkpoint
-        _send_checkpoint(state)
+        _send_checkpoint(profile, state)
 
         # Update intention after gathering enough context
         if not state.intention_updated and state.call_count >= 3:
             state.intention_updated = True
             try:
-                _client.update_session(
+                profile.client.update_session(
                     state.intaris_session_id,
-                    _build_intention(),
-                    _build_details(session_id=task_id or ""),
+                    state.intention,
+                    state.details,
                 )
             except Exception:
                 pass
@@ -692,14 +836,16 @@ def _make_guarded_handler(
                     "[intaris] Session suspended: %s. Waiting for approval...",
                     status_reason,
                 )
-                poll_result = _poll_session_status(state.intaris_session_id, tool_name)
+                poll_result = _poll_session_status(
+                    profile, state.intaris_session_id, tool_name
+                )
                 if poll_result == "active":
                     # Re-evaluate after reactivation
                     logger.info(
                         "[intaris] Session reactivated — re-evaluating %s",
                         tool_name,
                     )
-                    re_result = _client.evaluate(
+                    re_result = profile.client.evaluate(
                         state.intaris_session_id, tool_name, args
                     )
                     if re_result.data and re_result.data.get("decision") == "approve":
@@ -709,7 +855,7 @@ def _make_guarded_handler(
                             args,
                             str(re_result.data.get("call_id") or ""),
                         )
-                        return original_handler(args, **kwargs)
+                        return invoke_original(args, **kwargs)
                     if re_result.data and re_result.data.get("decision") == "escalate":
                         re_call_id = str(re_result.data.get("call_id") or "")
                         re_reason = str(
@@ -717,12 +863,12 @@ def _make_guarded_handler(
                                 "reasoning", "Tool call requires human approval"
                             )
                         )
-                        poll_result = _poll_escalation(re_call_id, tool_name)
+                        poll_result = _poll_escalation(profile, re_call_id, tool_name)
                         if poll_result == "approve":
                             _queue_pending_tool_result(
                                 state, tool_name, args, re_call_id
                             )
-                            return original_handler(args, **kwargs)
+                            return invoke_original(args, **kwargs)
                         if poll_result == "deny":
                             return json.dumps(
                                 {
@@ -733,7 +879,7 @@ def _make_guarded_handler(
                             {
                                 "error": (
                                     f"[intaris] ESCALATION TIMEOUT ({re_call_id}): {re_reason}\n"
-                                    f"No response within {_cfg.escalation_timeout_s:.0f}s. "
+                                    f"No response within {profile.cfg.escalation_timeout_s:.0f}s. "
                                     f"Approve or deny in the Intaris UI."
                                 )
                             }
@@ -755,7 +901,7 @@ def _make_guarded_handler(
                     {
                         "error": (
                             f"[intaris] SESSION SUSPENSION TIMEOUT: {status_reason}\n"
-                            f"No response within {_cfg.escalation_timeout_s:.0f}s."
+                            f"No response within {profile.cfg.escalation_timeout_s:.0f}s."
                         )
                     }
                 )
@@ -783,10 +929,10 @@ def _make_guarded_handler(
                 call_id,
                 reasoning,
             )
-            poll_result = _poll_escalation(call_id, tool_name)
+            poll_result = _poll_escalation(profile, call_id, tool_name)
             if poll_result == "approve":
                 _queue_pending_tool_result(state, tool_name, args, call_id)
-                return original_handler(args, **kwargs)
+                return invoke_original(args, **kwargs)
             if poll_result == "deny":
                 return json.dumps(
                     {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
@@ -796,7 +942,7 @@ def _make_guarded_handler(
                 {
                     "error": (
                         f"[intaris] ESCALATION TIMEOUT ({call_id}): {reasoning}\n"
-                        f"No response within {_cfg.escalation_timeout_s:.0f}s. "
+                        f"No response within {profile.cfg.escalation_timeout_s:.0f}s. "
                         f"Approve or deny in the Intaris UI."
                     )
                 }
@@ -804,8 +950,17 @@ def _make_guarded_handler(
 
         # -- APPROVE -----------------------------------------------------------
         _queue_pending_tool_result(state, tool_name, args, call_id)
-        return original_handler(args, **kwargs)
+        return invoke_original(args, **kwargs)
 
+    guarded_handler._intaris_original_handler = original_handler
+    if is_async:
+
+        @wraps(guarded_handler)
+        async def async_guarded_handler(args: dict, **kwargs: Any) -> Any:
+            result = guarded_handler(args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        return async_guarded_handler
     return guarded_handler
 
 
@@ -814,11 +969,10 @@ def _make_guarded_handler(
 # ============================================================================
 
 
-def _register_mcp_tools(ctx: Any) -> None:
+def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
     """Register MCP tools from Intaris as Hermes agent tools."""
-    assert _cfg is not None and _client is not None
 
-    tools = _refresh_mcp_tool_cache()
+    tools = _refresh_mcp_tool_cache(profile)
     if not tools:
         return
 
@@ -837,12 +991,17 @@ def _register_mcp_tools(ctx: Any) -> None:
 
         def _make_mcp_handler(srv: str, tn: str) -> Callable:
             def mcp_handler(args: dict, **kwargs: Any) -> str:
-                assert _client is not None
+                if not profile.active or _profile_key() != profile.home:
+                    return json.dumps(
+                        {
+                            "error": "[intaris] MCP tool belongs to a different or unloaded profile"
+                        }
+                    )
 
                 # Find active session
                 intaris_session_id: str | None = None
-                with _sessions_lock:
-                    for s in reversed(list(_sessions.values())):
+                with profile.sessions_lock:
+                    for s in reversed(list(profile.sessions.values())):
                         if s.intaris_session_id:
                             intaris_session_id = s.intaris_session_id
                             if not s.is_idle:
@@ -853,7 +1012,7 @@ def _register_mcp_tools(ctx: Any) -> None:
                         {"error": "[intaris] No active session for MCP tool call"}
                     )
 
-                result = _client.call_mcp_tool(intaris_session_id, srv, tn, args)
+                result = profile.client.call_mcp_tool(intaris_session_id, srv, tn, args)
 
                 if not result.data:
                     return json.dumps(
@@ -895,15 +1054,17 @@ def _register_mcp_tools(ctx: Any) -> None:
                 text_parts = [c.get("text", json.dumps(c)) for c in content]
                 return json.dumps({"result": "\n".join(text_parts) or "(empty result)"})
 
+            mcp_handler._intaris_mcp_owner = profile
             return mcp_handler
 
-        ctx.register_tool(
+        handle = ctx.register_tool(
             name=tool_name,
             toolset="intaris-mcp",
             schema=schema,
             handler=_make_mcp_handler(server, name),
             description=f"[MCP: {server}] {description}",
         )
+        _track_registration(profile, handle)
 
     logger.info("[intaris] Registered %d MCP tools from Intaris", len(tools))
 
@@ -914,21 +1075,26 @@ def _register_mcp_tools(ctx: Any) -> None:
 
 
 def _on_session_start(
-    session_id: str, model: str = "", platform: str = "", **kwargs: Any
+    profile: ProfileRuntime,
+    session_id: str,
+    model: str = "",
+    platform: str = "",
+    **kwargs: Any,
 ) -> None:
     """on_session_start: Create Intaris session."""
-    state = _get_or_create_state(session_id)
-    _ensure_session(session_id, state, platform, model)
+    state = _get_or_create_state(profile, session_id)
+    _ensure_session(profile, session_id, state, platform, model)
 
     # Refresh MCP tool cache on session start
-    if _cfg and _cfg.mcp_tools and _is_mcp_cache_stale():
+    if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
         try:
-            _refresh_mcp_tool_cache()
+            _refresh_mcp_tool_cache(profile)
         except Exception:
             pass
 
 
 def _on_session_end(
+    profile: ProfileRuntime,
     session_id: str,
     completed: bool = True,
     interrupted: bool = False,
@@ -937,25 +1103,26 @@ def _on_session_end(
     **kwargs: Any,
 ) -> None:
     """on_session_end: Signal completion or idle."""
-    state = _sessions.get(session_id)
+    state = profile.sessions.get(session_id)
     if not state:
         return
 
     if completed or interrupted:
-        _signal_completion(session_id, state)
-        with _sessions_lock:
-            _sessions.pop(session_id, None)
+        _signal_completion(profile, session_id, state)
+        with profile.sessions_lock:
+            profile.sessions.pop(session_id, None)
     else:
         # Not completed — transition to idle
-        if not state.is_idle and state.intaris_session_id and _client:
+        if not state.is_idle and state.intaris_session_id and profile.client:
             state.is_idle = True
             try:
-                _client.update_status(state.intaris_session_id, "idle")
+                profile.client.update_status(state.intaris_session_id, "idle")
             except Exception:
                 pass
 
 
 def _on_pre_llm_call(
+    profile: ProfileRuntime,
     session_id: str = "",
     user_message: str = "",
     conversation_history: Any = None,
@@ -969,12 +1136,11 @@ def _on_pre_llm_call(
     Returns ``{"context": "..."}`` to inject behavioral alerts into the
     system prompt when there are cached warnings from recent evaluations.
     """
-    assert _cfg is not None and _client is not None
 
-    state = _sessions.get(session_id)
+    state = profile.sessions.get(session_id)
     if not state:
-        state = _get_or_create_state(session_id)
-        _ensure_session(session_id, state, platform, model)
+        state = _get_or_create_state(profile, session_id)
+        _ensure_session(profile, session_id, state, platform, model)
 
     if not state.intaris_session_id:
         return None
@@ -983,7 +1149,7 @@ def _on_pre_llm_call(
     if state.is_idle and user_message:
         state.is_idle = False
         try:
-            _client.update_status(state.intaris_session_id, "active")
+            profile.client.update_status(state.intaris_session_id, "active")
         except Exception:
             pass
 
@@ -995,9 +1161,10 @@ def _on_pre_llm_call(
         assistant_context = state.last_assistant_text or None
         state.last_assistant_text = ""
 
-        if _cfg.recording:
+        if profile.cfg.recording:
             # Record user message event, then call /reasoning with from_events
             _record_event(
+                profile,
                 session_id,
                 {
                     "type": "message",
@@ -1008,14 +1175,16 @@ def _on_pre_llm_call(
                     },
                 },
             )
-            _flush_recording_buffer(session_id)
+            _flush_recording_buffer(profile, session_id)
             try:
-                _client.submit_reasoning(state.intaris_session_id, "", from_events=True)
+                profile.client.submit_reasoning(
+                    state.intaris_session_id, "", from_events=True
+                )
             except Exception:
                 pass
         else:
             try:
-                _client.submit_reasoning(
+                profile.client.submit_reasoning(
                     state.intaris_session_id,
                     f"User message: {clean_text}",
                     context=assistant_context,
@@ -1030,12 +1199,17 @@ def _on_pre_llm_call(
 
 
 def _on_pre_tool_call(
-    tool_name: str = "", args: dict | None = None, task_id: str = "", **kwargs: Any
+    profile: ProfileRuntime,
+    tool_name: str = "",
+    args: dict | None = None,
+    task_id: str = "",
+    **kwargs: Any,
 ) -> None:
     """pre_tool_call: Record tool call event (evaluation happens in wrapper)."""
     if not task_id:
         return
     _record_event(
+        profile,
         task_id,
         {
             "type": "tool_call",
@@ -1056,6 +1230,7 @@ def _on_pre_tool_call(
 
 
 def _on_post_tool_call(
+    profile: ProfileRuntime,
     tool_name: str = "",
     args: dict | None = None,
     result: Any = "",
@@ -1065,7 +1240,7 @@ def _on_post_tool_call(
     """post_tool_call: Record tool result."""
     if not task_id:
         return
-    state = _sessions.get(task_id)
+    state = profile.sessions.get(task_id)
     args_key = _args_fingerprint(args)
     mapped_call_id: str | None = None
     if state:
@@ -1076,6 +1251,7 @@ def _on_post_tool_call(
                 del state.pending_tool_results[i]
                 break
     _record_event(
+        profile,
         task_id,
         {
             "type": "tool_result",
@@ -1109,6 +1285,7 @@ def _on_post_tool_call(
 
 
 def _on_post_llm_call(
+    profile: ProfileRuntime,
     session_id: str = "",
     user_message: str = "",
     assistant_response: str = "",
@@ -1118,7 +1295,7 @@ def _on_post_llm_call(
     **kwargs: Any,
 ) -> None:
     """post_llm_call: Capture assistant response for reasoning context."""
-    state = _sessions.get(session_id)
+    state = profile.sessions.get(session_id)
     if not state:
         return
 
@@ -1127,6 +1304,7 @@ def _on_post_llm_call(
 
         # Record assistant message
         _record_event(
+            profile,
             session_id,
             {
                 "type": "message",
@@ -1144,111 +1322,167 @@ def _on_post_llm_call(
 # ============================================================================
 
 
+def _bind_hook(profile: ProfileRuntime, callback: Callable) -> Callable:
+    """Keep manager callbacks bound to their registration, even after a turn ends."""
+
+    @wraps(callback)
+    def bound(*args: Any, **kwargs: Any) -> Any:
+        if profile.active:
+            return callback(profile, *args, **kwargs)
+        return None
+
+    return bound
+
+
+def _close_profile(profile: ProfileRuntime) -> None:
+    """Stop this generation's timer and dispose its Hermes registrations."""
+    with profile.lifecycle_lock:
+        if not profile.active:
+            return
+        profile.active = False
+        if profile.flush_timer is not None:
+            profile.flush_timer.cancel()
+            profile.flush_timer = None
+        registrations = list(profile.registrations)
+    with profile.sessions_lock:
+        task_ids = list(profile.sessions)
+    for task_id in task_ids:
+        _flush_recording_buffer(profile, task_id)
+    for handle in reversed(registrations):
+        handle.dispose()
+    with _profiles_lock:
+        if _profiles.get(profile.home) is profile:
+            del _profiles[profile.home]
+
+
+def _track_registration(profile: ProfileRuntime, handle: Any) -> None:
+    """Retain host lifecycle handles when supported by the Hermes version."""
+    if handle is not None:
+        with profile.lifecycle_lock:
+            if profile.active:
+                profile.registrations.append(handle)
+            else:
+                handle.dispose()
+
+
 def register(ctx: Any) -> None:
-    """Hermes plugin entry point.
+    """Register guards and hooks in the active Hermes profile's namespace.
 
-    Called by the Hermes plugin manager after discovery.  Registers hooks,
-    wraps all existing tool handlers with Intaris evaluation guards, and
-    optionally registers MCP tools.
+    The home is resolved once at registration. Each callback captures that
+    runtime, so another registration cannot redirect an in-flight request.
     """
-    global _cfg, _client, _flush_timer
+    from tools.registry import registry  # type: ignore[import-not-found]
 
-    _cfg = _resolve_config()
-    _client = IntarisClient(
-        url=_cfg.url,
-        api_key=_cfg.api_key,
-        user_id=_cfg.user_id,
+    home = _profile_key()
+    scoped = callable(getattr(registry, "get_all_entries", None)) and (
+        "scope" in inspect.signature(registry.register).parameters
     )
+    with _profiles_lock:
+        registration_lock = _registration_locks.setdefault(home, threading.RLock())
+    # Network requests and recording flushes must not hold up another home.
+    with registration_lock:
+        with _profiles_lock:
+            previous = _profiles.get(home)
+        if previous is not None and previous.context is ctx and previous.active:
+            return
+        if getattr(ctx, "_load_abandoned", False) is True:
+            return
+        cfg = _resolve_config(ctx)
+        if previous is not None:
+            _close_profile(previous)
+        profile = ProfileRuntime(
+            home=home,
+            cfg=cfg,
+            context=ctx,
+            client=IntarisClient(cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id),
+            policy=_build_policy(cfg.allow_paths),
+        )
+        with _profiles_lock:
+            if not scoped and any(key != home for key in _profiles):
+                raise RuntimeError(
+                    "Multiple Intaris profiles require Hermes' profile-scoped tool registry"
+                )
+            _profiles[home] = profile
+        try:
+            _register_profile(profile, ctx, registry, scoped)
+        except Exception:
+            _close_profile(profile)
+            raise
 
-    # Validation warnings
-    if not _cfg.api_key:
+
+def _register_profile(
+    profile: ProfileRuntime, ctx: Any, registry: Any, scoped: bool
+) -> None:
+    """Install one profile while only its own registration lock is held."""
+    # Install cleanup before any discovery I/O: Hermes can abandon a loader
+    # and roll its registrations back while that request is still running.
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(partial(_close_profile, profile))
+    cfg = profile.cfg
+    if not cfg.api_key:
         logger.warning(
             "[intaris] API key not configured — plugin will fail to authenticate. "
-            "Set INTARIS_API_KEY."
+            "Set INTARIS_API_KEY in the profile's Hermes credentials."
         )
-    if _cfg.fail_open:
+    if cfg.fail_open:
         logger.warning(
             "[intaris] Fail-open mode enabled — tool calls will proceed unchecked "
             "if Intaris is unreachable."
         )
 
-    logger.info(
-        "[intaris] Plugin initialized (url=%s, fail_open=%s, checkpoint=%d, "
-        "recording=%s, mcp_tools=%s)",
-        _cfg.url,
-        _cfg.fail_open,
-        _cfg.checkpoint_interval,
-        _cfg.recording,
-        _cfg.mcp_tools,
-    )
-
-    # -- Wrap all existing tool handlers with Intaris evaluation guards --------
-    try:
-        from tools.registry import registry  # type: ignore[import-not-found]
-
-        mcp_tool_names = set()
-        if _cfg.mcp_tools:
-            # Pre-fetch MCP tools so we know which names to skip wrapping
-            # (MCP tools have their own evaluation via POST /mcp/call)
-            try:
-                cache = _refresh_mcp_tool_cache()
-                mcp_tool_names = {f"{t['server']}_{t['name']}" for t in cache}
-            except Exception:
-                pass
-
-        wrapped_count = 0
-        for name in list(registry._tools.keys()):
-            entry = registry._tools[name]
-
-            # Skip MCP tools — they have their own evaluation path
-            if name in mcp_tool_names:
-                continue
-
-            original_handler = entry.handler
-            guarded = _make_guarded_handler(
-                original_handler, name, entry.toolset, entry.is_async
-            )
-
-            # Re-register with same toolset to avoid collision warning
-            registry.register(
-                name=name,
-                toolset=entry.toolset,
-                schema=entry.schema,
-                handler=guarded,
-                check_fn=entry.check_fn,
-                requires_env=entry.requires_env,
-                is_async=False,  # Our wrapper is synchronous
-                description=entry.description,
-                emoji=entry.emoji,
-            )
-            wrapped_count += 1
-
-        logger.info(
-            "[intaris] Wrapped %d tool handlers with evaluation guards", wrapped_count
+    # Scoped public enumeration includes other plugins visible to this profile.
+    # Legacy Hermes has only a global registry; support one profile there.
+    entries = registry.get_all_entries() if scoped else list(registry._tools.values())
+    for entry in entries:
+        original = entry.handler
+        metadata = getattr(original, "__dict__", {})
+        if metadata.get("_intaris_mcp_owner") is not None:
+            continue  # These handlers evaluate through /mcp/call themselves.
+        original = metadata.get("_intaris_original_handler", original)
+        guarded = _make_guarded_handler(
+            profile, original, entry.name, entry.toolset, entry.is_async
         )
-    except ImportError:
-        logger.warning(
-            "[intaris] Could not import tools.registry — tool wrapping disabled. "
-            "Tool calls will not be evaluated."
+        options = dict(
+            name=entry.name,
+            toolset=entry.toolset,
+            schema=entry.schema,
+            handler=guarded,
+            check_fn=entry.check_fn,
+            requires_env=entry.requires_env,
+            is_async=entry.is_async,
+            description=entry.description,
+            emoji=entry.emoji,
         )
+        if scoped:
+            # The host enforces tools.override / allow_tool_override permission
+            # and owns teardown of this profile's overlay.
+            _track_registration(profile, ctx.register_tool(**options, override=True))
+        else:
+            registry.register(**options)
 
-    # -- Register MCP tools ---------------------------------------------------
-    if _cfg.mcp_tools:
+    if profile.cfg.mcp_tools:
         try:
-            _register_mcp_tools(ctx)
+            _register_mcp_tools(profile, ctx)
         except Exception as exc:
             logger.warning("[intaris] MCP tool registration failed: %s", exc)
 
-    # -- Register hooks -------------------------------------------------------
-    ctx.register_hook("on_session_start", _on_session_start)
-    ctx.register_hook("on_session_end", _on_session_end)
-    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
-    ctx.register_hook("post_tool_call", _on_post_tool_call)
-    ctx.register_hook("post_llm_call", _on_post_llm_call)
+    if not profile.active or getattr(ctx, "_load_abandoned", False) is True:
+        _close_profile(profile)
+        return
 
-    # -- Start recording flush timer -----------------------------------------
-    if _cfg.recording:
-        _flush_timer = threading.Timer(_cfg.recording_flush_interval_s, _periodic_flush)
-        _flush_timer.daemon = True
-        _flush_timer.start()
+    for name, callback in (
+        ("on_session_start", _on_session_start),
+        ("on_session_end", _on_session_end),
+        ("pre_llm_call", _on_pre_llm_call),
+        ("pre_tool_call", _on_pre_tool_call),
+        ("post_tool_call", _on_post_tool_call),
+        ("post_llm_call", _on_post_llm_call),
+    ):
+        _track_registration(
+            profile, ctx.register_hook(name, _bind_hook(profile, callback))
+        )
+    _schedule_flush(profile)
+    logger.info(
+        "[intaris] Registered profile %s (%d guarded tools)", profile.home, len(entries)
+    )
