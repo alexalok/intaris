@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import types
-from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -69,7 +68,6 @@ from hermes_intaris import (  # noqa: E402
     register,
 )
 from hermes_intaris.client import ApiResult, IntarisClient  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -182,8 +180,8 @@ class TestHelpers:
         assert "8 approved" in summary
 
     def test_get_or_create_state(self):
-        state1 = _get_or_create_state("task-1")
-        state2 = _get_or_create_state("task-1")
+        state1 = _get_or_create_state("session-1")
+        state2 = _get_or_create_state("session-1")
         assert state1 is state2
         assert state1.call_count == 0
 
@@ -260,12 +258,12 @@ class TestToolWrapper:
         mod._client = IntarisClient("http://test:8060", "test-key")
 
         # Create a session
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test-session"
         return state
 
     def test_approve_calls_original(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "read_file", "file-tools", False)
@@ -282,13 +280,17 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            result = handler({"path": "/tmp/test.txt"})
+            result = handler(
+                {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+            )
 
         assert result == '{"result": "ok"}'
-        original.assert_called_once_with({"path": "/tmp/test.txt"})
+        original.assert_called_once_with(
+            {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+        )
 
     def test_deny_blocks_execution(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
@@ -305,7 +307,9 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            result = handler({"command": "rm -rf /"})
+            result = handler(
+                {"command": "rm -rf /"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -317,7 +321,7 @@ class TestToolWrapper:
         import hermes_intaris as mod
 
         monkeypatch.setenv("INTARIS_FAIL_OPEN", "true")
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         mod._cfg = _resolve_config()  # Re-resolve with fail_open=true
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
@@ -325,20 +329,24 @@ class TestToolWrapper:
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Connection refused")
-            result = handler({"path": "/tmp/test.txt"})
+            result = handler(
+                {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+            )
 
         assert result == '{"result": "ok"}'
         original.assert_called_once()
 
     def test_fail_closed_on_network_error(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Connection refused")
-            result = handler({"command": "ls"})
+            result = handler(
+                {"command": "ls"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -350,7 +358,7 @@ class TestToolWrapper:
         import hermes_intaris as mod
 
         monkeypatch.setenv("INTARIS_FAIL_OPEN", "true")
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         mod._cfg = _resolve_config()
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
@@ -358,7 +366,9 @@ class TestToolWrapper:
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Unauthorized", status=401)
-            result = handler({"command": "ls"})
+            result = handler(
+                {"command": "ls"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -383,7 +393,7 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            handler({"path": "/tmp/test.txt"})
+            handler({"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1")
 
         assert state.call_count == 1
         assert state.approved_count == 1
@@ -402,7 +412,7 @@ class TestToolWrapper:
         original = mock.MagicMock(return_value='{"result": "ok"}')
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
 
-        result = handler({"command": "ls"})
+        result = handler({"command": "ls"}, session_id="session-1", task_id="task-1")
         parsed = json.loads(result)
         assert "error" in parsed
         assert "No active Intaris session" in parsed["error"]
@@ -429,9 +439,9 @@ class TestHooks:
                 data={"session_id": "hm-123"}, status=200
             )
             _on_session_start = mod._on_session_start
-            _on_session_start(session_id="task-1", model="gpt-5", platform="cli")
+            _on_session_start(session_id="session-1", model="gpt-5", platform="cli")
 
-        state = _sessions.get("task-1")
+        state = _sessions.get("session-1")
         assert state is not None
         assert state.intaris_session_id is not None
         assert state.intaris_session_id.startswith("hm-")
@@ -445,7 +455,7 @@ class TestHooks:
         mod._cfg = _resolve_config()
         mod._client = IntarisClient("http://test:8060", "test-key")
 
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test"
         state.call_count = 5
         state.approved_count = 4
@@ -458,7 +468,7 @@ class TestHooks:
             mock_status.return_value = ApiResult(data={}, status=200)
             mock_summary.return_value = ApiResult(data={}, status=200)
 
-            mod._on_session_end(session_id="task-1", completed=True)
+            mod._on_session_end(session_id="session-1", completed=True)
 
         mock_status.assert_called_once_with("hm-test", "completed")
         mock_summary.assert_called_once()
@@ -466,7 +476,7 @@ class TestHooks:
         assert "5 tool calls" in summary_text
 
         # Session should be removed
-        assert "task-1" not in _sessions
+        assert "session-1" not in _sessions
 
     def test_pre_llm_call_forwards_reasoning(self, monkeypatch):
         import hermes_intaris as mod
@@ -478,14 +488,14 @@ class TestHooks:
         mod._cfg = _resolve_config()
         mod._client = IntarisClient("http://test:8060", "test-key")
 
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test"
 
         with mock.patch.object(IntarisClient, "submit_reasoning") as mock_reason:
             mock_reason.return_value = ApiResult(data={}, status=200)
 
             mod._on_pre_llm_call(
-                session_id="task-1",
+                session_id="session-1",
                 user_message="Fix the bug in main.py",
             )
 
