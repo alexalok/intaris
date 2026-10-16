@@ -550,6 +550,50 @@ def test_shell_side_effect_options_never_fast(tool, command):
     assert classify(tool, {"command": command}).value == "write"
 
 
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("policy", [None, POLICY], ids=["default", "mandatory"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -{delete,print}",
+        "find . -{delete,{print,ls}}",
+        "rg --{pre=sh,files}",
+        "ls file{1..3}",
+        "find . '-{delete,print}'",
+    ],
+)
+def test_brace_syntax_requires_evaluation(tool, policy, command):
+    from intaris.classifier import classify
+
+    # shlex does not expand braces. The shell can turn an apparently safe
+    # operand into write/exec options; quoted braces are conservative too.
+    assert classify(tool, {"command": command}, session_policy=policy).value == "write"
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+def test_agent_brace_expansion_reaches_inference(client, tool):
+    create(client)
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Brace expansion adds a destructive find option",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(client, tool=tool, command="find . -{delete,print}")
+
+    assert result["decision"] == "deny", result
+    assert result["path"] == "llm", result
+    inference.assert_called_once()
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "write"
+    assert audit["tool"] == tool
+
+
 def test_atomic_lifecycle_update_preserves_concurrent_stop(client):
     from intaris.session import SessionStore
 
