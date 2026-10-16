@@ -76,6 +76,27 @@ class Handle:
             self.release()
 
 
+class ToolHandle(Handle):
+    """Model Hermes leases that skip retired predecessor generations."""
+
+    def __init__(self, registry, home, name, previous, current):
+        self.previous, self.current = previous, current
+        leases = getattr(registry, "test_leases", [])
+        registry.test_leases = leases
+        self.predecessor = next(
+            (handle for handle in reversed(leases) if handle.current is previous), None
+        )
+        leases.append(self)
+
+        def release():
+            entry, predecessor = self.previous, self.predecessor
+            while predecessor is not None and not predecessor.active:
+                entry, predecessor = predecessor.previous, predecessor.predecessor
+            registry.restore_registration(name, current, entry, scope=home)
+
+        super().__init__(release)
+
+
 class Context:
     """Only the supported PluginContext calls used by this adapter."""
 
@@ -95,11 +116,7 @@ class Context:
         defaults = dict(check_fn=None, requires_env=[], is_async=False, emoji="")
         self.registry.register(**(defaults | kwargs), scope=self.home)
         current = self.registry.snapshot_registration(name, scope=self.home)
-        return Handle(
-            lambda: self.registry.restore_registration(
-                name, current, previous, scope=self.home
-            )
-        )
+        return ToolHandle(self.registry, self.home, name, previous, current)
 
     def register_hook(self, name, handler):
         self.hooks.setdefault(name, []).append(handler)
@@ -895,18 +912,40 @@ def test_failed_first_load_allows_later_llm_bootstrap(
     assert requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == sid
 
 
-def test_failed_reload_keeps_session_for_retry(runtime, monkeypatch):
+@pytest.mark.parametrize(
+    "changed", [None, "url", "user_id", "agent_id", "api_key", "policy"]
+)
+@pytest.mark.parametrize("unload_first", [False, True])
+def test_failed_reload_keeps_session_for_retry(
+    runtime, monkeypatch, changed, unload_first
+):
     old = runtime.register("a")
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id")
+        if unload_first:
+            for callback in old.unload:
+                callback()
         original = Context.register_hook
 
         def fail_registration(*args, **kwargs):
             raise RuntimeError("synthetic hook registration failure")
 
-        monkeypatch.setattr(Context, "register_hook", fail_registration)
-        with pytest.raises(RuntimeError, match="synthetic hook registration failure"):
-            runtime.register("a")
+        settings = {"fail_open": True}
+        with monkeypatch.context() as change:
+            if changed == "api_key":
+                runtime.secrets["a"] = {"INTARIS_API_KEY": "changed-key"}
+            elif changed == "policy":
+                change.setenv("TMPDIR", "/changed-temp-root")
+            elif changed is not None:
+                settings[changed] = (
+                    "https://changed.invalid" if changed == "url" else "changed"
+                )
+            monkeypatch.setattr(Context, "register_hook", fail_registration)
+            with pytest.raises(
+                RuntimeError, match="synthetic hook registration failure"
+            ):
+                runtime.register("a", settings)
+        runtime.secrets.pop("a", None)
         monkeypatch.setattr(Context, "register_hook", original)
         runtime.register("a")
         assert json.loads(
@@ -917,6 +956,132 @@ def test_failed_reload_keeps_session_for_retry(runtime, monkeypatch):
         requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
         == (requests_for(runtime, "/intention")[0]["body"]["session_id"])
     )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("fail_registration", [False, True])
+@pytest.mark.parametrize("pause_phase", ["before", "after"])
+def test_reload_never_exposes_unguarded_native_tool(
+    runtime, monkeypatch, legacy, fail_registration, pause_phase
+):
+    if legacy:
+        monkeypatch.setattr(runtime.registry, "get_all_entries", None)
+    old = runtime.register("a")
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+    entered, release = threading.Event(), threading.Event()
+    failures, replacements = [], []
+    register = plugin._register_profile
+
+    def paused_register(*args):
+        if pause_phase == "after":
+            register(*args)
+        entered.set()
+        assert release.wait(5)
+        if pause_phase == "before":
+            register(*args)
+        if fail_registration:
+            raise RuntimeError("synthetic replacement failure")
+
+    def load():
+        try:
+            replacements.append(runtime.register("a"))
+        except Exception as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(plugin, "_register_profile", paused_register)
+    thread = threading.Thread(target=load)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a"):
+            before = len(requests_for(runtime, "/evaluate"))
+            result = json.loads(
+                runtime.registry.get_entry("read_file").handler({"path": "during"})
+            )
+            assert "error" in result
+            assert len(requests_for(runtime, "/evaluate")) == before
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(failures) == int(fail_registration)
+    with runtime.profile("a"):
+        before = len(requests_for(runtime, "/evaluate"))
+        result = json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after"})
+        )
+        assert "error" in result or len(requests_for(runtime, "/evaluate")) > before
+        if fail_registration:
+            monkeypatch.setattr(plugin, "_register_profile", register)
+            replacements.append(runtime.register("a"))
+            assert json.loads(
+                runtime.registry.get_entry("read_file").handler({"path": "retry"})
+            ) == {"result": "retry"}
+        # Final explicit unload must still release every guard generation.
+        for ctx in [old, *replacements]:
+            for callback in ctx.unload:
+                callback()
+        assert not getattr(
+            runtime.registry.get_entry("read_file").handler,
+            "_intaris_original_handler",
+            None,
+        )
+
+
+def test_rejected_guard_replacement_keeps_old_guard_installed(runtime, monkeypatch):
+    old = runtime.register("a", {"fail_open": True})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        monkeypatch.setattr(Context, "register_tool", lambda *args, **kwargs: None)
+        with pytest.raises(RuntimeError, match="did not register Intaris guard"):
+            runtime.register("a", {"fail_open": True})
+        assert "error" in json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+        )
+    assert not requests_for(runtime, "/evaluate")
+
+
+def test_unload_recording_uses_one_total_http_timeout_budget(runtime, monkeypatch):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        for index in range(3):
+            old.emit("on_session_start", session_id=f"session-{index}")
+            old.emit(
+                "post_llm_call",
+                session_id=f"session-{index}",
+                assistant_response=f"recording-{index}",
+            )
+    clock, timeouts = [0.0], []
+
+    def timeout(req, *, timeout):
+        assert req.full_url.endswith("/events")
+        timeouts.append(timeout)
+        clock[0] += min(3.0, timeout)
+        raise TimeoutError("synthetic recording timeout")
+
+    with monkeypatch.context() as slow:
+        slow.setattr(plugin.time, "monotonic", lambda: clock[0])
+        slow.setattr("urllib.request.urlopen", timeout)
+        for callback in old.unload:
+            callback()
+    assert clock[0] <= 5.0
+    assert timeouts == [5.0, 2.0]
+    with runtime.profile("a"):
+        assert not getattr(
+            runtime.registry.get_entry("read_file").handler,
+            "_intaris_original_handler",
+            None,
+        )
+        new = runtime.register("a", {"session_recording": True})
+        Timer.instances[-1].fire()
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after"})
+        ) == {"result": "after"}
+        new.emit("on_session_end", session_id="session-2")
+    events = requests_for(runtime, "/events")
+    assert len(events) == 1
+    assert "recording-2" in json.dumps(events[0]["body"])
 
 
 def test_reload_waits_for_external_unload_flush_and_cleanup(runtime):
@@ -1023,6 +1188,10 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
             assert len(manager._hooks["on_session_start"]) == 1
             manager.invoke_hook("on_session_start", session_id="same-id")
             contexts[name], managers[name] = ctx, manager
+            # Overlapping replacement uses the real Hermes lease coordinator.
+            for _ in range(2):
+                plugin.register(plugins.PluginContext(manifest, manager))
+                assert len(manager._hooks["on_session_start"]) == 1
     with runtime.profile("a"):
         runtime.registry.get_entry("read_file").handler({"path": "ok"})
         assert runtime.registry.get_entry("b_tool") is None
@@ -1071,6 +1240,11 @@ def test_legacy_unload_restores_original_tool(runtime, monkeypatch, public_resto
     ctx = runtime.register("a")
     with runtime.profile("a"):
         ctx.emit("on_session_start", session_id="same-id")
+        for _ in range(2):
+            previous = ctx
+            ctx = runtime.register("a")
+            for callback in previous.unload:
+                callback()
         assert json.loads(
             runtime.registry.get_entry("read_file").handler({"path": "guarded"})
         ) == {"result": "guarded"}

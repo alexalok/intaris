@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 MAX_SESSIONS = 100
 MAX_RETIRED_PROFILES = 100
 MAX_RECENT_TOOLS = 10
+TEARDOWN_FLUSH_TIMEOUT_S = 5.0
 
 # ============================================================================
 # Configuration
@@ -233,6 +234,9 @@ class ProfileRuntime:
         default_factory=threading.Event, repr=False
     )
     active: bool = True
+    ready: bool = True
+    registered: bool = False
+    predecessor: ProfileRuntime | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -467,14 +471,16 @@ def _record_event(profile: ProfileRuntime, task_id: str, event: dict[str, Any]) 
         # flush. Send its event through the original client immediately; no
         # timer remains to drain an inactive generation's buffer.
         should_flush = (
-            not profile.active
+            not profile.ready
             or len(state.recording_buffer) >= profile.cfg.recording_flush_size
         )
     if should_flush:
         _flush_recording_buffer(profile, task_id)
 
 
-def _flush_recording_buffer(profile: ProfileRuntime, task_id: str) -> None:
+def _flush_recording_buffer(
+    profile: ProfileRuntime, task_id: str, *, timeout_s: float = 5.0
+) -> None:
     """Flush buffered recording events to Intaris."""
     state = profile.sessions.get(task_id)
     if not state or not state.intaris_session_id:
@@ -485,7 +491,9 @@ def _flush_recording_buffer(profile: ProfileRuntime, task_id: str) -> None:
         events = state.recording_buffer[:]
         state.recording_buffer.clear()
     try:
-        profile.client.append_events(state.intaris_session_id, events)
+        profile.client.append_events(
+            state.intaris_session_id, events, timeout_s=timeout_s
+        )
     except Exception as exc:
         logger.warning(
             "[intaris] Recording flush failed for %s: %s (%d events)",
@@ -497,7 +505,7 @@ def _flush_recording_buffer(profile: ProfileRuntime, task_id: str) -> None:
 
 def _periodic_flush(profile: ProfileRuntime) -> None:
     """Flush all recording buffers periodically."""
-    if not profile.active:
+    if not profile.active or not profile.ready:
         return
     with profile.sessions_lock:
         task_ids = list(profile.sessions)
@@ -512,7 +520,7 @@ def _periodic_flush(profile: ProfileRuntime) -> None:
 def _schedule_flush(profile: ProfileRuntime) -> None:
     """Bind even context-free timer threads to the originating runtime."""
     with profile.lifecycle_lock:
-        if profile.active and profile.cfg.recording:
+        if profile.active and profile.ready and profile.cfg.recording:
             profile.flush_timer = threading.Timer(
                 profile.cfg.recording_flush_interval_s,
                 partial(_periodic_flush, profile),
@@ -747,7 +755,7 @@ def _make_guarded_handler(
         return original_handler(args, **kwargs)
 
     def guarded_handler(args: dict, **kwargs: Any) -> Any:
-        if not profile.active or _profile_key() != profile.home:
+        if not profile.active or not profile.ready or _profile_key() != profile.home:
             return json.dumps(
                 {"error": "[intaris] Tool belongs to a different or unloaded profile"}
             )
@@ -1021,7 +1029,11 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
 
         def _make_mcp_handler(srv: str, tn: str) -> Callable:
             def mcp_handler(args: dict, **kwargs: Any) -> str:
-                if not profile.active or _profile_key() != profile.home:
+                if (
+                    not profile.active
+                    or not profile.ready
+                    or _profile_key() != profile.home
+                ):
                     return json.dumps(
                         {
                             "error": "[intaris] MCP tool belongs to a different or unloaded profile"
@@ -1366,46 +1378,74 @@ def _bind_hook(profile: ProfileRuntime, callback: Callable) -> Callable:
 
     @wraps(callback)
     def bound(*args: Any, **kwargs: Any) -> Any:
-        if profile.active:
+        if profile.active and profile.ready:
             return callback(profile, *args, **kwargs)
         return None
 
     return bound
 
 
-def _close_profile(profile: ProfileRuntime) -> None:
-    """Stop this generation's timer and dispose its Hermes registrations."""
+def _quiesce_profile(profile: ProfileRuntime) -> bool:
+    """Block new callbacks while retaining guards until replacement is ready."""
     with profile.lifecycle_lock:
         if not profile.active:
-            return
-        profile.active = False
+            return False
+        profile.ready = False
         if profile.flush_timer is not None:
             profile.flush_timer.cancel()
             profile.flush_timer = None
+        return True
+
+
+def _retain_sessions(profile: ProfileRuntime) -> None:
+    """Retain detached continuity while the caller holds _profiles_lock."""
+    _retired_sessions.pop(profile.home, None)
+    _retired_sessions[profile.home] = _SessionContinuity(
+        _session_fingerprint(profile),
+        profile.sessions,
+        profile.sessions_lock,
+        profile.recording_lock,
+        profile.session_start_required,
+    )
+    while len(_retired_sessions) > MAX_RETIRED_PROFILES:
+        _retired_sessions.pop(next(iter(_retired_sessions)))
+
+
+def _close_profile(profile: ProfileRuntime) -> None:
+    """Stop this generation's timer and dispose its Hermes registrations."""
+    with profile.lifecycle_lock:
+        if not _quiesce_profile(profile):
+            return
+        profile.active = False
         registrations = list(profile.registrations)
     try:
         with profile.sessions_lock:
             task_ids = list(profile.sessions)
+        deadline = time.monotonic() + TEARDOWN_FLUSH_TIMEOUT_S
         for task_id in task_ids:
-            _flush_recording_buffer(profile, task_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _flush_recording_buffer(profile, task_id, timeout_s=remaining)
         for handle in reversed(registrations):
-            handle.dispose()
+            try:
+                handle.dispose()
+            except Exception:
+                logger.exception("[intaris] Failed to dispose profile registration")
     finally:
         with _profiles_lock:
             if _profiles.get(profile.home) is profile:
                 # Keep shared state/locks for already-admitted callbacks, but
                 # never retain the runtime's client, context, tools or timer.
-                _retired_sessions.pop(profile.home, None)
-                _retired_sessions[profile.home] = _SessionContinuity(
-                    _session_fingerprint(profile),
-                    profile.sessions,
-                    profile.sessions_lock,
-                    profile.recording_lock,
-                    profile.session_start_required,
-                )
-                while len(_retired_sessions) > MAX_RETIRED_PROFILES:
-                    _retired_sessions.pop(next(iter(_retired_sessions)))
-                del _profiles[profile.home]
+                # A failed provisional load must not replace the last
+                # successful owner's continuity with another identity.
+                if profile.registered:
+                    _retain_sessions(profile)
+                previous = profile.predecessor
+                if previous is not None and previous.active:
+                    _profiles[profile.home] = previous
+                else:
+                    del _profiles[profile.home]
         profile.closed.set()
 
 
@@ -1456,23 +1496,32 @@ def register(ctx: Any) -> None:
         with _profiles_lock:
             previous = _profiles.get(home)
             known_home = home in _registered_homes
-        if previous is not None and previous.context is ctx and previous.active:
+        if (
+            previous is not None
+            and previous.context is ctx
+            and previous.active
+            and previous.ready
+        ):
             return
         if getattr(ctx, "_load_abandoned", False) is True:
             return
         cfg = _resolve_config(ctx)
         if previous is not None:
-            _close_profile(previous)
-            # An external unload may already be flushing/disposing this owner.
-            # Wait here, not in unload: host rollback must remain able to close
-            # an abandoned loader while discovery holds registration_lock.
-            previous.closed.wait()
+            if not _quiesce_profile(previous):
+                # External unload already owns cleanup. It must not wait for
+                # registration_lock when abandoning a blocked loader.
+                previous.closed.wait()
+            elif previous.registered:
+                with _profiles_lock:
+                    _retain_sessions(previous)
         profile = ProfileRuntime(
             home=home,
             cfg=cfg,
             context=ctx,
             client=IntarisClient(cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id),
             policy=_build_policy(cfg.allow_paths),
+            ready=False,
+            predecessor=previous,
         )
         if known_home:
             profile.session_start_required.set()
@@ -1482,7 +1531,7 @@ def register(ctx: Any) -> None:
                 raise RuntimeError(
                     "Multiple Intaris profiles require Hermes' profile-scoped tool registry"
                 )
-            retained = _retired_sessions.pop(home, None)
+            retained = _retired_sessions.get(home)
             if retained is not None and retained.fingerprint == fingerprint:
                 profile.sessions = retained.sessions
                 profile.sessions_lock = retained.sessions_lock
@@ -1494,11 +1543,40 @@ def register(ctx: Any) -> None:
         except Exception:
             _close_profile(profile)
             raise
-        with _profiles_lock:
-            if profile.active and _profiles.get(home) is profile:
+        with profile.lifecycle_lock, _profiles_lock:
+            if (
+                profile.active
+                and getattr(ctx, "_load_abandoned", False) is not True
+                and _profiles.get(home) is profile
+            ):
+                if previous is not None and not scoped:
+                    # Rollback restores immediate guards. Once committed,
+                    # final unload must restore their original entries.
+                    originals = {
+                        id(handle.current): handle.previous
+                        for handle in previous.registrations
+                        if isinstance(handle, _LegacyToolRegistration)
+                    }
+                    for handle in profile.registrations:
+                        if isinstance(handle, _LegacyToolRegistration):
+                            handle.previous = originals.get(
+                                id(handle.previous), handle.previous
+                            )
+                profile.registered = True
+                profile.ready = True
+                profile.predecessor = None
+                _retired_sessions.pop(home, None)
                 # A lock records an attempt, not a successful load. Retain
                 # successful history even after continuity-cache eviction.
                 _registered_homes.add(home)
+        if not profile.registered:
+            _close_profile(profile)
+            return
+        # Replacement guards now cover the old ones. Scoped Hermes leases
+        # skip disposed predecessors when the replacement is later unloaded.
+        if previous is not None:
+            _close_profile(previous)
+        _schedule_flush(profile)
 
 
 def _register_profile(
@@ -1548,7 +1626,12 @@ def _register_profile(
         if scoped:
             # The host enforces tools.override / allow_tool_override permission
             # and owns teardown of this profile's overlay.
-            _track_registration(profile, ctx.register_tool(**options, override=True))
+            handle = ctx.register_tool(**options, override=True)
+            _track_registration(profile, handle)
+            if handle is None:
+                raise RuntimeError(
+                    f"Hermes did not register Intaris guard: {entry.name}"
+                )
         else:
             registry.register(**options)
             _track_registration(
@@ -1577,7 +1660,6 @@ def _register_profile(
         _track_registration(
             profile, ctx.register_hook(name, _bind_hook(profile, callback))
         )
-    _schedule_flush(profile)
     logger.info(
         "[intaris] Registered profile %s (%d guarded tools)", profile.home, len(entries)
     )

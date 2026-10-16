@@ -284,12 +284,14 @@ class IntarisClient:
         session_id: str,
         events: list[dict[str, Any]],
         agent_id: str | None = None,
+        *,
+        timeout_s: float = 5.0,
     ) -> ApiResult:
         return self.call_api(
             "POST",
             f"/api/v1/session/{urllib.parse.quote(session_id, safe='')}/events",
             events,
-            timeout_s=5.0,
+            timeout_s=timeout_s,
             extra_headers={"X-Intaris-Source": "hermes"},
             agent_id=agent_id,
         )

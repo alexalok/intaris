@@ -71,7 +71,9 @@ authenticated MCP cache and tool registrations, recording buffers, and timer.
 Identical Hermes session IDs in different profiles create distinct Intaris
 sessions. Loading another profile cannot redirect existing callbacks. Unloading
 or reloading a profile cancels its timer and releases its registrations; an
-already-running flush retains its original client.
+already-running flush retains its original client. Final recording uploads share
+a five-second HTTP timeout budget across all sessions. Buffers not attempted
+within that budget remain available to a compatible reload.
 
 Non-secret options can be set under `plugins.entries.intaris.settings`, using
 the environment variable name below without `INTARIS_`, in lowercase (for
@@ -104,6 +106,12 @@ replaced. Session state for the 100 most recently unloaded profiles is retained
 in memory without retaining their clients, managers, or timers. Changing identity
 or policy, or reloading after that state was evicted, requires a fresh Hermes
 session start; tools remain blocked even with fail-open enabled until then.
+If replacement registration fails, the last successful profile's retained
+sessions remain available when retrying with that profile's configuration.
+Direct in-process replacement keeps old guards blocking until the new guards
+are ready, including failed replacement attempts. Hermes' force discovery
+unloads plugin registrations before calling the adapter; tool dispatch must be
+paused by the host during that unload/reload interval.
 Legacy global-only tool registrations are restored on unload, provided another
 plugin has not replaced them in the meantime.
 
