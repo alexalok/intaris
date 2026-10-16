@@ -305,15 +305,34 @@ def test_cancellation_rechecked_at_dispatch(adapter, host, monkeypatch, mode):
     transport = Transport(mode, block="never")
     monkeypatch.setattr("urllib.request.urlopen", transport)
 
-    # Trigger after approval processing but before original-handler dispatch.
+    # Trigger after the real correlation is queued, before handler dispatch.
+    queue_result = plugin._queue_pending_tool_result
+    unrelated = {"tool": "other", "args": "{}", "call_id": "other-call"}
+    adapter.state.pending_tool_results.append(unrelated)
+
     def cancel(*args):
+        pending = queue_result(*args)
         host.interrupted.add(threading.get_ident())
+        return pending
 
     monkeypatch.setattr(plugin, "_queue_pending_tool_result", cancel)
     plugin._cfg.fail_open = True
     result = json.loads(adapter.handler({}, session_id="session-A"))
     assert "CANCELLED" in result["error"]
     assert not adapter.calls
+    assert adapter.state.pending_tool_results == [unrelated]
+
+    # A later identical invocation must record its own audit ID.
+    host.interrupted.remove(threading.get_ident())
+    monkeypatch.setattr(plugin, "_queue_pending_tool_result", queue_result)
+    plugin._cfg.recording = True
+    result = adapter.handler({}, session_id="session-A")
+    plugin._on_post_tool_call(
+        tool_name="synthetic", args={}, result=result, session_id="session-A"
+    )
+    assert len(adapter.calls) == 1
+    assert adapter.state.recording_buffer[-1]["data"]["call_id"] == "c2"
+    assert adapter.state.pending_tool_results == [unrelated]
 
 
 def test_transport_failure_does_not_override_cancellation_with_fail_open(

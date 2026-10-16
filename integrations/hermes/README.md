@@ -138,8 +138,9 @@ Safe polling requires `tools.interrupt.is_interrupted`,
 `tools.approval_context.get_current_session_key`, and the window, ceiling,
 margin and heartbeat APIs in `tools.approval_human_wait`, plus the worker
 interruption fan-out and deadline accounting in that host's executors. Hermes
-supplies `session_id`/`task_id` to correlate lifecycle cancellation. Legacy callers
-without identity can wait only when exactly one adapter session exists.
+must supply the originating `session_id` for evaluation and lifecycle cancellation;
+`task_id` is not a substitute. Missing or invalid session identity blocks every
+guarded call, even when exactly one adapter session exists or fail-open is enabled.
 If these APIs or session context are unavailable, human waits fail closed with
 an instruction to review the Intaris decision and retry; `INTARIS_FAIL_OPEN`
 does not override this restriction. Immediate evaluation results remain supported

@@ -208,17 +208,18 @@ def _args_fingerprint(args: dict[str, Any] | None) -> str:
 
 def _queue_pending_tool_result(
     state: SessionState, tool_name: str, args: dict[str, Any] | None, call_id: str
-) -> None:
-    """Remember the audit call id for the next executed post_tool_call hook."""
+) -> dict[str, str] | None:
+    """Remember and return the correlation entry owned by this invocation."""
     if not call_id:
-        return
-    state.pending_tool_results.append(
-        {
-            "tool": tool_name,
-            "args": _args_fingerprint(args),
-            "call_id": str(call_id),
-        }
-    )
+        return None
+    pending = {
+        "tool": tool_name,
+        "args": _args_fingerprint(args),
+        "call_id": str(call_id),
+    }
+    with _sessions_lock:
+        state.pending_tool_results.append(pending)
+    return pending
 
 
 # ============================================================================
@@ -616,8 +617,17 @@ def _make_guarded_handler(
 
         def dispatch(call_id: str = "") -> str:
             invocation.check()
-            _queue_pending_tool_result(state, tool_name, args, call_id)
-            invocation.check()
+            pending = _queue_pending_tool_result(state, tool_name, args, call_id)
+            try:
+                invocation.check()
+            except WaitStopped:
+                # No tool ran, so this invocation must not consume a later result.
+                with _sessions_lock:
+                    for i, candidate in enumerate(state.pending_tool_results):
+                        if candidate is pending:
+                            del state.pending_tool_results[i]
+                            break
+                raise
             return original_handler(args, **kwargs)
 
         # Evaluate the tool call
@@ -1132,7 +1142,7 @@ def _on_post_tool_call(
         return
     args_key = _args_fingerprint(args)
     mapped_call_id: str | None = None
-    if state:
+    with _sessions_lock:
         # Oldest-match first keeps correlation stable for repeated identical calls.
         for i, candidate in enumerate(state.pending_tool_results):
             if candidate.get("tool") == tool_name and candidate.get("args") == args_key:
