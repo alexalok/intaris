@@ -1044,11 +1044,100 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
     assert not plugin._active_invocations
 
 
-@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("outer_async,inner_async", [(True, False), (False, True)])
+@pytest.mark.parametrize("same_identity", [True, False])
+def test_reload_preserves_mixed_wrapper_calling_convention(
+    runtime, outer_async, inner_async, same_identity
+):
+    calls, validations = [], []
+
+    def original(args, *, session_id=""):
+        calls.append((args, session_id))
+        return json.dumps({"result": args["path"]})
+
+    async def async_original(args, *, session_id=""):
+        return original(args, session_id=session_id)
+
+    with runtime.profile("a") as home:
+        runtime.registry.register(
+            name="mixed_tool",
+            toolset="test",
+            schema={"name": "mixed_tool"},
+            handler=async_original if inner_async else original,
+            is_async=inner_async,
+            check_fn=None,
+            requires_env=[],
+            description="Mixed tool",
+            emoji="",
+        )
+        current = runtime.register("a")
+        current.emit("on_session_start", session_id="same-id")
+        predecessor = runtime.registry.get_entry("mixed_tool").handler
+
+        @wraps(predecessor)
+        def validate(args, **kwargs):
+            validations.append(args["path"])
+            result = asyncio.run(predecessor({"path": "transformed"}, **kwargs))
+            # The external plugin consumes the predecessor's concrete result.
+            return json.dumps(json.loads(result) | {"validated": True})
+
+        @wraps(predecessor)
+        async def async_validate(args, **kwargs):
+            validations.append(args["path"])
+            result = await asyncio.to_thread(
+                predecessor, {"path": "transformed"}, **kwargs
+            )
+            return json.dumps(json.loads(result) | {"validated": True})
+
+        later = Context(runtime.registry, home)
+        later.register_tool(
+            name="mixed_tool",
+            toolset="test",
+            schema={"name": "mixed_tool"},
+            handler=async_validate if outer_async else validate,
+            is_async=outer_async,
+            description="Mixed external wrapper",
+            override=True,
+        )
+        for generation in range(3):
+            if generation:
+                current = runtime.register(
+                    "a",
+                    {} if same_identity else {"agent_id": f"generation-{generation}"},
+                )
+                if not same_identity:
+                    current.emit("on_session_start", session_id="same-id")
+            entry = runtime.registry.get_entry("mixed_tool")
+            value = entry.handler({"path": "allowed"}, session_id="same-id")
+            result = asyncio.run(value) if entry.is_async else value
+            assert json.loads(result) == {"result": "transformed", "validated": True}
+            assert plugin._guard_replacements.get() is None
+            assert not plugin._active_invocations
+
+    assert validations == ["allowed"] * 3
+    assert calls == [({"path": "transformed"}, "same-id")] * 3
+    evaluations = [
+        r
+        for r in requests_for(runtime, "/evaluate")
+        if r["body"]["tool"] == "mixed_tool"
+    ]
+    assert len(evaluations) == 3, "evaluate exactly once before and after each reload"
+    assert all(r["body"]["args"] == {"path": "transformed"} for r in evaluations)
+    if not same_identity:
+        assert [r["headers"].get("X-agent-id", "") for r in evaluations] == [
+            "",
+            "generation-1",
+            "generation-2",
+        ]
+
+
+@pytest.mark.parametrize(
+    "is_async,inner_async", [(False, False), (True, True), (True, False), (False, True)]
+)
 @pytest.mark.parametrize("completed", [False, True])
 @pytest.mark.parametrize("change_identity", [False, True])
 def test_composed_wrapper_cannot_resume_cancelled_invocation(
-    runtime, is_async, completed, change_identity
+    runtime, is_async, inner_async, completed, change_identity
 ):
     entered, release = threading.Event(), threading.Event()
     calls, results = [], []
@@ -1065,8 +1154,8 @@ def test_composed_wrapper_cannot_resume_cancelled_invocation(
             name="paused_tool",
             toolset="test",
             schema={"name": "paused_tool"},
-            handler=async_original if is_async else original,
-            is_async=is_async,
+            handler=async_original if inner_async else original,
+            is_async=inner_async,
             check_fn=None,
             requires_env=[],
             description="Paused tool",
@@ -1080,13 +1169,19 @@ def test_composed_wrapper_cannot_resume_cancelled_invocation(
         def pause(args, **kwargs):
             entered.set()
             assert release.wait(5)
-            return predecessor({"path": "transformed"}, **kwargs)
+            result = predecessor({"path": "transformed"}, **kwargs)
+            return asyncio.run(result) if inner_async else result
 
         @wraps(predecessor)
         async def async_pause(args, **kwargs):
             entered.set()
             assert release.wait(5)
-            return await predecessor({"path": "transformed"}, **kwargs)
+            if inner_async:
+                return await predecessor({"path": "transformed"}, **kwargs)
+            result = await asyncio.to_thread(
+                predecessor, {"path": "transformed"}, **kwargs
+            )
+            return json.dumps(json.loads(result))
 
         later = Context(runtime.registry, home)
         later.register_tool(

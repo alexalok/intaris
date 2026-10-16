@@ -836,7 +836,9 @@ def _make_guarded_handler(
             replacement_target._intaris_original_handler,
             tool_name,
             toolset,
-            is_async,
+            # The foreign wrapper may bridge sync and async handlers. Preserve
+            # the retained guard's contract independently of the outer entry.
+            inspect.iscoroutinefunction(replacement_target),
             _admission=admission,
         )
         replacements = dict(_guard_replacements.get() or {})
