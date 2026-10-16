@@ -1307,3 +1307,64 @@ def test_agent_mid_token_tildes_remain_fast(client, tool, command):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "read"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep --reg="root" "/etc/passwd"',
+        'grep --regex "root" "/etc/passwd"',
+        'grep --future="/etc/passwd" root README.md',
+        'grep --future --regexp="/etc/passwd" README.md',
+    ],
+)
+@pytest.mark.parametrize(
+    "deny_paths", [[], ["/etc/*"]], ids=["boundary", "explicit-deny"]
+)
+def test_agent_unknown_grep_long_options_obey_policy(client, tool, command, deny_paths):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": deny_paths}
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Unapproved possible file",
+                "decision": "deny",
+            }
+        ),
+    ):
+        result = evaluate(client, tool=tool, command=command)
+    assert result["decision"] == "deny", result
+    assert result["path"] == ("critical" if deny_paths else "llm"), result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == ("critical" if deny_paths else "write")
+    assert audit["tool"] == tool
+    if not deny_paths:
+        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        assert "/etc/passwd" in context["target_paths"]
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep --label="/etc/passwd" root README.md',
+        'grep --max-count 2 "/etc/passwd" README.md',
+    ],
+)
+def test_agent_known_grep_data_options_remain_fast(client, tool, command):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": ["/etc/*"]}
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command=command)
+    assert result["decision"] == "approve", result
+    assert result["path"] == "fast", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "read"
+    assert audit["tool"] == tool

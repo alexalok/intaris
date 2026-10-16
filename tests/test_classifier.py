@@ -1592,3 +1592,133 @@ class TestStatClusterFormats:
             )
             == Classification.CRITICAL
         )
+
+
+class TestGrepUnknownLongOptions:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("option", ["--reg", "--rege", "--regex", "--regexp"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_pattern_option_prefixes_never_hide_files(self, tool, option, separator):
+        args = {"command": f'grep {option}{separator}"root" "/etc/passwd"'}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,possible_path",
+        [
+            ('grep --reg="root" README.md', "/tmp/project/README.md"),
+            ("grep --rec root README.md", "/tmp/project/root"),
+            ("grep --line-n root README.md", "/tmp/project/root"),
+            ('grep --fil="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --lab "/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --excl="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future "/etc/passwd" README.md', "/etc/passwd"),
+            ('grep "/etc/passwd" README.md --future', "/etc/passwd"),
+            ('grep --future --regexp="/etc/passwd" README.md', "/etc/passwd"),
+            ('grep --future -e "/etc/passwd" README.md', "/etc/passwd"),
+            ('grep --recursive="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future="../outside.txt" root README.md', "/tmp/outside.txt"),
+            ('grep --future "../outside.txt" README.md', "/tmp/outside.txt"),
+            ("grep --color=auto --future", "/tmp/project/auto"),
+        ],
+    )
+    def test_unparsed_long_options_evaluate_and_keep_possible_operands(
+        self, tool, command, possible_path
+    ):
+        args = {"command": command}
+        assert possible_path in resolve_tool_paths(tool, args, "/tmp/project")
+        assert classify(tool, args) == Classification.WRITE
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": [possible_path]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--regexp "root" README.md',
+            '--regexp="/etc/passwd" README.md',
+            "--file patterns.txt README.md",
+            '--exclude-from ignore.txt "/etc/passwd" README.md',
+            '--label "/etc/passwd" root README.md',
+            '--group-separator="/etc/passwd" root README.md',
+            '--exclude "/etc/passwd" root README.md',
+            '--include="/etc/passwd" root README.md',
+            '--directories skip "/etc/passwd" README.md',
+            '--binary-files text "/etc/passwd" README.md',
+            '--max-count 2 "/etc/passwd" README.md',
+            '--after-context 1 "/etc/passwd" README.md',
+            '--before-context=1 "/etc/passwd" README.md',
+            '--context 2 "/etc/passwd" README.md',
+            '--color "/etc/passwd" README.md',
+            '--colour=always "/etc/passwd" README.md',
+            '--line-number --ignore-case --fixed-strings "/etc/passwd" README.md',
+            '--recursive --with-filename "/etc/passwd" README.md',
+        ],
+    )
+    def test_supported_full_option_roles_remain_fast(self, tool, arguments):
+        args = {"command": f"grep {arguments}"}
+        assert "/etc/passwd" not in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-ne "--future=/etc/passwd" README.md',
+            '--regexp "--future=/etc/passwd" README.md',
+            '--label "--future=/etc/passwd" root README.md',
+            '-- "--future=/etc/passwd" README.md',
+        ],
+    )
+    def test_option_shaped_data_does_not_trigger_fallback(self, tool, arguments):
+        args = {"command": f"grep {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("option", ["--regexp", "--file", "--label"])
+    def test_missing_long_option_value_requires_evaluation(self, tool, option):
+        assert classify(tool, {"command": f"grep {option}"}) == Classification.WRITE

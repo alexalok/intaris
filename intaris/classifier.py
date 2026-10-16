@@ -528,7 +528,7 @@ def _file_operands_for_command(tokens: list[str]) -> list[str]:
     command = tokens[0]
     args = tokens[1:]
     if command in {"grep", "rg"}:
-        return _grep_file_operands(command, args)
+        return _parse_search_arguments(command, args)[0]
     if command == "sed":
         return _sed_file_operands(args)
     if command == "awk":
@@ -589,8 +589,72 @@ def _generic_file_operands(command: str, args: list[str]) -> list[str]:
     return operands
 
 
-def _grep_file_operands(command: str, args: list[str]) -> list[str]:
-    """Return grep/rg file operands while keeping option values out of patterns."""
+# Bounded GNU grep roles: unknown spellings are evaluated, not inferred from
+# arbitrary prefixes. Optional color values are attached-only under getopt_long.
+_GREP_LONG_OPTION_ROLES: dict[str, str] = {
+    "--regexp": "pattern",
+    "--file": "file",
+    "--exclude-from": "auxiliary_file",
+    **dict.fromkeys(
+        (
+            "--after-context",
+            "--before-context",
+            "--context",
+            "--max-count",
+            "--binary-files",
+            "--devices",
+            "--directories",
+            "--exclude",
+            "--exclude-dir",
+            "--include",
+            "--label",
+            "--group-separator",
+        ),
+        "option",
+    ),
+    **dict.fromkeys(("--color", "--colour"), "optional"),
+    **dict.fromkeys(
+        (
+            "--basic-regexp",
+            "--extended-regexp",
+            "--fixed-regexp",
+            "--fixed-strings",
+            "--perl-regexp",
+            "--byte-offset",
+            "--count",
+            "--files-with-matches",
+            "--files-without-match",
+            "--help",
+            "--ignore-case",
+            "--no-ignore-case",
+            "--initial-tab",
+            "--line-buffered",
+            "--line-number",
+            "--line-regexp",
+            "--no-filename",
+            "--no-group-separator",
+            "--no-messages",
+            "--null",
+            "--null-data",
+            "--only-matching",
+            "--quiet",
+            "--recursive",
+            "--dereference-recursive",
+            "--invert-match",
+            "--silent",
+            "--text",
+            "--binary",
+            "--version",
+            "--with-filename",
+            "--word-regexp",
+        ),
+        "flag",
+    ),
+}
+
+
+def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], bool]:
+    """Return file operands and whether GNU grep long-option parsing is uncertain."""
     operands: list[str] = []
     first_positional: int | None = None
     pattern_seen = False
@@ -599,7 +663,7 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
     short_values = {"f": "file", "e": "pattern"}
     short_values.update(dict.fromkeys("mABC", "option"))
     short_values.update(dict.fromkeys("gtrTjEM" if command == "rg" else "dD", "option"))
-    auxiliary_file_option = "--ignore-file" if command == "rg" else "--exclude-from"
+    unknown_options = False
     for index, token in enumerate(args):
         if pending_value is not None:
             if pending_value in {"file", "auxiliary_file"}:
@@ -614,17 +678,28 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
                 first_positional = len(operands)
             operands.extend(remaining)
             break
+        option, separator, value = token.partition("=")
+        if command == "grep" and token.startswith("--"):
+            role = _GREP_LONG_OPTION_ROLES.get(option)
+            if option.startswith("--exclude-f") and "--exclude-from".startswith(option):
+                role = "auxiliary_file"
+            if role is None or (role == "flag" and separator):
+                unknown_options = True
+            elif role == "flag" or (role == "optional" and not separator):
+                pass
+            elif separator:
+                if role in {"file", "auxiliary_file"}:
+                    operands.append(value)
+                if role in {"file", "pattern"}:
+                    pattern_seen = True
+            else:
+                pending_value = role
+            continue
+        # Remaining long-option handling is for ripgrep.
         if command == "rg" and token in {"--files", "--type-list"}:
             patternless = True
             continue
-        # Exclusion/ignore files are read too, but do not supply search patterns.
-        option, separator, value = token.partition("=")
-        # GNU grep accepts these unique prefixes, unlike inline --exclude.
-        if option == auxiliary_file_option or (
-            command == "grep"
-            and option.startswith("--exclude-f")
-            and "--exclude-from".startswith(option)
-        ):
+        if option == "--ignore-file":
             if separator:
                 operands.append(value)
             else:
@@ -696,11 +771,21 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
         if first_positional is None:
             first_positional = len(operands)
         operands.append(token)
-    # -e/-f may appear after positional operands. Only infer a positional
-    # pattern after all options have been considered.
-    if not pattern_seen and not patternless and first_positional is not None:
+    if command == "grep" and pending_value is not None:
+        unknown_options = True
+    if unknown_options:
+        # Unknown roles invalidate positional-pattern inference, even when the
+        # unknown option appears last. Retain all literals and attached values
+        # as possible paths, including values otherwise parsed as pattern/data.
+        operands.extend(arg for arg in args if arg != "--")
+        operands.extend(
+            arg.partition("=")[2] for arg in args if arg.startswith("--") and "=" in arg
+        )
+    elif not pattern_seen and not patternless and first_positional is not None:
+        # -e/-f may appear after positional operands. Infer a positional pattern
+        # only after all known options have been considered.
         del operands[first_positional]
-    return operands
+    return list(dict.fromkeys(operands)), unknown_options
 
 
 def _sed_file_operands(args: list[str]) -> list[str]:
@@ -1238,6 +1323,8 @@ def _is_single_command_read_only(command: str) -> bool:
         return False
 
     base_cmd = tokens[0]
+    if base_cmd == "grep" and _parse_search_arguments(base_cmd, tokens[1:])[1]:
+        return False
 
     # Script interpreters, pagers, and interactive tools can execute programs
     # or write files. Route them through evaluation instead of a prefix allow.
