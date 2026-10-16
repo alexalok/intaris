@@ -246,6 +246,7 @@ class ProfileRuntime:
     active: bool = True
     ready: bool = True
     registered: bool = False
+    continuity_adopted: bool = False
     predecessor: ProfileRuntime | None = field(default=None, repr=False)
 
 
@@ -2010,9 +2011,10 @@ def _close_profile(profile: ProfileRuntime) -> None:
                 # Keep shared state/locks for already-admitted callbacks, but
                 # do not retain registration context, tools, or timers.
                 # Outstanding lifecycle records own their original client.
-                # A failed provisional load must not replace the last
-                # successful owner's continuity with another identity.
-                if profile.registered:
+                # Restore adopted successful continuity if cache pressure
+                # removed it during a failed provisional registration. A new
+                # identity that never registered must not replace it.
+                if profile.registered or profile.continuity_adopted:
                     _retain_sessions(profile)
                 previous = profile.predecessor
                 if previous is not None and previous.active:
@@ -2112,6 +2114,7 @@ def register(ctx: Any) -> None:
                 profile.sessions_lock = retained.sessions_lock
                 profile.recording_lock = retained.recording_lock
                 profile.session_start_required = retained.session_start_required
+                profile.continuity_adopted = True
                 _adopt_continuity(retained)
             _profiles[home] = profile
         try:

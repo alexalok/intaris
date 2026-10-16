@@ -3303,3 +3303,87 @@ def test_retirement_batch_bounds_effect_lock_wait(runtime, monkeypatch):
     assert state._ended.is_set() and state._completion.status == "completed"
     assert not requests_for(runtime, "/agent-summary")
     assert not plugin._completion_owners
+
+
+@pytest.mark.parametrize("failure", ["exception", "abandoned"])
+def test_adopted_continuity_survives_cache_eviction_and_failed_reload(
+    runtime, monkeypatch, failure
+):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 1)
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        original = plugin._profiles[str(home)].sessions["same-id"]
+        original_id = original.intaris_session_id
+        original_owner = original._completion
+        for callback in old.unload:
+            callback()
+    entered, release = threading.Event(), threading.Event()
+    register = plugin._register_profile
+
+    def fail_registration(profile, ctx, *args):
+        if profile.home == str(home):
+            entered.set()
+            assert release.wait(5)
+            if failure == "exception":
+                raise RuntimeError("synthetic pending replacement failure")
+            ctx._load_abandoned = True
+            return
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as failed, ThreadPoolExecutor(max_workers=1) as workers:
+        failed.setattr(plugin, "_register_profile", fail_registration)
+        pending = workers.submit(runtime.register, "a")
+        try:
+            assert entered.wait(5)
+            provisional = plugin._profiles[str(home)]
+            assert provisional.sessions["same-id"] is original
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="other-id")
+                for callback in other.unload:
+                    callback()
+            assert str(home) not in plugin._retired_sessions
+            assert original_owner.status == "active" and not original._ended.is_set()
+        finally:
+            release.set()
+        if failure == "exception":
+            with pytest.raises(
+                RuntimeError, match="synthetic pending replacement failure"
+            ):
+                pending.result(5)
+        else:
+            pending.result(5)
+    current = runtime.register("a")
+    with runtime.profile("a"):
+        recovered = plugin._profiles[str(home)]
+        assert recovered.sessions.get("same-id") is original, (
+            "retry must retain adopted successful continuity"
+        )
+        assert original._completion is original_owner
+        assert original.start_confirmed and not original._ended.is_set()
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "retry"}, session_id="same-id"
+            )
+        ) == {"result": "retry"}
+        current.emit("on_session_end", session_id="same-id")
+    assert (
+        len(
+            [
+                r
+                for r in requests_for(runtime, "/intention")
+                if r["url"].startswith("https://a.invalid")
+            ]
+        )
+        == 1
+    )
+    assert requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == original_id
+    summaries = [
+        r
+        for r in requests_for(runtime, "/agent-summary")
+        if r["url"].startswith("https://a.invalid")
+    ]
+    assert len(summaries) == 1 and summaries[0]["url"].endswith(
+        f"/{original_id}/agent-summary"
+    )
