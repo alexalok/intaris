@@ -52,7 +52,7 @@ export INTARIS_URL=http://localhost:8060  # default
 | `INTARIS_URL` | `http://localhost:8060` | Intaris server URL |
 | `INTARIS_API_KEY` | (required) | API key for authentication |
 | `INTARIS_USER_ID` | (empty) | User ID (optional if API key maps to user) |
-| `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable |
+| `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable. 4xx errors and invalid protocol responses always block. |
 | `INTARIS_ALLOW_PATHS` | (empty) | Comma-separated parent directories for policy allow_paths |
 | `INTARIS_ESCALATION_TIMEOUT` | `0` | Max seconds to wait for escalation (0 = no timeout) |
 | `INTARIS_CHECKPOINT_INTERVAL` | `25` | Evaluate calls between checkpoints (0 = disabled) |
