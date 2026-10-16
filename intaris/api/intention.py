@@ -38,7 +38,7 @@ async def declare_intention(
     exists and triggers an async alignment check. The first /evaluate
     call will wait for the alignment check to complete.
     """
-    from intaris.server import _get_db
+    from intaris.server import _get_config, _get_db
     from intaris.session import SessionStore
 
     if not ctx.agent_id:
@@ -72,7 +72,10 @@ async def declare_intention(
             intention=request.intention,
             title=request.title,
             details=request.details,
-            policy=request.policy,
+            policy=_get_config().server.agent_policy
+            if ctx.is_agent
+            else request.policy,
+            agent_restricted=ctx.is_agent,
             parent_session_id=request.parent_session_id,
             agent_id=ctx.agent_id,
         )
@@ -256,6 +259,14 @@ async def update_session(
     from intaris.server import _get_db
     from intaris.session import SessionStore
 
+    if ctx.is_agent:
+        body = await http_request.json()
+        if set(body) - {"intention", "details"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Agent credentials cannot change session policy or security fields",
+            )
+
     if request.intention is not None:
         logger.debug(
             "Ignoring client intention update for session %s "
@@ -320,6 +331,7 @@ async def update_session_status(
             request.status,
             user_id=ctx.user_id,
             status_reason=request.status_reason,
+            agent_request=ctx.is_agent,
         )
 
         # Publish session_status_changed event
@@ -394,6 +406,8 @@ async def update_session_status(
                     logger.debug("Failed to enqueue close summary", exc_info=True)
 
         return StatusUpdateResponse(ok=True)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         detail = str(e)
         if "not found" in detail:

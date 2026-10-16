@@ -59,6 +59,74 @@ def _parse_api_keys() -> dict[str, str]:
         return {}
 
 
+def _strict_json_object(name: str) -> dict | None:
+    """Parse opt-in security configuration without coercion or duplicate keys."""
+    import json
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+
+    def pairs(items: list[tuple[str, object]]) -> dict:
+        result: dict = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"{name} contains duplicate keys")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"{name} must be a JSON object without duplicate keys"
+        ) from None
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return value
+
+
+def _parse_agent_api_keys() -> dict[str, str]:
+    """Parse agent credentials bound to fixed tenants, failing closed."""
+    keys = _strict_json_object("INTARIS_AGENT_API_KEYS") or {}
+    for key, user in keys.items():
+        if (
+            not key
+            or not key.isascii()
+            or any(c.isspace() for c in key)
+            or not isinstance(user, str)
+            or not user.strip()
+            or user != user.strip()
+            or any(c in user for c in "*?[]")
+        ):
+            raise ValueError(
+                "INTARIS_AGENT_API_KEYS requires keys and fixed nonempty users; no wildcards"
+            )
+    return keys
+
+
+def _parse_agent_policy() -> dict | None:
+    """Validate the server-owned policy separately from permissive client models."""
+    from intaris.api.schemas import SessionPolicy
+
+    policy = _strict_json_object("INTARIS_AGENT_POLICY")
+    if policy is None:
+        return None
+    try:
+        parsed = SessionPolicy.model_validate(policy, strict=True, extra="forbid")
+    except ValueError:
+        raise ValueError(
+            "INTARIS_AGENT_POLICY contains unknown fields or invalid types"
+        ) from None
+    if policy.get("maximum_outcome") not in (None, "deny"):
+        raise ValueError("INTARIS_AGENT_POLICY maximum_outcome must be deny")
+    if "judge" in policy or "interaction_mode" in policy:
+        raise ValueError(
+            "INTARIS_AGENT_POLICY uses server JUDGE_MODE; judge and interaction_mode overrides are unsupported"
+        )
+    return parsed.model_dump(exclude_none=True)
+
+
 def _data_dir() -> str:
     """Resolve base data directory.
 
@@ -194,6 +262,19 @@ class ServerConfig:
     # Multi-key with user_id mapping: {"key": "username", "key2": "*"}
     # A value of "*" means auth-only (no user binding).
     api_keys: dict[str, str] = field(default_factory=_parse_api_keys)
+
+    # Opt-in restricted credentials and immutable server-owned session policy.
+    agent_api_keys: dict[str, str] = field(default_factory=_parse_agent_api_keys)
+    agent_policy: dict | None = field(default_factory=_parse_agent_policy)
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous credentials before serving any requests."""
+        if self.agent_api_keys and self.agent_policy is None:
+            raise ValueError(
+                "INTARIS_AGENT_POLICY is required with INTARIS_AGENT_API_KEYS"
+            )
+        if set(self.agent_api_keys) & (set(self.api_keys) | {self.api_key}):
+            raise ValueError("INTARIS_AGENT_API_KEYS must not overlap admin API keys")
 
     # Cognis JWT validation (optional, additive to API key auth).
     jwt_public_key: str = field(default_factory=lambda: _env("INTARIS_JWT_PUBLIC_KEY"))

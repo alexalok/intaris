@@ -244,10 +244,10 @@ class TestReadOnlyBash:
             == Classification.WRITE
         )
 
-    def test_sed_without_i_is_read(self):
+    def test_sed_scripts_require_evaluation(self):
         assert (
             classify("bash", {"command": "sed 's/a/b/' file.txt"})
-            == Classification.READ
+            == Classification.WRITE
         )
 
     def test_sed_with_i_is_write(self):
@@ -270,10 +270,11 @@ class TestReadOnlyBash:
     def test_piped_commands_all_read(self):
         assert (
             classify("bash", {"command": "cat file.txt | grep pattern"})
-            == Classification.READ
+            == Classification.WRITE
         )
         assert (
-            classify("bash", {"command": "ls -la | sort | head"}) == Classification.READ
+            classify("bash", {"command": "ls -la | sort | head"})
+            == Classification.WRITE
         )
 
     def test_piped_commands_with_write(self):
@@ -283,7 +284,7 @@ class TestReadOnlyBash:
         )
 
     def test_chained_commands_all_read(self):
-        assert classify("bash", {"command": "ls && pwd"}) == Classification.READ
+        assert classify("bash", {"command": "ls && pwd"}) == Classification.WRITE
 
     def test_chained_commands_with_write(self):
         assert (
@@ -292,7 +293,7 @@ class TestReadOnlyBash:
 
     def test_background_commands_all_read(self):
         # Both commands in background execution must be read-only
-        assert classify("bash", {"command": "ls & pwd"}) == Classification.READ
+        assert classify("bash", {"command": "ls & pwd"}) == Classification.WRITE
 
     def test_background_commands_with_write(self):
         # 'rm -rf /' matches critical pattern, so the whole command is CRITICAL
@@ -321,10 +322,11 @@ class TestReadOnlyBash:
         """Input redirection is detected (< operator)."""
         assert classify("bash", {"command": "sort < input.txt"}) == Classification.WRITE
 
-    def test_no_false_positive_redirect(self):
-        """Comparison operators in quoted strings should not trigger redirect."""
-        # grep with > inside quotes should still be read-only
-        assert classify("bash", {"command": "grep '>' file.txt"}) == Classification.READ
+    def test_quoted_redirect_symbols_require_evaluation(self):
+        """Quoted metacharacters also defer to the conservative evaluator."""
+        assert (
+            classify("bash", {"command": "grep '>' file.txt"}) == Classification.WRITE
+        )
 
     def test_empty_command(self):
         assert classify("bash", {"command": ""}) == Classification.WRITE
@@ -848,7 +850,6 @@ class TestPathClassification:
             "cat certs/keycloak.pem",
             "diff --label .env old new",
             "grep needle --exclude .env README.md",
-            "awk '{print}' label=.env README.md",
             "cat path=.env",
         ],
     )

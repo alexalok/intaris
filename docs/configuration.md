@@ -15,6 +15,8 @@ Data is stored in `~/.intaris` by default (override with `DATA_DIR`). In Docker,
 | `METRICS_PORT` | `9090` | Dedicated Prometheus metrics port; must differ from `INTARIS_PORT` |
 | `INTARIS_API_KEY` | (empty) | Single shared API key. Authenticates requests but does not bind to a user -- clients must send `X-User-Id` header. |
 | `INTARIS_API_KEYS` | (empty) | JSON dict mapping API keys to user IDs: `{"key1": "alice", "key2": "bob", "key3": "*"}`. A value of `"*"` means auth-only (no user binding). |
+| `INTARIS_AGENT_API_KEYS` | (unset) | Opt-in JSON mapping of restricted agent API keys to fixed user IDs. Requires `INTARIS_AGENT_POLICY`; keys must not overlap either admin key setting. |
+| `INTARIS_AGENT_POLICY` | (unset) | Server-owned JSON session policy for restricted credentials. Strict validation; see below. |
 | `INTARIS_JWT_PUBLIC_KEY` | (empty) | Path to a Cognis ES256 public key PEM for JWT validation |
 | `INTARIS_JWKS_URL` | (empty) | JWKS URL for Cognis-issued JWT validation (mutually exclusive with `INTARIS_JWT_PUBLIC_KEY`) |
 | `RATE_LIMIT` | `60` | Max evaluations per session per minute. Set to `0` to disable. |
@@ -23,7 +25,7 @@ Data is stored in `~/.intaris` by default (override with `DATA_DIR`). In Docker,
 
 ### Authentication
 
-At least one of `INTARIS_API_KEY`, `INTARIS_API_KEYS`, `INTARIS_JWT_PUBLIC_KEY`, or `INTARIS_JWKS_URL` should be set in production. Without any of them, the server accepts unauthenticated requests.
+At least one of `INTARIS_API_KEY`, `INTARIS_API_KEYS`, `INTARIS_AGENT_API_KEYS`, `INTARIS_JWT_PUBLIC_KEY`, or `INTARIS_JWKS_URL` should be set in production. Without any of them, the server accepts unauthenticated requests.
 
 With `INTARIS_API_KEY` (single shared key), clients must also send `X-User-Id` to identify themselves. With `INTARIS_API_KEYS`, the user identity is resolved from the key mapping. With Cognis JWTs, Intaris resolves `user_id` from the JWT `sub` claim and optional `agent_id` from the JWT `agent_id` claim (or `X-Agent-Id` when the claim is absent).
 
@@ -43,6 +45,47 @@ JWT validation requires:
 - `aud` includes `"intaris"`
 - `sub` claim present
 - matching `agent_id` claim and `X-Agent-Id` header when both are provided
+
+### Restricted agent credentials
+
+Existing `INTARIS_API_KEY`, `INTARIS_API_KEYS`, and Cognis JWT/SSO credentials keep their existing administrative privileges. Give the adapter a **different**, restricted key. Both keys may map to the same tenant so a human operator can review and resolve the agent's calls.
+
+Example server environment (replace the placeholder keys and user):
+
+```dotenv
+INTARIS_API_KEYS={"replace-admin-key":"operator"}
+INTARIS_AGENT_API_KEYS={"replace-agent-key":"operator"}
+INTARIS_AGENT_POLICY={"allow_tools":["read_file","search_files","read_terminal"],"deny_commands":["*sudo*"],"deny_paths":[],"maximum_outcome":"deny"}
+JUDGE_MODE=advisory
+```
+
+The adapter uses `INTARIS_API_KEY=replace-agent-key` in its **own** environment and sends `X-Agent-Id: hermes`. The server's admin key, model credentials, database, configuration, and process environment must remain accessible only to the separate Intaris service user. Do not give Hermes the server environment file or service-account access. This change adds no OS isolation or sandbox.
+
+Validation and enforcement:
+
+- `INTARIS_AGENT_API_KEYS` is a JSON object of nonempty ASCII keys without whitespace to nonempty fixed user IDs without surrounding whitespace or glob characters (`*`, `?`, `[`, `]`). Values are never coerced. Duplicate JSON keys, malformed JSON, and overlap with `INTARIS_API_KEY` or `INTARIS_API_KEYS` fail startup. An absent or empty mapping disables the role.
+- `INTARIS_AGENT_POLICY` must be an explicit JSON object when agent keys are present. Unknown fields, duplicate JSON keys (including nested ones), and invalid types fail startup. Supported fields are the string arrays `allow_tools`, `deny_tools`, `allow_commands`, `deny_commands`, `allow_paths`, `deny_paths`; `allow_policies`/`deny_policies` arrays of strings or objects; and optional `maximum_outcome`, which may only be `"deny"` (or null/omitted). Here `deny` preserves the full severity of the evaluator's decision; it does not deny every call. `judge` and `interaction_mode` overrides are unsupported: the operator controls `JUDGE_MODE`.
+- `allow_tools` is an explicit, trusted native-tool list. Do not include `terminal` or `bash`, or broad shell command patterns. The example deliberately leaves `allow_commands` unset so shell calls use the conservative classifier. `deny_paths: []` adds no filesystem deny rules; normal project-boundary checks still apply when a working directory is supplied.
+- The fixed tenant cannot be overridden by `X-User-Id`, `X-Agent-Id`, or role headers. If a request includes a restricted key in any supported credential carrier, it remains restricted even with an admin SSO cookie. Conflicting restricted tenants are rejected. Agent credentials cannot exchange themselves for admin cookies or use WebSocket/MCP surfaces.
+- Agent session creation ignores client-supplied policy and stores the server policy plus a durable, server-only `agent_restricted` flag. Evaluating an existing same-tenant session with an agent key permanently sets this flag, including sessions created by an admin. Every later evaluation and Judge review uses the current server policy independently of the stored session policy and caller role. Removing the policy from configuration makes restricted-session evaluation fail closed. A restart or PATCH cannot remove the flag.
+- Agent PATCH permits `details` and the legacy ignored `intention` field only. Policy, parent, and security-field edits are forbidden. Status PATCH permits `active`, `idle`, and `completed` only while the current status is one of those values. Its database update is conditional, so an agent cannot clear a concurrent human suspension/termination. Human admin keys retain the full lifecycle controls.
+- Client `maximum_outcome`, `judge`, and unattended-mode policy cannot weaken mandatory enforcement. Critical mandatory denials cannot reuse cached Judge approvals. A human admin can still approve the exact call through `/decision`, and normal human approval polling/retry remains supported.
+
+Only these agent routes are enabled; all other methods and paths return 403:
+
+| Method | Routes (under `/api/v1`) |
+|---|---|
+| POST | `/intention`, `/evaluate`, `/reasoning`, `/checkpoint`, `/session/{id}/agent-summary`, `/session/{id}/events`, `/session/{id}/events/flush` |
+| GET | `/session/{id}`, `/audit/{call_id}`, `/session/{id}/summary`, `/profile` |
+| PATCH | `/session/{id}` (constrained fields), `/session/{id}/status` (constrained lifecycle) |
+
+In particular, `/decision`, configuration/management endpoints, MCP management and calls (including stdio launch), token exchange, action-token routes, and WebSocket streams are unavailable to restricted credentials. The native Hermes lifecycle/recording works; its optional MCP tool discovery returns no tools with this key. Agent access is tenant-scoped, not an isolation boundary between sessions in the same tenant.
+
+`terminal` and `bash` now share command, critical-pattern, and path classification; audit records keep the original tool name. Simple reads such as `cat README.md`, `ls -la`, `pwd`, and `git status --short` remain fast. Compounds/pipelines, expansion, redirection, executable scripts, and write/exec options require evaluation. Some harmless commands are conservatively evaluated. This matcher assumes the named executables and their environment/configuration are trusted; it is not a complete shell sandbox.
+
+The regression cases follow the documented behavior of [Bash command substitution](https://www.gnu.org/s/bash/manual/html_node/Command-Substitution.html), [GNU find execution actions](https://www.gnu.org/software/findutils/manual/html_node/find_html/Single-File.html), [GNU sort output files](https://www.gnu.org/software/coreutils/manual/html_node/sort-invocation.html), and [Git diff output/external helpers](https://git-scm.com/docs/git-diff). These are reasons to inspect the whole command, rather than auto-approve a leading command name.
+
+No model or timeout defaults change with this opt-in role. Size the adapter HTTP timeout for intention/alignment barriers plus evaluator and synchronous Judge latency. A planned 60-second Hermes HTTP timeout requires a separate measured model/timeout configuration; these deterministic tests do not establish provider latency.
 
 ## Tool-Call Evaluator
 

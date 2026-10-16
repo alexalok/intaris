@@ -469,6 +469,7 @@ class AuditStore:
         tool: str,
         args_hash: str,
         cutoff: str,
+        human_only: bool = False,
     ) -> dict[str, Any] | None:
         """Find a prior approved override for the same tool+args.
 
@@ -502,10 +503,11 @@ class AuditStore:
                       OR COALESCE(maximum_outcome, 'deny') = 'deny'
                   )
                   AND resolved_at >= ?
+                  AND (? = FALSE OR resolved_by = 'user')
                 ORDER BY resolved_at DESC
                 LIMIT 1
                 """,
-                (user_id, tool, args_hash, UNATTENDED_JUDGE_REVIEW, cutoff),
+                (user_id, tool, args_hash, UNATTENDED_JUDGE_REVIEW, cutoff, human_only),
             )
             row = cur.fetchone()
 

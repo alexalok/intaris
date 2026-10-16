@@ -495,6 +495,11 @@ class Database:
             conn.execute("ALTER TABLE notification_channels ADD COLUMN events TEXT")
             logger.info("Migration: added events column to notification_channels")
 
+        if not self._sqlite_column_exists(conn, "sessions", "agent_restricted"):
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN agent_restricted INTEGER NOT NULL DEFAULT 0"
+            )
+
         if not self._sqlite_column_exists(conn, "sessions", "alignment_overridden"):
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN alignment_overridden INTEGER DEFAULT 0"
@@ -969,6 +974,7 @@ class Database:
                 ("sessions", "agent_id", "TEXT"),
                 ("notification_channels", "events", "TEXT"),
                 ("sessions", "alignment_overridden", "BOOLEAN DEFAULT FALSE"),
+                ("sessions", "agent_restricted", "BOOLEAN NOT NULL DEFAULT FALSE"),
                 ("sessions", "last_alignment", "TEXT"),
                 ("audit_log", "injection_detected", "BOOLEAN DEFAULT FALSE"),
                 ("behavioral_analyses", "agent_id", "TEXT"),
@@ -1231,6 +1237,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_event_seq INTEGER DEFAULT 0,
     latest_user_message_seq INTEGER,
     user_message_observed INTEGER DEFAULT 0,
+    agent_restricted INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, session_id)
@@ -1540,6 +1547,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_event_seq BIGINT DEFAULT 0,
     latest_user_message_seq BIGINT,
     user_message_observed BOOLEAN DEFAULT FALSE,
+    agent_restricted BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (user_id, session_id)
 );
 

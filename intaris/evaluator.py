@@ -49,7 +49,7 @@ from intaris.decision import (
     make_fast_decision,
 )
 from intaris.llm import LLMClient, parse_json_response
-from intaris.policy import effective_policy_for_evaluator
+from intaris.policy import effective_policy_for_evaluator, policy_for_session
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import (
     SAFETY_EVALUATION_SCHEMA,
@@ -169,7 +169,7 @@ def _effective_working_directory(
         ),
         None,
     )
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         tool_workdir = args.get("workdir")
         if isinstance(tool_workdir, str) and tool_workdir:
             if os.path.isabs(tool_workdir):
@@ -260,8 +260,10 @@ class Evaluator:
         analysis_config: AnalysisConfig | None = None,
         alignment_barrier: Any | None = None,
         jev: JevClient | None = None,
+        agent_policy: dict[str, Any] | None = None,
     ):
         self._llm = llm
+        self._agent_policy = agent_policy
         self._jev = jev
         self._sessions = session_store
         self._audit = audit_store
@@ -293,6 +295,7 @@ class Evaluator:
         minimum_outcome: str | None = None,
         approval_call_id: str | None = None,
         judge_unattended: bool = False,
+        restricted_agent: bool = False,
     ) -> dict[str, Any]:
         """Evaluate a tool call for safety and intention alignment.
 
@@ -332,7 +335,17 @@ class Evaluator:
             context["approval_call_id"] = approval_call_id
 
         # Get session for intention and policy (verifies ownership)
+        if restricted_agent:
+            self._sessions.restrict_agent_session(session_id, user_id=user_id)
         session = self._sessions.get(session_id, user_id=user_id)
+        restricted = bool(session.get("agent_restricted"))
+        session["policy"] = policy_for_session(session, self._agent_policy)
+        if restricted:
+            # Agent context cannot opt into autonomous Judge approval of denials.
+            judge_unattended = False
+            context = dict(context or {})
+            for field in ("interaction_mode", "judge", "maximum_outcome", "policy"):
+                context.pop(field, None)
         maximum_outcome = (session.get("policy") or {}).get("maximum_outcome")
         unattended = (session.get("policy") or {}).get(
             "interaction_mode"
@@ -348,7 +361,9 @@ class Evaluator:
         # Auto-resume idle sessions silently (behavioral guardrails)
         if session_status == "idle":
             try:
-                self._sessions.update_status(session_id, "active", user_id=user_id)
+                self._sessions.update_status(
+                    session_id, "active", user_id=user_id, agent_request=restricted
+                )
                 session_status = "active"
                 logger.debug("Auto-resumed idle session %s", session_id)
             except ValueError:
@@ -710,6 +725,7 @@ class Evaluator:
                     user_id=user_id,
                     tool=tool,
                     args_hash=args_hash,
+                    human_only=restricted,
                 )
                 if minimum_outcome is None and not unattended
                 else None
@@ -992,6 +1008,7 @@ class Evaluator:
         user_id: str,
         tool: str,
         args_hash: str,
+        human_only: bool = False,
     ) -> Decision | None:
         """Check if a prior escalation or denial for the same tool+args was approved.
 
@@ -1020,6 +1037,7 @@ class Evaluator:
             tool=tool,
             args_hash=args_hash,
             cutoff=cutoff,
+            human_only=human_only,
         )
 
         if row is not None:

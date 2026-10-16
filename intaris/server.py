@@ -25,7 +25,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Match, Mount, Route, WebSocketRoute
 
 from intaris import __version__
-from intaris.auth import match_api_key, resolve_auth
+from intaris.auth import (
+    agent_route_allowed,
+    agent_user_from_credentials,
+    match_api_key,
+    resolve_auth,
+)
 from intaris.config import SearchConfig, load_config
 from intaris.metrics import (
     RuntimeMetrics,
@@ -55,6 +60,9 @@ _session_agent_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _session_user_bound: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "session_user_bound", default=False
+)
+_session_is_agent: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "session_is_agent", default=False
 )
 # user_bound is True when the API key maps to a specific user_id.
 # When True, the UI should prevent user impersonation (X-User-Id override).
@@ -121,6 +129,7 @@ def _get_evaluator(alignment_barrier=None):
             analysis_config=cfg.analysis,
             alignment_barrier=alignment_barrier,
             jev=_get_jev_client(),
+            agent_policy=cfg.server.agent_policy,
         )
     return _evaluator
 
@@ -356,6 +365,34 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        cfg = _get_config()
+        try:
+            agent_user = agent_user_from_credentials(
+                request.headers, request.cookies, cfg.server.agent_api_keys
+            )
+        except ValueError:
+            return JSONResponse({"error": "Conflicting credentials"}, status_code=401)
+        if agent_user is not None:
+            if not agent_route_allowed(request.method, request.url.path):
+                return JSONResponse(
+                    {"error": "Agent credential cannot access this endpoint"},
+                    status_code=403,
+                )
+            from intaris.sanitize import validate_agent_id
+
+            agent_id = validate_agent_id(request.headers.get("x-agent-id", "").strip())
+            tokens = [
+                (_session_user_id, _session_user_id.set(agent_user)),
+                (_session_agent_id, _session_agent_id.set(agent_id)),
+                (_session_user_bound, _session_user_bound.set(True)),
+                (_session_is_agent, _session_is_agent.set(True)),
+            ]
+            try:
+                return await call_next(request)
+            finally:
+                for variable, token in reversed(tokens):
+                    variable.reset(token)
+
         # Skip auth for health endpoint, static UI files, action tokens,
         # and the exchange token endpoint (it validates the token itself).
         if (
@@ -371,8 +408,6 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        cfg = _get_config()
-
         try:
             from intaris.sanitize import validate_agent_id
 
@@ -381,7 +416,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             header_user_id = request.headers.get("x-user-id", "").strip() or None
 
             has_auth = bool(
-                cfg.server.api_keys
+                cfg.server.agent_api_keys
+                or cfg.server.api_keys
                 or cfg.server.api_key
                 or cfg.server.jwt_public_key
                 or cfg.server.jwks_url
@@ -427,6 +463,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     header_agent_id=header_agent_id,
                     api_key=cfg.server.api_key,
                     api_keys=cfg.server.api_keys,
+                    agent_api_keys=cfg.server.agent_api_keys,
                     jwt_public_key=cfg.server.jwt_public_key,
                     jwks_url=cfg.server.jwks_url,
                     allow_no_auth=False,
@@ -443,6 +480,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     header_agent_id=header_agent_id,
                     api_key=cfg.server.api_key,
                     api_keys=cfg.server.api_keys,
+                    agent_api_keys=cfg.server.agent_api_keys,
                     jwt_public_key=cfg.server.jwt_public_key,
                     jwks_url=cfg.server.jwks_url,
                     allow_no_auth=True,
@@ -519,6 +557,11 @@ class _MCPEndpoint:
     async def __call__(self, scope, receive, send):
         """ASGI interface."""
         if scope["type"] not in ("http", "websocket"):
+            return
+
+        # This surface supports Streamable HTTP only, never unauthenticated WS.
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
             return
 
         # Get the MCP proxy from the module-level reference.
@@ -922,6 +965,7 @@ async def lifespan(app):
         judge_reviewer = JudgeReviewer(
             llm=_LLMClient(cfg.llm_judge),
             config=cfg.judge,
+            agent_policy=cfg.server.agent_policy,
             audit_store=_AuditStore(_get_db()),
             session_store=_SessionStore(_get_db()),
             evaluator=_get_evaluator(),

@@ -911,7 +911,7 @@ def classify(
         return Classification.READ
 
     # Step 6: Check critical patterns (bash only)
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         if command and _is_critical(command):
             return Classification.CRITICAL
@@ -962,7 +962,7 @@ def resolve_tool_paths(
             raw_paths.extend(extract_apply_patch_paths(patch_text))
 
     # For bash commands, also extract absolute paths from the command string
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         if command:
             raw_paths.extend(extract_bash_paths(command))
@@ -1041,7 +1041,7 @@ def is_read_only(tool: str, args: dict[str, Any]) -> bool:
 
     Checks the tool name against the built-in read-only allowlist.
     For bash commands, also checks the command string for read-only
-    commands, piped chains, and git subcommands.
+    commands and git subcommands. Compound shell syntax requires evaluation.
 
     This is a pure classification check — it does NOT consider session
     policy, tool preferences, or path policy. Use ``classify()`` for
@@ -1082,7 +1082,7 @@ def is_read_only(tool: str, args: dict[str, Any]) -> bool:
                 return True
 
     # Bash commands (case-sensitive — "bash" is always lowercase)
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         return _is_read_only_bash(args)
 
     return False
@@ -1092,37 +1092,17 @@ def _is_read_only_bash(args: dict[str, Any]) -> bool:
     """Check if a bash command is read-only.
 
     Parses the command to extract the base command and checks against
-    the read-only allowlist. Special handling for git subcommands,
-    sed -i (write), and piped commands.
+    the read-only allowlist. Compound syntax, executable scripts, and
+    state-changing options require evaluation.
     """
     command = _extract_bash_command(args)
     if not command:
         return False
 
-    # Handle piped commands: ALL commands in the pipe must be read-only
-    if "|" in command:
-        parts = command.split("|")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
-
-    # Handle chained commands (&&, ;) and background (&)
-    for sep in ("&&", ";"):
-        if sep in command:
-            parts = command.split(sep)
-            return all(
-                _is_single_command_read_only(part.strip())
-                for part in parts
-                if part.strip()
-            )
-
-    # Background execution: 'cmd1 & cmd2' — both must be read-only.
-    # Check after && to avoid splitting on && first.
-    if " & " in command or command.endswith(" &"):
-        parts = command.split("&")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
+    # Fast paths cover simple commands only. Shell control flow, expansion,
+    # and redirection require evaluation even when the first command is safe.
+    if any(char in command for char in ";&|\n\r`$"):
+        return False
 
     return _is_single_command_read_only(command)
 
@@ -1133,6 +1113,10 @@ _REDIRECT_OPS: set[str] = {">", ">>", "2>", "2>>", "&>", "&>>", "<", "<<"}
 
 def _is_single_command_read_only(command: str) -> bool:
     """Check if a single (non-piped, non-chained) command is read-only."""
+    # Mixed/remaining shell control syntax is not a simple command.
+    if any(char in command for char in ";&|\n\r`$"):
+        return False
+
     # Check for shell redirection BEFORE shlex.split, since shlex treats
     # > as a regular token. We scan the raw command for redirect operators.
     if _has_shell_redirect(command):
@@ -1149,17 +1133,54 @@ def _is_single_command_read_only(command: str) -> bool:
 
     base_cmd = tokens[0]
 
+    # Script interpreters, pagers, and interactive tools can execute programs
+    # or write files. Route them through evaluation instead of a prefix allow.
+    if base_cmd in {"awk", "sed", "yq", "less", "more", "top", "fd"}:
+        return False
+    if base_cmd == "env" and len(tokens) != 1:
+        return False
+    if base_cmd == "find" and any(
+        t.startswith(("-exec", "-ok", "-delete", "-fprint", "-fls")) for t in tokens[1:]
+    ):
+        return False
+    if base_cmd == "rg" and any(
+        t.startswith(("--pre", "--hostname-bin")) for t in tokens[1:]
+    ):
+        return False
+    # These utilities have output-file/command options (including abbreviated
+    # long options). Only plain operands are eligible for the fast path.
+    if base_cmd in {"sort", "tree", "file", "uniq"}:
+        if any(t.startswith("-") and t != "-" for t in tokens[1:]):
+            return False
+        if base_cmd == "uniq" and len(tokens) > 2:
+            return False
+    if base_cmd == "date" and not (
+        len(tokens) == 1 or (len(tokens) == 2 and tokens[1].startswith("+"))
+    ):
+        return False
+    if base_cmd == "hostname" and len(tokens) != 1:
+        return False
+
     # Git: check subcommand
     if base_cmd == "git" and len(tokens) > 1:
         subcommand = tokens[1]
+        unsafe_options = (
+            "--output",
+            "--ext-diff",
+            "--textconv",
+            "--open-files-in-pager",
+        )
+        if any(
+            t.startswith("--")
+            and len(t) > 2
+            and any(option.startswith(t.split("=", 1)[0]) for option in unsafe_options)
+            for t in tokens[2:]
+        ):
+            return False
         if subcommand in _READ_ONLY_GIT_SUBCOMMANDS:
             return True
         if subcommand in _GIT_SUBCOMMANDS_WITH_CHECKS:
             return _is_git_subcommand_read_only(subcommand, tokens[2:])
-        return False
-
-    # sed with -i flag is a write operation
-    if base_cmd == "sed" and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
         return False
 
     # python/node are not read-only by default (can execute arbitrary code)
@@ -1171,30 +1192,8 @@ def _is_single_command_read_only(command: str) -> bool:
 
 
 def _has_shell_redirect(command: str) -> bool:
-    """Check if a command contains shell redirection operators.
-
-    Scans the raw command string for output/input redirection that would
-    make an otherwise read-only command into a write operation.
-    Examples: 'ls > file.txt', 'echo data >> log', 'cat < input'.
-
-    Uses regex to avoid false positives inside quoted strings.
-    """
-    # Match redirection operators NOT inside quotes.
-    # This is a simplified check — it won't catch all edge cases with
-    # nested quoting, but covers the common attack vectors.
-    # Pattern: unquoted >, >>, 2>, 2>>, &>, &>>, <, <<
-    return bool(
-        re.search(
-            r"""(?<!['"\\])"""  # Not preceded by quote or escape
-            r"(?:"
-            r"\d*>>?"  # [n]> or [n]>>
-            r"|&>>"  # &>>
-            r"|&>"  # &>
-            r"|<<?(?!<)"  # < or << (but not <<<)
-            r")",
-            command,
-        )
-    )
+    """Conservatively reject redirection, including adjacent quoted operands."""
+    return "<" in command or ">" in command
 
 
 def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
@@ -1218,7 +1217,18 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         config_args = set(remaining)
         read_flags = {"--get", "--get-all", "--list", "-l"}
         if config_args & read_flags:
-            return True
+            safe_flags = read_flags | {
+                "--show-origin",
+                "--show-scope",
+                "--global",
+                "--local",
+                "--system",
+                "--null",
+                "-z",
+            }
+            return all(
+                not arg.startswith("-") or arg in safe_flags for arg in remaining
+            )
         return False
 
     if subcommand == "branch":
@@ -1265,7 +1275,10 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         if not remaining:
             return True
         if remaining[0] in ("-l", "--list"):
-            return True
+            return all(
+                not arg.startswith("-") or arg in {"-l", "--list", "-n"}
+                for arg in remaining
+            )
         return False
 
     if subcommand == "remote":
@@ -1277,7 +1290,7 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         if not remaining:
             return True
         if remaining[0] in ("-v", "--verbose"):
-            return True
+            return len(remaining) == 1
         if remaining[0] in ("show", "get-url"):
             return True
         return False
@@ -1324,7 +1337,7 @@ def _check_session_policy_deny(
     if tool in deny_tools:
         return Classification.CRITICAL
 
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         deny_commands = policy.get("deny_commands", [])
         for pattern in deny_commands:
@@ -1344,7 +1357,7 @@ def _check_session_policy_allow(
     if tool in allow_tools:
         return Classification.READ
 
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         allow_commands = policy.get("allow_commands", [])
         for pattern in allow_commands:
