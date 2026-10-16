@@ -2078,26 +2078,17 @@ def register(ctx: Any) -> None:
     # Network requests and recording flushes must not hold up another home.
     with registration_lock:
         with _profiles_lock:
-            previous = _profiles.get(home)
-            known_home = home in _registered_homes
+            current = _profiles.get(home)
         if (
-            previous is not None
-            and previous.context is ctx
-            and previous.active
-            and previous.ready
+            current is not None
+            and current.context is ctx
+            and current.active
+            and current.ready
         ):
             return
         if getattr(ctx, "_load_abandoned", False) is True:
             return
         cfg = _resolve_config(ctx)
-        if previous is not None:
-            if not _quiesce_profile(previous):
-                # External unload already owns cleanup. It must not wait for
-                # registration_lock when abandoning a blocked loader.
-                previous.closed.wait()
-            elif previous.registered:
-                with _profiles_lock:
-                    _retain_sessions(previous)
         profile = ProfileRuntime(
             home=home,
             cfg=cfg,
@@ -2105,16 +2096,21 @@ def register(ctx: Any) -> None:
             client=IntarisClient(cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id),
             policy=_build_policy(cfg.allow_paths),
             ready=False,
-            predecessor=previous,
         )
-        if known_home:
-            profile.session_start_required.set()
         fingerprint = _session_fingerprint(profile)
         with _profiles_lock:
             if not scoped and any(key != home for key in _profiles):
                 raise RuntimeError(
                     "Multiple Intaris profiles require Hermes' profile-scoped tool registry"
                 )
+            # Capture and publish the predecessor in one bookkeeping step.
+            # Closing it cannot expose an evictable gap before our unload wait.
+            previous = _profiles.get(home)
+            profile.predecessor = previous
+            if home in _registered_homes:
+                profile.session_start_required.set()
+            if previous is not None and previous.registered:
+                _retain_sessions(previous)
             retained = _retired_sessions.get(home)
             if retained is not None and retained.fingerprint == fingerprint:
                 profile.sessions = retained.sessions
@@ -2125,9 +2121,11 @@ def register(ctx: Any) -> None:
                 _adopt_continuity(retained)
             _profiles[home] = profile
             if previous is not None:
-                # Unload may have retired this rollback source while we waited.
                 _adopt_continuity(_continuity(previous))
         try:
+            if previous is not None and not _quiesce_profile(previous):
+                # Wait outside bookkeeping locks after securing rollback state.
+                previous.closed.wait()
             _register_profile(profile, ctx, registry, scoped)
         except Exception:
             _close_profile(profile)

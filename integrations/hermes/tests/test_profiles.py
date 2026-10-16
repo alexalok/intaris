@@ -3749,3 +3749,150 @@ def test_published_predecessor_leaves_retired_budget_after_unload_wait(
             )
         ) == {"result": "retry"}
         current.emit("on_session_end", session_id="same-id")
+
+
+@pytest.mark.parametrize("compatible", [True, False])
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+@pytest.mark.parametrize("terminal_cancel", [False, True])
+def test_reload_protects_predecessor_before_unload_wait_returns(
+    runtime, monkeypatch, compatible, outcome, terminal_cancel
+):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 100)
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 1)
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        predecessor = plugin._profiles[str(home)]
+        original = predecessor.sessions["same-id"]
+        original_id = original.intaris_session_id
+        end_session = old.hooks["on_session_end"][0]
+    closing, allow_close = threading.Event(), threading.Event()
+    waiting, woke, allow_return = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    handle = predecessor.registrations[-1]
+    dispose = handle.dispose
+    closed_wait = predecessor.closed.wait
+    register = plugin._register_profile
+
+    def paused_dispose():
+        closing.set()
+        assert allow_close.wait(5)
+        dispose()
+
+    def paused_wait(*args, **kwargs):
+        waiting.set()
+        result = closed_wait(*args, **kwargs)
+        woke.set()
+        assert allow_return.wait(5)
+        return result
+
+    def replacement_registration(profile, ctx, *args):
+        if profile.home == str(home) and outcome == "failure":
+            raise RuntimeError("synthetic wakeup-gap registration failure")
+        return register(profile, ctx, *args)
+
+    handle.dispose = paused_dispose
+    predecessor.closed.wait = paused_wait
+    with (
+        monkeypatch.context() as replacement,
+        ThreadPoolExecutor(max_workers=2) as workers,
+    ):
+        replacement.setattr(plugin, "_register_profile", replacement_registration)
+        unload = workers.submit(old.unload[0])
+        pending = None
+        try:
+            assert closing.wait(5)
+            pending = workers.submit(
+                runtime.register, "a", {} if compatible else {"agent_id": "new"}
+            )
+            assert waiting.wait(5)
+            allow_close.set()
+            unload.result(5)
+            assert woke.wait(5)
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="other-id")
+                for callback in other.unload:
+                    callback()
+            ended_in_gap = original._ended.is_set()
+            if terminal_cancel:
+                # Host may have captured this callback before unload disposed it.
+                with runtime.profile("a"):
+                    end_session(session_id="same-id")
+                assert original._ended.is_set()
+                assert original._completion.status == "completed"
+                assert "same-id" not in predecessor.sessions
+        finally:
+            allow_close.set()
+            allow_return.set()
+        assert pending is not None
+        if outcome == "failure":
+            with pytest.raises(
+                RuntimeError, match="synthetic wakeup-gap registration failure"
+            ):
+                pending.result(5)
+        else:
+            current = pending.result(5)
+    assert not ended_in_gap, (
+        "reload must protect its captured predecessor before waking"
+    )
+    if outcome == "failure":
+        current = runtime.register("a")
+    if terminal_cancel:
+        with runtime.profile("a"):
+            current_profile = plugin._profiles[str(home)]
+            assert "same-id" not in current_profile.sessions
+            assert original._ended.is_set() and not original.start_confirmed
+            assert original._completion.status == "completed"
+            assert original._completion.token not in plugin._retired_owners
+            assert not plugin._completion_owners.get((str(home), "same-id"))
+            assert "error" in json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "cancelled"}, session_id="same-id"
+                )
+            )
+            assert not requests_for(runtime, "/evaluate")
+            # A later explicit start owns a distinct lifetime under the same SID.
+            current.emit("on_session_start", session_id="same-id")
+            fresh = current_profile.sessions["same-id"]
+            assert fresh is not original and fresh._ended is not original._ended
+            assert fresh.intaris_session_id != original_id
+            assert fresh.start_confirmed and not fresh._ended.is_set()
+            assert original._ended.is_set() and not original.start_confirmed
+            assert json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "fresh"}, session_id="same-id"
+                )
+            ) == {"result": "fresh"}
+            current.emit("on_session_end", session_id="same-id")
+        assert requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == (
+            fresh.intaris_session_id
+        )
+        summaries = [
+            r
+            for r in requests_for(runtime, "/agent-summary")
+            if r["url"].endswith(f"/{original_id}/agent-summary")
+        ]
+        assert len(summaries) == 1
+    elif compatible or outcome == "failure":
+        with runtime.profile("a"):
+            assert plugin._profiles[str(home)].sessions["same-id"] is original
+            assert original.start_confirmed and not original._ended.is_set()
+            assert json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "retained"}, session_id="same-id"
+                )
+            ) == {"result": "retained"}
+            current.emit("on_session_end", session_id="same-id")
+        assert (
+            requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == original_id
+        )
+        created = [
+            r
+            for r in requests_for(runtime, "/intention")
+            if r["url"].startswith("https://a.invalid")
+        ]
+        assert len(created) == 1
