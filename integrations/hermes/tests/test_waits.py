@@ -10,6 +10,7 @@ import threading
 import time
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 import hermes_intaris as plugin
@@ -124,14 +125,12 @@ class Transport:
 
 @pytest.fixture
 def adapter(monkeypatch, host):
-    plugin._sessions.clear()
-    monkeypatch.setattr(
-        plugin, "_cfg", plugin.Config(checkpoint_interval=0, mcp_tools=False)
+    profile = plugin.ProfileRuntime(
+        home=plugin._profile_key(),
+        cfg=plugin.Config(checkpoint_interval=0, mcp_tools=False),
+        client=IntarisClient("http://intaris.test", "test-key"),
     )
-    monkeypatch.setattr(
-        plugin, "_client", IntarisClient("http://intaris.test", "test-key")
-    )
-    state = plugin._get_or_create_state("session-A")
+    state = plugin._get_or_create_state(profile, "session-A")
     state.intaris_session_id = "intaris-A"
     calls = []
 
@@ -139,7 +138,9 @@ def adapter(monkeypatch, host):
         calls.append((args, kwargs))
         return '{"result": "executed"}'
 
-    handler = plugin._make_guarded_handler(original, "synthetic", "test", False)
+    handler = plugin._make_guarded_handler(
+        profile, original, "synthetic", "test", False
+    )
     # Accelerate only the adapter's backoff, never sleeps in other code.
     monkeypatch.setattr(
         plugin,
@@ -149,8 +150,12 @@ def adapter(monkeypatch, host):
             sleep=lambda seconds: None,
         ),
     )
-    yield types.SimpleNamespace(handler=handler, calls=calls, state=state)
-    plugin._sessions.clear()
+    yield types.SimpleNamespace(
+        profile=profile, handler=handler, calls=calls, state=state
+    )
+    profile.sessions.clear()
+    if state._completion is not None:
+        plugin._forget_completion_owner(state._completion)
 
 
 @contextmanager
@@ -222,11 +227,11 @@ def test_session_end_cancels_wait_before_completion_http(
     transport = Transport(mode)
     with invocation(adapter, transport, monkeypatch) as run:
         # Another session becomes newest after this invocation started.
-        other = plugin._get_or_create_state("session-B")
+        other = plugin._get_or_create_state(adapter.profile, "session-B")
         other.intaris_session_id = "intaris-B"
-        plugin._on_session_end("session-B")
+        plugin._on_session_end(adapter.profile, "session-B")
         assert not run.done.is_set()
-        plugin._on_session_end("session-A", completed=False)
+        plugin._on_session_end(adapter.profile, "session-A", completed=False)
         assert run.done.wait(1)
         assert "CANCELLED" in json.loads(run.result[0])["error"]
     assert not adapter.calls
@@ -235,7 +240,7 @@ def test_session_end_cancels_wait_before_completion_http(
 
 @pytest.mark.parametrize("mode", ["escalate", "suspended"])
 def test_timeout_while_transport_pending_fails_closed(adapter, host, monkeypatch, mode):
-    plugin._cfg.escalation_timeout_s = 0.2
+    adapter.profile.cfg = replace(adapter.profile.cfg, escalation_timeout_s=0.2)
     transport = Transport(mode)
     with invocation(adapter, transport, monkeypatch) as run:
         assert run.done.wait(1), "adapter timeout must include pending HTTP"
@@ -258,7 +263,7 @@ def test_denial_cleans_up_without_dispatch(adapter, host, monkeypatch, mode):
 def test_interrupt_is_scoped_to_worker_and_session(adapter, host, monkeypatch):
     first, second = Transport(), Transport()
     with invocation(adapter, first, monkeypatch) as a:
-        state_b = plugin._get_or_create_state("session-B")
+        state_b = plugin._get_or_create_state(adapter.profile, "session-B")
         state_b.intaris_session_id = "intaris-B"
         token = host.session_key.set("gateway-B")
         try:
@@ -293,7 +298,7 @@ def test_missing_host_support_returns_retry_without_waiting(
     monkeypatch.setitem(sys.modules, missing, None)
     transport = Transport(block="never")
     monkeypatch.setattr("urllib.request.urlopen", transport)
-    plugin._cfg.fail_open = True
+    adapter.profile.cfg = replace(adapter.profile.cfg, fail_open=True)
     result = json.loads(adapter.handler({}, session_id="session-A"))
     assert "Cannot safely wait" in result["error"]
     assert "retry" in result["error"]
@@ -316,7 +321,7 @@ def test_cancellation_rechecked_at_dispatch(adapter, host, monkeypatch, mode):
         return pending
 
     monkeypatch.setattr(plugin, "_queue_pending_tool_result", cancel)
-    plugin._cfg.fail_open = True
+    adapter.profile.cfg = replace(adapter.profile.cfg, fail_open=True)
     result = json.loads(adapter.handler({}, session_id="session-A"))
     assert "CANCELLED" in result["error"]
     assert not adapter.calls
@@ -325,10 +330,14 @@ def test_cancellation_rechecked_at_dispatch(adapter, host, monkeypatch, mode):
     # A later identical invocation must record its own audit ID.
     host.interrupted.remove(threading.get_ident())
     monkeypatch.setattr(plugin, "_queue_pending_tool_result", queue_result)
-    plugin._cfg.recording = True
+    adapter.profile.cfg = replace(adapter.profile.cfg, recording=True)
     result = adapter.handler({}, session_id="session-A")
     plugin._on_post_tool_call(
-        tool_name="synthetic", args={}, result=result, session_id="session-A"
+        adapter.profile,
+        tool_name="synthetic",
+        args={},
+        result=result,
+        session_id="session-A",
     )
     assert len(adapter.calls) == 1
     assert adapter.state.recording_buffer[-1]["data"]["call_id"] == "c2"
@@ -343,7 +352,7 @@ def test_transport_failure_does_not_override_cancellation_with_fail_open(
         raise OSError("connection refused")
 
     monkeypatch.setattr("urllib.request.urlopen", failing)
-    plugin._cfg.fail_open = True
+    adapter.profile.cfg = replace(adapter.profile.cfg, fail_open=True)
     result = json.loads(adapter.handler({}, session_id="session-A"))
     assert "CANCELLED" in result["error"]
     assert not adapter.calls
@@ -351,8 +360,10 @@ def test_transport_failure_does_not_override_cancellation_with_fail_open(
 
 def test_resume_does_not_revive_cancelled_wait(adapter, host, monkeypatch):
     with invocation(adapter, Transport(), monkeypatch) as run:
-        plugin._on_session_end("session-A", completed=False)
-        plugin._on_pre_llm_call(session_id="session-A", user_message="continue")
+        plugin._on_session_end(adapter.profile, "session-A", completed=False)
+        plugin._on_pre_llm_call(
+            adapter.profile, session_id="session-A", user_message="continue"
+        )
         assert run.done.wait(1)
         assert "CANCELLED" in json.loads(run.result[0])["error"]
     assert not adapter.calls
@@ -376,7 +387,9 @@ def test_reactivation_then_escalation_still_honors_interruption(
 def test_interrupt_during_other_predispatch_http_does_not_park_worker(
     adapter, host, monkeypatch, block
 ):
-    plugin._cfg.checkpoint_interval = 1 if block == "checkpoint" else 0
+    adapter.profile.cfg = replace(
+        adapter.profile.cfg, checkpoint_interval=1 if block == "checkpoint" else 0
+    )
     adapter.state.call_count = 2  # Triggers the existing intention update path.
     with invocation(adapter, Transport("approve", block=block), monkeypatch) as run:
         host.interrupted.add(run.thread.ident)
@@ -393,7 +406,7 @@ def test_approval_budget_spans_reactivation_and_reevaluation(
     monkeypatch.setattr(
         waits, "time", types.SimpleNamespace(monotonic=lambda: clock.now)
     )
-    plugin._cfg.escalation_timeout_s = 10
+    adapter.profile.cfg = replace(adapter.profile.cfg, escalation_timeout_s=10)
     with invocation(
         adapter, Transport("suspended", block="reevaluate"), monkeypatch
     ) as run:
@@ -407,7 +420,7 @@ def test_approval_budget_spans_reactivation_and_reevaluation(
 def test_session_eviction_cancels_pending_wait(adapter, host, monkeypatch):
     monkeypatch.setattr(plugin, "MAX_SESSIONS", 1)
     with invocation(adapter, Transport(), monkeypatch) as run:
-        plugin._get_or_create_state("session-B")
+        plugin._get_or_create_state(adapter.profile, "session-B")
         assert run.done.wait(1), "eviction must not orphan a session lifetime"
         assert "CANCELLED" in json.loads(run.result[0])["error"]
     assert not adapter.calls

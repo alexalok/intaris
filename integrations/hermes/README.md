@@ -45,6 +45,110 @@ export INTARIS_API_KEY=your-api-key
 export INTARIS_URL=http://localhost:8060  # default
 ```
 
+Enable the plugin in the profile's `config.yaml`. Current Hermes requires the
+`tools.override` capability to wrap built-in tools; the supported legacy grant
+is also accepted:
+
+```yaml
+plugins:
+  enabled: [intaris]
+  entries:
+    intaris:
+      allow_tool_override: true
+      settings:
+        url: https://intaris.example.com
+        user_id: work
+        agent_id: hermes-work
+        allow_paths: ~/work
+        mcp_tools: true
+        session_recording: false
+```
+
+### Profiles in one process
+
+Each resolved Hermes home owns its config snapshot, HTTP client, sessions,
+authenticated MCP cache and tool registrations, recording buffers, and timer.
+Identical Hermes session IDs in different profiles create distinct Intaris
+sessions. Loading another profile cannot redirect existing callbacks. Unloading
+or reloading a profile cancels its timer and releases its registrations; an
+already-running flush retains its original client. Final recording uploads share
+a five-second HTTP timeout budget across all sessions. Buffers not attempted
+within that budget remain available to a compatible reload or to the original
+session's later idle/completion event, even after an identity-changing reload.
+
+Non-secret options can be set under `plugins.entries.intaris.settings`, using
+the environment variable name below without `INTARIS_`, in lowercase (for
+example, `escalation_timeout`, `session_recording`, `mcp_tools_cache_ttl_s`).
+Precedence is **explicit plugin setting → Hermes profile-scoped env value →
+built-in default**. Explicit `false`, `0`, and empty strings override defaults.
+Hermes' `ctx.get_config()` also supports its legacy `config` subtree. Config is
+captured at registration; use Hermes' plugin reload to apply changes.
+
+Store `INTARIS_API_KEY` through Hermes' profile credentials or Desktop secret
+field, not in YAML. The adapter uses `agent.secret_scope.get_secret()` for env
+and credential lookup, preserving Hermes' fail-closed behavior when a required
+secret scope is missing. It never reads credential files or changes
+`os.environ`. Single-profile process-env configuration still works. Merely
+changing `HERMES_HOME` does not load credentials: embedded hosts must install
+the matching Hermes secret scope and propagate context to workers, as Hermes
+does. Process env is shared, so use profile settings/scopes for distinct values.
+
+Multiple profiles require Hermes' scoped tool registry. Older global-only
+registries retain single-profile support and reject a second profile instead
+of sharing guards or authenticated MCP tools. A handler called with a foreign
+or unloaded profile is blocked even when fail-open is enabled. Hooks and timer
+callbacks remain bound to their originating manager.
+
+With the pip entry-point installation, reloading a profile preserves active
+Intaris sessions, intention context, and counters when the backend URL,
+credentials, user/agent identity, and effective path policy are unchanged.
+Runtime callbacks, tools, MCP cache, and timers are replaced. Admission
+continuity is cached for the 100 most recently unloaded profiles, without
+retaining managers or timers. Up to 100 outstanding retired session owners keep
+their original client and state solely for lifecycle completion. This budget
+counts sessions across all unloaded profiles and incompatible generations,
+including repeated replacements of the same home and Hermes session ID.
+Compatible adoption transfers existing owners without completing them. Capacity
+retirement cancels the old lifetime and sends its final recording/status/summary
+after pending creation and admitted tool calls drain; discarded continuity cannot
+reopen the retired session. Retained records preserve final recording/status/summary routing across identity changes
+and cannot authorize new tool calls. Duplicate end callbacks produce one local
+completion transition; HTTP delivery remains best effort. A retained predecessor
+end callback can finish its original owners but cannot cancel a fresh lifetime
+created by a later registration, even when the Hermes session ID is reused.
+Teardown recording and
+retirement effects share one five-second budget per outer unload/replacement,
+including waits for another lifecycle sender. Once that budget expires, remaining
+retirement uploads/status/summary attempts are skipped. Creation or tool calls
+still in flight keep their original owner and settle deferred completion when
+their captured lifetime finishes.
+The 100-session cap also completes evicted sessions through their original owner,
+flushes retained recording, and releases that owner after pending creation and
+already-admitted outer tool calls finish; an evicted session cannot reopen its
+old lifetime.
+Changing identity or policy, or reloading after admission continuity was evicted,
+requires each Hermes session to receive its own fresh session-start event. One
+session's start cannot unlock another; tools remain blocked even with fail-open
+enabled until that session starts.
+If replacement registration fails, the last successful profile's retained
+sessions remain available when retrying with that profile's configuration.
+Direct in-process replacement keeps old guards blocking until the new guards
+are ready, including failed replacement attempts. Explicit starts received during
+the published replacement handoff are retained locally within the same session
+limits, including rollback cleanup. The first subsequent native/MCP/pre-LLM
+admission creates the remote session using the settled profile's configuration;
+the start hook does not wait for registration or replay remote creation during it.
+An intervening terminal end invalidates that pending start, and a later explicit
+start establishes a distinct lifetime. Hermes' force discovery
+unloads plugin registrations before calling the adapter; tool dispatch must be
+paused by the host during that unload/reload interval.
+Legacy global-only tool registrations are restored on unload, provided another
+plugin has not replaced them in the meantime.
+
+Directory installations re-import the plugin module during force reload,
+resetting its in-memory state. Start a new Hermes session after a directory
+reload; use the pip entry-point installation for active-session continuity.
+
 ### Configuration Options
 
 | Env Var | Default | Description |
@@ -52,6 +156,7 @@ export INTARIS_URL=http://localhost:8060  # default
 | `INTARIS_URL` | `http://localhost:8060` | Intaris server URL |
 | `INTARIS_API_KEY` | (required) | API key for authentication |
 | `INTARIS_USER_ID` | (empty) | User ID (optional if API key maps to user) |
+| `INTARIS_AGENT_ID` | (empty) | Optional agent metadata |
 | `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable. 4xx errors and invalid protocol responses always block. |
 | `INTARIS_ALLOW_PATHS` | (empty) | Comma-separated parent directories for policy allow_paths |
 | `INTARIS_ESCALATION_TIMEOUT` | `0` | Additional approval-wait limit in seconds (0 = Hermes approval limit only) |
@@ -95,11 +200,32 @@ Host paths that omit `session_id` are also blocked. For example, the nested `exe
 
 When `INTARIS_MCP_TOOLS=true` (default), the plugin fetches MCP tools from Intaris and registers them as native Hermes tools. These tools proxy execution through `POST /api/v1/mcp/call` with full safety evaluation server-side.
 
+## Tests
+
+From the Intaris repository root:
+
+```bash
+PYTHONPATH=integrations/hermes uv run pytest integrations/hermes/tests -q
+HERMES_SOURCE=/path/to/hermes-agent PYTHONPATH=integrations/hermes uv run pytest integrations/hermes/tests -q
+```
+
+The first command uses controlled Hermes boundary doubles and no network. The
+second additionally exercises Hermes' real profile/secret contexts, worker
+context propagation, tool registry, plugin settings, managers, hooks, and unload
+handles. It requires an environment that can import that checkout's
+`hermes_cli.plugins`. All HTTP responses and profile credentials are synthetic;
+no live Hermes service or real credential files are used.
+
 ## Risks and Caveats
 
-### Registry internal access
+### Registry compatibility
 
-The plugin accesses `registry._tools` (a private attribute of Hermes's `ToolRegistry`) to enumerate and wrap existing tool handlers. While this is a stable internal API used by Hermes's own `model_tools.py`, it is not part of the public plugin contract and could change in future Hermes versions. The public `registry.register()` method is used for re-registration.
+Current Hermes is enumerated through `registry.get_all_entries()` and wrapped
+through `ctx.register_tool(override=True)`, preserving profile overlays and host
+unload tracking. The host must grant `tools.override` (or
+`allow_tool_override: true`); the adapter does not bypass that check. Legacy
+global-only versions use `registry._tools` and `registry.register()` for one
+profile. Tool discovery after registration still depends on Hermes load order.
 
 ### Latency on every tool call
 
