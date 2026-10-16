@@ -2490,3 +2490,203 @@ def test_completion_owner_allows_one_idle_per_active_interval(runtime):
         "completed",
     ]
     assert len(requests_for(runtime, "/agent-summary")) == 1
+
+
+@pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("transport_fails", [False, True])
+def test_session_eviction_retires_completion_owners(
+    runtime, monkeypatch, caplog, idle, transport_fails
+):
+    import gc
+    import logging
+    import weakref
+
+    monkeypatch.setattr(plugin, "MAX_SESSIONS", 3)
+    ctx = runtime.register("a", {"session_recording": True})
+    if transport_fails:
+        # Captured LogRecords retain exception tracebacks; keep the test logger
+        # from pinning the very states whose collectability this test checks.
+        caplog.set_level(logging.CRITICAL, logger="hermes_intaris.client")
+
+        def fail_effect(req):
+            if req.full_url.endswith(("/events", "/status", "/agent-summary")):
+                raise TimeoutError("synthetic lifecycle outage")
+
+        runtime.request_hook.append(fail_effect)
+    references = []
+    with runtime.profile("a") as home:
+        profile = plugin._profiles[str(home)]
+        for index in range(12):
+            sid = f"session-{index}"
+            ctx.emit("on_session_start", session_id=sid)
+            references.append(weakref.ref(profile.sessions[sid]))
+            ctx.emit(
+                "post_llm_call", session_id=sid, assistant_response=f"event-{index}"
+            )
+            if idle:
+                ctx.emit("on_session_end", session_id=sid, completed=False)
+        assert len(profile.sessions) == 3
+        retained = sum(
+            len(owners)
+            for (owner_home, _), owners in plugin._completion_owners.items()
+            if owner_home == str(home)
+        )
+        assert retained == 3, "eviction must retire owners as well as session entries"
+        gc.collect()
+        assert all(ref() is None for ref in references[:-3])
+        ctx.emit("on_session_start", session_id="session-11")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "retained"}, session_id="session-11"
+            )
+        ) == {"result": "retained"}
+    created = [r["body"]["session_id"] for r in requests_for(runtime, "/intention")]
+    completed = [
+        r["url"].split("/")[-2]
+        for r in requests_for(runtime, "/status")
+        if r["body"]["status"] == "completed"
+    ]
+    summaries = [
+        r["url"].split("/")[-2] for r in requests_for(runtime, "/agent-summary")
+    ]
+    assert completed == created[:-3]
+    assert summaries == created[:-3]
+    events = requests_for(runtime, "/events")
+    assert all(
+        any(f"event-{index}" in json.dumps(r["body"]) for r in events)
+        for index in range(9)
+    )
+
+
+@pytest.mark.parametrize("phase", ["before_http", "during_http"])
+def test_session_eviction_settles_pending_creation_and_preserves_reused_id(
+    runtime, monkeypatch, phase
+):
+    monkeypatch.setattr(plugin, "MAX_SESSIONS", 1)
+    ctx = runtime.register("a")
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+    ensure = plugin._ensure_session
+
+    def hold_before(profile, task_id, state, *args, **kwargs):
+        if task_id == "same-id" and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return ensure(profile, task_id, state, *args, **kwargs)
+
+    def hold_during(req):
+        if req.full_url.endswith("/intention") and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    if phase == "before_http":
+        monkeypatch.setattr(plugin, "_ensure_session", hold_before)
+    else:
+        runtime.request_hook.append(hold_during)
+
+    def start():
+        try:
+            with runtime.profile("a"):
+                ctx.emit("on_session_start", session_id="same-id")
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a") as home:
+            profile = plugin._profiles[str(home)]
+            original = profile.sessions["same-id"]
+            ctx.emit("on_session_start", session_id="other-id")
+            assert original._ended.is_set()
+            ctx.emit("on_session_start", session_id="same-id")
+            replacement = profile.sessions["same-id"]
+            replacement_id = replacement.intaris_session_id
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and not failures
+    assert original._ended.is_set() and not original.start_confirmed
+    assert original._completion.status == "completed"
+    assert profile.sessions["same-id"] is replacement
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+    owners = [
+        owner
+        for (owner_home, _), group in plugin._completion_owners.items()
+        if owner_home == str(home)
+        for owner in group.values()
+    ]
+    assert len(owners) == 1 and owners[0].state is replacement
+    created = requests_for(runtime, "/intention")
+    assert len(created) == (3 if phase == "during_http" else 2)
+    completed = [
+        r["url"].split("/")[-2]
+        for r in requests_for(runtime, "/status")
+        if r["body"]["status"] == "completed"
+    ]
+    expected = {r["body"]["session_id"] for r in created} - {replacement_id}
+    assert set(completed) == expected and len(completed) == len(expected)
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "new lifetime"}, session_id="same-id"
+            )
+        ) == {"result": "new lifetime"}
+    assert (
+        requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == replacement_id
+    )
+
+
+def test_session_eviction_flush_does_not_hold_map_or_delete_reused_id(
+    runtime, monkeypatch
+):
+    monkeypatch.setattr(plugin, "MAX_SESSIONS", 1)
+    ctx = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a") as home:
+        profile = plugin._profiles[str(home)]
+        ctx.emit("on_session_start", session_id="same-id")
+        original = profile.sessions["same-id"]
+        ctx.emit("post_llm_call", session_id="same-id", assistant_response="old event")
+    original_id = original.intaris_session_id
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_flush(req):
+        if req.full_url.endswith(f"/{original_id}/events"):
+            entered.set()
+            assert release.wait(5)
+
+    def start(session_id):
+        with runtime.profile("a"):
+            ctx.emit("on_session_start", session_id=session_id)
+            return profile.sessions.get(session_id)
+
+    runtime.request_hook.append(hold_flush)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        eviction = workers.submit(start, "other-id")
+        try:
+            assert entered.wait(5), "eviction must flush the original recording"
+            assert original._ended.is_set()
+            # Same-home map and global owner locks must remain usable during HTTP.
+            replacement = workers.submit(start, "same-id").result(3)
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="same-id")
+        finally:
+            release.set()
+        # The intermediate entry was itself evicted before its start resumed.
+        assert eviction.result(5) is None
+    assert profile.sessions["same-id"] is replacement
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+    statuses = requests_for(runtime, "/status")
+    assert len(statuses) == 1
+    assert statuses[0]["url"].endswith(f"/{original_id}/status")
+    assert statuses[0]["body"] == {"status": "completed"}
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+    assert len(requests_for(runtime, "/events")) == 1
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "new lifetime"}, session_id="same-id"
+            )
+        ) == {"result": "new lifetime"}

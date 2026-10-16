@@ -325,12 +325,14 @@ def _profile_key() -> str:
 
 
 def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
+    evicted_owners = []
     with profile.sessions_lock:
         state = profile.sessions.get(task_id)
         if state is None:
             state = SessionState()
             profile.sessions[task_id] = state
-            # Evict oldest entries if over limit
+            # Evict oldest entries if over limit. Publish ownership even when
+            # a start has not entered creation yet, so it cannot outlive eviction.
             if len(profile.sessions) > MAX_SESSIONS:
                 excess = len(profile.sessions) - MAX_SESSIONS
                 keys = list(profile.sessions.keys())[:excess]
@@ -338,7 +340,16 @@ def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
                     evicted = profile.sessions.pop(k, None)
                     if evicted is not None:
                         evicted._ended.set()
-        return state
+                        evicted_owners.append(
+                            _get_completion_owner(profile, k, evicted)
+                        )
+    # Claim every cancellation before effects, with no map/global lock over I/O.
+    # Pending creation settles this terminal claim in its own finally block.
+    for owner in evicted_owners:
+        _claim_session_end(owner, terminal=True)
+    for owner in evicted_owners:
+        _emit_lifecycle(owner)
+    return state
 
 
 def _requires_fresh_start(profile: ProfileRuntime, session_id: Any) -> bool:
