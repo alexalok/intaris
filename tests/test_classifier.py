@@ -96,7 +96,7 @@ class TestReadOnlyBash:
             "cat README.md",
             "head -n 10 file.txt",
             "tail -f log.txt",
-            "find . -name '*.py'",
+            "find . -name README.md",
             "tree src/",
             "wc -l file.txt",
             "grep -r 'pattern' .",
@@ -179,7 +179,12 @@ class TestReadOnlyBash:
         assert classify("bash", {"command": "git tag"}) == Classification.READ
         assert classify("bash", {"command": "git tag -l"}) == Classification.READ
         assert classify("bash", {"command": "git tag --list"}) == Classification.READ
-        assert classify("bash", {"command": "git tag -l 'v1.*'"}) == Classification.READ
+        assert classify("bash", {"command": "git tag -l 'v1.0'"}) == Classification.READ
+
+    @pytest.mark.parametrize("command", ["find . -name '*.py'", "git tag -l 'v1.*'"])
+    def test_quoted_globs_require_evaluation(self, command: str):
+        """Quoted patterns conservatively follow the same path as shell globs."""
+        assert classify("bash", {"command": command}) == Classification.WRITE
 
     def test_git_tag_write(self):
         """git tag with create/delete args is write."""

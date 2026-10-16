@@ -1101,9 +1101,10 @@ def _is_read_only_bash(args: dict[str, Any]) -> bool:
 
     # Fast paths cover simple commands only. Shell control flow, expansion,
     # and redirection require evaluation even when the first command is safe.
-    # Brace expansion can synthesize write/exec options that shlex misses;
-    # conservatively reject braces even when quoted or escaped.
-    if any(char in command for char in ";&|\n\r`${}"):
+    # Brace/pathname expansion can synthesize write/exec options that
+    # shlex misses. Reject glob syntax (including extglob parentheses),
+    # braces, and quoted/escaped forms conservatively.
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
         return False
 
     return _is_single_command_read_only(command)
@@ -1116,7 +1117,7 @@ _REDIRECT_OPS: set[str] = {">", ">>", "2>", "2>>", "&>", "&>>", "<", "<<"}
 def _is_single_command_read_only(command: str) -> bool:
     """Check if a single (non-piped, non-chained) command is read-only."""
     # Mixed/remaining shell control syntax is not a simple command.
-    if any(char in command for char in ";&|\n\r`${}"):
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
         return False
 
     # Check for shell redirection BEFORE shlex.split, since shlex treats

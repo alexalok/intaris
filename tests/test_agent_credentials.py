@@ -594,6 +594,65 @@ def test_agent_brace_expansion_reaches_inference(client, tool):
     assert audit["tool"] == tool
 
 
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("policy", [None, POLICY], ids=["default", "mandatory"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . *",
+        "find . -??????",
+        "find . [-]delete",
+        "find . @(-delete)",
+        "find . '*'",
+        r"find . \*",
+    ],
+)
+def test_glob_syntax_requires_evaluation(tmp_path, tool, policy, command):
+    from intaris.classifier import classify
+
+    # Matching filenames can become options after shell expansion. Never
+    # execute find: classification must reject the syntax before READ.
+    for name in ("-delete", "-print"):
+        (tmp_path / name).touch()
+    assert (
+        classify(
+            tool,
+            {"command": command},
+            session_policy=policy,
+            working_directory=str(tmp_path),
+        ).value
+        == "write"
+    )
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+def test_agent_pathname_expansion_reaches_inference(client, tmp_path, tool):
+    shell_directory = tmp_path / "shell"
+    shell_directory.mkdir()
+    for name in ("-delete", "-print"):
+        (shell_directory / name).touch()
+    create(client, details={"working_directory": str(shell_directory)})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Pathname expansion adds a destructive find option",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(client, tool=tool, command="find . *")
+
+    assert result["decision"] == "deny", result
+    assert result["path"] == "llm", result
+    inference.assert_called_once()
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "write"
+    assert audit["tool"] == tool
+
+
 def test_atomic_lifecycle_update_preserves_concurrent_stop(client):
     from intaris.session import SessionStore
 
