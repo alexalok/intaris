@@ -619,7 +619,12 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
             continue
         # Exclusion/ignore files are read too, but do not supply search patterns.
         option, separator, value = token.partition("=")
-        if option == auxiliary_file_option:
+        # GNU grep accepts these unique prefixes, unlike inline --exclude.
+        if option == auxiliary_file_option or (
+            command == "grep"
+            and option.startswith("--exclude-f")
+            and "--exclude-from".startswith(option)
+        ):
             if separator:
                 operands.append(value)
             else:

@@ -1218,7 +1218,13 @@ def test_agent_stat_format_is_not_a_denied_path(client, tool):
 @pytest.mark.parametrize("tool", ["terminal", "bash"])
 @pytest.mark.parametrize(
     "command,option,target",
-    [("grep", "--exclude-from", "README.md"), ("rg", "--ignore-file", ".")],
+    [
+        ("grep", "--exclude-f", "README.md"),
+        ("grep", "--exclude-fr", "README.md"),
+        ("grep", "--exclude-fro", "README.md"),
+        ("grep", "--exclude-from", "README.md"),
+        ("rg", "--ignore-file", "."),
+    ],
 )
 @pytest.mark.parametrize("separator", ["=", " "])
 @pytest.mark.parametrize(

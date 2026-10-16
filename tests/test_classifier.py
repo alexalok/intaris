@@ -1382,7 +1382,13 @@ class TestSearchAuxiliaryFiles:
     @pytest.mark.parametrize("tool", ["terminal", "bash"])
     @pytest.mark.parametrize(
         "command,option,target",
-        [("grep", "--exclude-from", "README.md"), ("rg", "--ignore-file", ".")],
+        [
+            ("grep", "--exclude-f", "README.md"),
+            ("grep", "--exclude-fr", "README.md"),
+            ("grep", "--exclude-fro", "README.md"),
+            ("grep", "--exclude-from", "README.md"),
+            ("rg", "--ignore-file", "."),
+        ],
     )
     @pytest.mark.parametrize("separator", ["=", " "])
     def test_auxiliary_search_files_obey_path_policy(
@@ -1410,7 +1416,14 @@ class TestSearchAuxiliaryFiles:
 
     @pytest.mark.parametrize("tool", ["terminal", "bash"])
     @pytest.mark.parametrize(
-        "command,option", [("grep", "--exclude-from"), ("rg", "--ignore-file")]
+        "command,option",
+        [
+            ("grep", "--exclude-f"),
+            ("grep", "--exclude-fr"),
+            ("grep", "--exclude-fro"),
+            ("grep", "--exclude-from"),
+            ("rg", "--ignore-file"),
+        ],
     )
     @pytest.mark.parametrize("separator", ["=", " "])
     def test_auxiliary_file_does_not_supply_search_pattern(
@@ -1451,6 +1464,33 @@ class TestSearchAuxiliaryFiles:
                 session_policy={"deny_paths": ["/etc/*"]},
             )
             == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'grep --exclude="/etc/passwd" root README.md',
+            'grep --exclude "/etc/passwd" root README.md',
+            'grep --exclude-dir="/etc/passwd" root README.md',
+            'grep --exclude-dir "/etc/passwd" root README.md',
+            'grep -e "--exclude-f=/etc/passwd" README.md',
+            'grep -- "--exclude-f=/etc/passwd" README.md',
+        ],
+    )
+    def test_inline_exclusions_and_literal_patterns_remain_data(self, tool, command):
+        args = {"command": command}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
         )
 
 
