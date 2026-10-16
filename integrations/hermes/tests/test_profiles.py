@@ -3896,3 +3896,59 @@ def test_reload_protects_predecessor_before_unload_wait_returns(
             if r["url"].startswith("https://a.invalid")
         ]
         assert len(created) == 1
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("paused_call", [False, True])
+def test_stale_predecessor_end_cannot_cancel_fresh_successor(
+    runtime, compatible, completed, paused_call
+):
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        predecessor = plugin._profiles[str(home)]
+        original = predecessor.sessions["same-id"]
+        captured_end = old.hooks["on_session_end"][0]
+        current = runtime.register("a", {} if compatible else {"agent_id": "new"})
+        if compatible:
+            current.emit("on_session_end", session_id="same-id")
+        current.emit("on_session_start", session_id="same-id")
+        successor = plugin._profiles[str(home)]
+        fresh = successor.sessions["same-id"]
+        assert fresh is not original
+        assert (successor.sessions is predecessor.sessions) == compatible
+        handler = runtime.registry.get_entry("read_file").handler
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_evaluation():
+        entered.set()
+        assert release.wait(5)
+
+    def invoke():
+        with runtime.profile("a"):
+            return json.loads(handler({"path": "fresh"}, session_id="same-id"))
+
+    if paused_call:
+        runtime.evaluate_hook.append(hold_evaluation)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(invoke) if paused_call else None
+        try:
+            if paused_call:
+                assert entered.wait(5)
+            with runtime.profile("a"):
+                captured_end(session_id="same-id", completed=completed)
+            ended_before_release = fresh._ended.is_set()
+        finally:
+            release.set()
+        result = pending.result(5) if pending is not None else invoke()
+    assert original._ended.is_set()
+    assert not ended_before_release, "old callback must not cancel newer owner or call"
+    assert fresh.start_confirmed and successor.sessions["same-id"] is fresh
+    assert fresh._completion.birth_generation == successor.generation
+    assert original._completion.birth_generation == predecessor.generation
+    assert result == {"result": "fresh"}
+    with runtime.profile("a"):
+        current.emit("on_session_end", session_id="same-id")
+    assert fresh._completion.status == "completed"
+    assert not plugin._active_invocations

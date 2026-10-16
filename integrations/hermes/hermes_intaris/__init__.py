@@ -53,6 +53,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from functools import partial, wraps
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,6 +71,7 @@ MAX_RETIRED_PROFILES = 100
 MAX_RETIRED_OWNERS = 100
 MAX_RECENT_TOOLS = 10
 TEARDOWN_FLUSH_TIMEOUT_S = 5.0
+_profile_generations = count(1)
 
 # ============================================================================
 # Configuration
@@ -228,6 +230,9 @@ class ProfileRuntime:
     home: str
     cfg: Config
     client: IntarisClient
+    generation: int = field(
+        default_factory=lambda: next(_profile_generations), init=False
+    )
     context: Any = field(default=None, repr=False)
     policy: dict[str, Any] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
@@ -284,12 +289,22 @@ class _CompletionOwner:
     sessions_lock: Any = field(repr=False)
     recording_lock: Any = field(repr=False)
     session_start_required: threading.Event = field(repr=False)
+    birth_generation: int
     token: object = field(default_factory=object, repr=False)
     lock: Any = field(default_factory=threading.RLock, repr=False)
     effects_lock: Any = field(default_factory=threading.Lock, repr=False)
     status: str = "active"
     emitted_status: str = "active"
     admissions: set[object] = field(default_factory=set, repr=False)
+
+
+@dataclass(frozen=True)
+class _InvocationCancellation:
+    """Cancel only calls whose exact owner predates the lifecycle callback."""
+
+    ended: threading.Event
+    owner_token: object
+    birth_generation: int
 
 
 def _session_fingerprint(profile: ProfileRuntime) -> str:
@@ -308,7 +323,7 @@ _registration_locks: dict[str, Any] = {}
 _registered_homes: set[str] = set()
 
 # Only live cancellation events cross generations; no client/config authority.
-_active_invocations: dict[tuple[str, str], dict[object, threading.Event]] = {}
+_active_invocations: dict[tuple[str, str], dict[object, _InvocationCancellation]] = {}
 _invocations_lock = threading.Lock()
 # Completion records retain no registration, timer, or new-call authority.
 _completion_owners: dict[tuple[str, str], dict[object, _CompletionOwner]] = {}
@@ -679,6 +694,7 @@ def _get_completion_owner(
                 profile.sessions_lock,
                 profile.recording_lock,
                 profile.session_start_required,
+                profile.generation,
             )
             state._completion = owner
             _completion_owners.setdefault((profile.home, session_id), {})[
@@ -1376,7 +1392,11 @@ def _make_guarded_handler(
                     owner.admissions.add(admission_token)
                     with _invocations_lock:
                         key = (profile.home, session_id)
-                        _active_invocations.setdefault(key, {})[admission_token] = ended
+                        _active_invocations.setdefault(key, {})[admission_token] = (
+                            _InvocationCancellation(
+                                ended, owner.token, owner.birth_generation
+                            )
+                        )
 
         invocation = admission.invocation
 
@@ -1621,23 +1641,31 @@ def _on_session_end(
     **kwargs: Any,
 ) -> None:
     """on_session_end: Signal completion or idle."""
-    # Cancel every admitted invocation before claiming or waiting for effects.
+    # Successors may finish original owners; a retained predecessor callback
+    # cannot acquire authority over a newer lifetime, even in a shared map.
     with profile.lifecycle_lock:
         with _invocations_lock:
-            for ended in _active_invocations.get(
+            for record in _active_invocations.get(
                 (profile.home, session_id), {}
             ).values():
-                ended.set()
-        state = profile.sessions.get(session_id)
-        if state is not None:
-            state._ended.set()
-            _get_completion_owner(profile, session_id, state)
-    with _completion_owners_lock:
-        owners = tuple(_completion_owners.get((profile.home, session_id), {}).values())
-    # Snapshot exact owners once. A new state created during a blocked flush
-    # belongs to another lifetime and must not be claimed by this event.
-    for owner in owners:
-        _claim_session_end(owner, completed or interrupted)
+                if record.birth_generation <= profile.generation:
+                    record.ended.set()
+        with profile.sessions_lock:
+            state = profile.sessions.get(session_id)
+            if state is not None:
+                _get_completion_owner(profile, session_id, state)
+        with _completion_owners_lock:
+            owners = tuple(
+                owner
+                for owner in _completion_owners.get(
+                    (profile.home, session_id), {}
+                ).values()
+                if owner.birth_generation <= profile.generation
+            )
+        # Snapshot and claim eligible exact owners before any effects. A newer
+        # same-SID state created during a blocked flush is a separate lifetime.
+        for owner in owners:
+            _claim_session_end(owner, completed or interrupted)
     for owner in owners:
         _emit_lifecycle(owner)
 
