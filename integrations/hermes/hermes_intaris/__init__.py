@@ -49,6 +49,8 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from functools import partial, wraps
 from pathlib import Path
@@ -65,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 MAX_SESSIONS = 100
 MAX_RETIRED_PROFILES = 100
+MAX_RETIRED_OWNERS = 100
 MAX_RECENT_TOOLS = 10
 TEARDOWN_FLUSH_TIMEOUT_S = 5.0
 
@@ -279,6 +282,7 @@ class _CompletionOwner:
     sessions: dict[str, SessionState] = field(repr=False)
     sessions_lock: Any = field(repr=False)
     recording_lock: Any = field(repr=False)
+    session_start_required: threading.Event = field(repr=False)
     token: object = field(default_factory=object, repr=False)
     lock: Any = field(default_factory=threading.RLock, repr=False)
     effects_lock: Any = field(default_factory=threading.Lock, repr=False)
@@ -308,6 +312,9 @@ _invocations_lock = threading.Lock()
 # Completion records retain no registration, timer, or new-call authority.
 _completion_owners: dict[tuple[str, str], dict[object, _CompletionOwner]] = {}
 _completion_owners_lock = threading.Lock()
+# Unloaded and incompatible generations share one budget, counted by exact owner.
+_retired_owners: dict[object, _CompletionOwner] = {}
+_completion_effects = threading.local()
 # A later plugin may retain an older guard in its closure. Route that exact
 # guard to a fresh guard while executing the preserved wrapper chain.
 _guard_replacements: contextvars.ContextVar[dict[Callable, Callable] | None] = (
@@ -328,23 +335,31 @@ def _profile_key() -> str:
 
 def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
     evicted_owners = []
-    with profile.sessions_lock:
-        state = profile.sessions.get(task_id)
-        if state is None:
+    # Publish ownership before a captured start can pause, and serialize new
+    # state admission with unload. A late callback cannot repopulate retired maps.
+    with profile.lifecycle_lock:
+        if not profile.active or not profile.ready:
             state = SessionState()
-            profile.sessions[task_id] = state
-            # Evict oldest entries if over limit. Publish ownership even when
-            # a start has not entered creation yet, so it cannot outlive eviction.
-            if len(profile.sessions) > MAX_SESSIONS:
-                excess = len(profile.sessions) - MAX_SESSIONS
-                keys = list(profile.sessions.keys())[:excess]
-                for k in keys:
-                    evicted = profile.sessions.pop(k, None)
-                    if evicted is not None:
-                        evicted._ended.set()
-                        evicted_owners.append(
-                            _get_completion_owner(profile, k, evicted)
-                        )
+            state._ended.set()
+            return state
+        with profile.sessions_lock:
+            state = profile.sessions.get(task_id)
+            if state is None:
+                state = SessionState()
+                profile.sessions[task_id] = state
+                _get_completion_owner(profile, task_id, state)
+                # Evict oldest entries if over limit. Publish ownership even when
+                # a start has not entered creation yet, so it cannot outlive eviction.
+                if len(profile.sessions) > MAX_SESSIONS:
+                    excess = len(profile.sessions) - MAX_SESSIONS
+                    keys = list(profile.sessions.keys())[:excess]
+                    for k in keys:
+                        evicted = profile.sessions.pop(k, None)
+                        if evicted is not None:
+                            evicted._ended.set()
+                            evicted_owners.append(
+                                _get_completion_owner(profile, k, evicted)
+                            )
     # Claim every cancellation before effects, with no map/global lock over I/O.
     # Pending creation settles this terminal claim in its own finally block.
     for owner in evicted_owners:
@@ -511,6 +526,9 @@ def _ensure_session(
 ) -> str | None:
     """Ensure an Intaris session exists.  Returns the session ID or None."""
 
+    if state._ended.is_set():
+        return None
+
     # Publish lifecycle ownership before creation HTTP can block. An end hook
     # may detach this state while creation finishes, without losing its outcome.
     owner = _get_completion_owner(profile, task_id, state)
@@ -659,6 +677,7 @@ def _get_completion_owner(
                 profile.sessions,
                 profile.sessions_lock,
                 profile.recording_lock,
+                profile.session_start_required,
             )
             state._completion = owner
             _completion_owners.setdefault((profile.home, session_id), {})[
@@ -669,6 +688,7 @@ def _get_completion_owner(
 
 def _forget_completion_owner(owner: _CompletionOwner) -> None:
     with _completion_owners_lock:
+        _retired_owners.pop(owner.token, None)
         key = (owner.home, owner.session_id)
         owners = _completion_owners.get(key)
         if owners is not None and owners.get(owner.token) is owner:
@@ -698,6 +718,10 @@ def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
 
 def _emit_lifecycle(owner: _CompletionOwner) -> None:
     """Serialize local claims/emissions; HTTP retains best-effort semantics."""
+    pending = getattr(_completion_effects, "pending", None)
+    if pending is not None:
+        pending[owner.token] = owner
+        return
     with owner.effects_lock:
         while True:
             with owner.lock:
@@ -1819,20 +1843,101 @@ def _quiesce_profile(profile: ProfileRuntime) -> bool:
         return True
 
 
-def _retain_sessions(profile: ProfileRuntime) -> None:
-    """Retain detached continuity while the caller holds _profiles_lock."""
-    _retired_sessions.pop(profile.home, None)
-    _retired_sessions[profile.home] = _SessionContinuity(
+@contextmanager
+def _defer_completion_effects() -> Iterator[None]:
+    """Drain retirement effects after the outer registration/unload returns."""
+    if getattr(_completion_effects, "pending", None) is not None:
+        yield
+        return
+    pending: dict[object, _CompletionOwner] = {}
+    _completion_effects.pending = pending
+    try:
+        yield
+    finally:
+        del _completion_effects.pending
+        for owner in pending.values():
+            _emit_lifecycle(owner)
+
+
+def _continuity(profile: ProfileRuntime) -> _SessionContinuity:
+    return _SessionContinuity(
         _session_fingerprint(profile),
         profile.sessions,
         profile.sessions_lock,
         profile.recording_lock,
         profile.session_start_required,
     )
+
+
+def _retire_continuity(retained: _SessionContinuity, *, discard: bool = False) -> None:
+    """Account for detached owners under _profiles_lock, deferring all effects."""
+    # Compatible adoption and a provisional replacement's rollback source are
+    # still live ownership. Cache eviction must not complete either lifetime.
+    if any(
+        profile.active
+        and (
+            profile.sessions is retained.sessions
+            or (
+                profile.predecessor is not None
+                and profile.predecessor.sessions is retained.sessions
+            )
+        )
+        for profile in _profiles.values()
+    ):
+        return
+    with retained.sessions_lock:
+        owners = [state._completion for state in retained.sessions.values()]
+    retiring = []
+    with _completion_owners_lock:
+        for owner in owners:
+            if owner is None or owner.token not in _completion_owners.get(
+                (owner.home, owner.session_id), {}
+            ):
+                continue
+            if discard:
+                _retired_owners.pop(owner.token, None)
+                retiring.append(owner)
+            else:
+                _retired_owners.setdefault(owner.token, owner)
+        while len(_retired_owners) > MAX_RETIRED_OWNERS:
+            retiring.append(_retired_owners.pop(next(iter(_retired_owners))))
+    # Cancellation and detachment happen before any I/O or effects-lock wait.
+    # Captured creation/guard work keeps its own owner after index removal.
+    for owner in retiring:
+        owner.session_start_required.set()
+        _claim_session_end(owner, terminal=True)
+        _forget_completion_owner(owner)
+        cached = _retired_sessions.get(owner.home)
+        if cached is not None and cached.sessions is owner.sessions:
+            with cached.sessions_lock:
+                if not cached.sessions:
+                    del _retired_sessions[owner.home]
+        _emit_lifecycle(owner)
+
+
+def _adopt_continuity(retained: _SessionContinuity) -> None:
+    """Transfer compatible ownership out of the retired budget without ending it."""
+    with retained.sessions_lock, _completion_owners_lock:
+        for state in retained.sessions.values():
+            if state._completion is not None:
+                _retired_owners.pop(state._completion.token, None)
+
+
+def _retain_sessions(profile: ProfileRuntime) -> None:
+    """Retain detached continuity while the caller holds _profiles_lock."""
+    previous = _retired_sessions.pop(profile.home, None)
+    retained = _continuity(profile)
+    _retired_sessions[profile.home] = retained
+    if previous is not None and previous.sessions is not retained.sessions:
+        _retire_continuity(previous)
+    _retire_continuity(retained)
     while len(_retired_sessions) > MAX_RETIRED_PROFILES:
-        _retired_sessions.pop(next(iter(_retired_sessions)))
+        _retire_continuity(
+            _retired_sessions.pop(next(iter(_retired_sessions))), discard=True
+        )
 
 
+@_defer_completion_effects()
 def _close_profile(profile: ProfileRuntime) -> None:
     """Stop this generation's timer and dispose its Hermes registrations."""
     with profile.lifecycle_lock:
@@ -1869,6 +1974,7 @@ def _close_profile(profile: ProfileRuntime) -> None:
                     _profiles[profile.home] = previous
                 else:
                     del _profiles[profile.home]
+            _retire_continuity(_continuity(profile))
         profile.closed.set()
 
 
@@ -1900,6 +2006,7 @@ class _LegacyToolRegistration:
             self.registry._tools[self.previous.name] = self.previous
 
 
+@_defer_completion_effects()
 def register(ctx: Any) -> None:
     """Register guards and hooks in the active Hermes profile's namespace.
 
@@ -1960,6 +2067,7 @@ def register(ctx: Any) -> None:
                 profile.sessions_lock = retained.sessions_lock
                 profile.recording_lock = retained.recording_lock
                 profile.session_start_required = retained.session_start_required
+                _adopt_continuity(retained)
             _profiles[home] = profile
         try:
             _register_profile(profile, ctx, registry, scoped)
@@ -1988,7 +2096,9 @@ def register(ctx: Any) -> None:
                 profile.registered = True
                 profile.ready = True
                 profile.predecessor = None
-                _retired_sessions.pop(home, None)
+                discarded = _retired_sessions.pop(home, None)
+                if discarded is not None:
+                    _retire_continuity(discarded)
                 # A lock records an attempt, not a successful load. Retain
                 # successful history even after continuity-cache eviction.
                 _registered_homes.add(home)

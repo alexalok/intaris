@@ -224,6 +224,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._registration_locks.clear()
         plugin._registered_homes.clear()
         plugin._completion_owners.clear()
+        plugin._retired_owners.clear()
     if hasattr(plugin, "_sessions"):
         plugin._sessions.clear()
         plugin._mcp_tool_cache = None
@@ -301,6 +302,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._registration_locks.clear()
         plugin._registered_homes.clear()
         plugin._completion_owners.clear()
+        plugin._retired_owners.clear()
 
 
 def requests_for(runtime, suffix):
@@ -2888,3 +2890,312 @@ def test_real_hermes_eviction_waits_for_outer_guard(
     ):
         if loop is not None and not loop.is_running():
             loop.close()
+
+
+@pytest.mark.parametrize("mode", ["homes", "unload", "replacement"])
+@pytest.mark.parametrize("transport_fails", [False, True])
+def test_retired_owner_budget_counts_sessions_and_generations(
+    runtime, monkeypatch, caplog, mode, transport_fails
+):
+    import gc
+    import logging
+    import weakref
+
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 2)
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 3, raising=False)
+    if transport_fails:
+        caplog.set_level(logging.CRITICAL, logger="hermes_intaris.client")
+
+        def fail(req):
+            if req.full_url.endswith(("/status", "/agent-summary")):
+                raise TimeoutError("synthetic lifecycle outage")
+
+        runtime.request_hook.append(fail)
+    references = []
+    for generation in range(7):
+        name = f"home-{generation}" if mode == "homes" else "a"
+        ctx = runtime.register(name, {"agent_id": str(generation)})
+        with runtime.profile(name) as home:
+            for sid in ("same-id", "second-id"):
+                ctx.emit("on_session_start", session_id=sid)
+                state = plugin._profiles[str(home)].sessions[sid]
+                references.append(weakref.ref(state))
+        if mode != "replacement":
+            for callback in ctx.unload:
+                callback()
+        count = sum(len(group) for group in plugin._completion_owners.values())
+        live = 2 if mode == "replacement" else 0
+        assert count <= live + 3, "retired budget counts owners, not homes or SIDs"
+    del state
+    gc.collect()
+    assert all(ref() is None for ref in references[: -(live + 3)])
+    completed = [
+        r
+        for r in requests_for(runtime, "/status")
+        if r["body"]["status"] == "completed"
+    ]
+    assert len(completed) >= 14 - live - 3
+    assert len(completed) == len(requests_for(runtime, "/agent-summary"))
+    assert len({r["url"] for r in completed}) == len(completed)
+
+
+def test_retired_owner_cache_eviction_and_compatible_adoption(runtime, monkeypatch):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 1)
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 10, raising=False)
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        state = plugin._profiles[str(home)].sessions["same-id"]
+    for callback in old.unload:
+        callback()
+    current = runtime.register("a")
+    owner = state._completion
+    original_register = plugin._register_profile
+
+    def fail(*args):
+        raise RuntimeError("synthetic replacement failure")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(plugin, "_register_profile", fail)
+        with pytest.raises(RuntimeError, match="synthetic replacement failure"):
+            runtime.register("a", {"agent_id": "failed"})
+    assert plugin._register_profile is original_register
+    current = runtime.register("a")
+    for name in ("b", "c", "d"):
+        ctx = runtime.register(name)
+        with runtime.profile(name):
+            ctx.emit("on_session_start", session_id="same-id")
+        for callback in ctx.unload:
+            callback()
+    # Cache eviction must retire B/C, but cannot complete adopted live A.
+    assert len(requests_for(runtime, "/agent-summary")) == 2
+    assert owner.status == "active" and not state._ended.is_set()
+    assert plugin._profiles[str(home)].sessions["same-id"] is state
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "still live"}, session_id="same-id"
+            )
+        ) == {"result": "still live"}
+        current.emit("on_session_end", session_id="same-id")
+    assert len(requests_for(runtime, "/agent-summary")) == 3
+
+
+@pytest.mark.parametrize("phase", ["before_http", "during_http"])
+def test_retired_owner_settles_creation_and_same_sid_reuse(runtime, monkeypatch, phase):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0, raising=False)
+    old = runtime.register("a")
+    entered, release = threading.Event(), threading.Event()
+    ensure = plugin._ensure_session
+
+    def before(profile, sid, state, *args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return ensure(profile, sid, state, *args, **kwargs)
+
+    def during(req):
+        if req.full_url.endswith("/intention") and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    if phase == "before_http":
+        monkeypatch.setattr(plugin, "_ensure_session", before)
+    else:
+        runtime.request_hook.append(during)
+
+    def start():
+        with runtime.profile("a"):
+            old.emit("on_session_start", session_id="same-id")
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(start)
+        try:
+            assert entered.wait(5)
+            with runtime.profile("a") as home:
+                original = plugin._profiles[str(home)].sessions["same-id"]
+                current = runtime.register("a", {"agent_id": "new"})
+                assert original._ended.is_set(), (
+                    "retirement must cancel pending creation"
+                )
+                current.emit("on_session_start", session_id="same-id")
+                replacement = plugin._profiles[str(home)].sessions["same-id"]
+                assert (
+                    sum(len(group) for group in plugin._completion_owners.values()) == 1
+                )
+        finally:
+            release.set()
+        pending.result(5)
+    assert original._completion.status == "completed"
+    assert not original.start_confirmed
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+    assert plugin._profiles[str(home)].sessions["same-id"] is replacement
+    assert len(requests_for(runtime, "/agent-summary")) == int(phase == "during_http")
+    assert len(requests_for(runtime, "/intention")) == 1 + int(phase == "during_http")
+
+
+@pytest.mark.parametrize("operation", ["replace", "unload"])
+@pytest.mark.parametrize("effect", ["status", "events"])
+def test_retired_owner_effects_release_registration_locks(
+    runtime, monkeypatch, operation, effect
+):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0, raising=False)
+    monkeypatch.setattr(plugin, "TEARDOWN_FLUSH_TIMEOUT_S", 0)
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        original = plugin._profiles[str(home)].sessions["same-id"]
+        old.emit(
+            "post_llm_call",
+            session_id="same-id",
+            assistant_response="retired recording",
+        )
+    entered, release = threading.Event(), threading.Event()
+
+    def hold(req):
+        if req.full_url.endswith(f"/{original.intaris_session_id}/{effect}"):
+            entered.set()
+            assert release.wait(5)
+
+    runtime.request_hook.append(hold)
+
+    def retire():
+        if operation == "replace":
+            return runtime.register("a", {"agent_id": "new"})
+        for callback in old.unload:
+            callback()
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        retiring = workers.submit(retire)
+        try:
+            assert entered.wait(5), "retirement must finish the old remote session"
+            assert original._ended.is_set()
+            # The same home's outer registration lock, not only globals, must be free.
+            current = workers.submit(runtime.register, "a", {"agent_id": "new"}).result(
+                3
+            )
+            with runtime.profile("a"):
+                current.emit("on_session_start", session_id="same-id")
+                replacement = plugin._profiles[str(home)].sessions["same-id"]
+                assert json.loads(
+                    runtime.registry.get_entry("read_file").handler(
+                        {"path": "replacement"}, session_id="same-id"
+                    )
+                ) == {"result": "replacement"}
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="same-id")
+        finally:
+            release.set()
+        retiring.result(5)
+    assert plugin._profiles[str(home)].sessions["same-id"] is replacement
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_retired_owner_cancels_outer_foreign_wrapper(runtime, monkeypatch, is_async):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0)
+    entered, release = threading.Event(), threading.Event()
+    with runtime.profile("a") as home:
+        old = runtime.register("a")
+        old.emit("on_session_start", session_id="same-id")
+        state = plugin._profiles[str(home)].sessions["same-id"]
+        predecessor = runtime.registry.get_entry("read_file").handler
+
+        @wraps(predecessor)
+        def wrapper(args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return predecessor({"path": "transformed"}, **kwargs)
+
+        @wraps(predecessor)
+        async def async_wrapper(args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return await asyncio.to_thread(
+                predecessor, {"path": "transformed"}, **kwargs
+            )
+
+        Context(runtime.registry, home).register_tool(
+            name="read_file",
+            toolset="test",
+            schema={"name": "read_file"},
+            handler=async_wrapper if is_async else wrapper,
+            is_async=is_async,
+            description="Preserved foreign wrapper",
+            override=True,
+        )
+        runtime.register("a")
+        handler = runtime.registry.get_entry("read_file").handler
+
+    def invoke():
+        with runtime.profile("a"):
+            result = handler({"path": "original"}, session_id="same-id")
+            return json.loads(asyncio.run(result) if is_async else result)
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(invoke)
+        try:
+            assert entered.wait(5)
+            assert len(state._completion.admissions) == 1
+            current = runtime.register("a", {"agent_id": "new"})
+            assert state._ended.is_set() and state._completion.status == "completed"
+            assert not requests_for(runtime, "/agent-summary"), (
+                "outer call still owns its lifetime"
+            )
+            with runtime.profile("a"):
+                current.emit("on_session_start", session_id="same-id")
+                replacement = plugin._profiles[str(home)].sessions["same-id"]
+            assert sum(len(group) for group in plugin._completion_owners.values()) == 1
+        finally:
+            release.set()
+        assert "CANCELLED" in pending.result(5).get("error", "")
+    assert not requests_for(runtime, "/evaluate")
+    assert not plugin._active_invocations
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+    assert plugin._profiles[str(home)].sessions["same-id"] is replacement
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+
+
+@pytest.mark.parametrize("cache_cap", [1, 100])
+def test_retired_owner_releases_client_and_session_dictionary(
+    runtime, monkeypatch, tmp_path, cache_cap
+):
+    import gc
+    import weakref
+
+    class SessionMap(dict):
+        pass
+
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", cache_cap)
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 2)
+    references = []
+    for generation in range(8):
+        # No host callback/lease retains these runtimes; only adapter ownership does.
+        home = str(tmp_path / f"home-{generation}")
+        profile = plugin.ProfileRuntime(
+            home=home,
+            cfg=plugin.Config(),
+            client=plugin.IntarisClient(
+                "https://gc.invalid", "test-key", "user", str(generation)
+            ),
+            sessions=SessionMap(),
+            registered=True,
+        )
+        plugin._profiles[home] = profile
+        state = plugin._get_or_create_state(profile, "same-id")
+        plugin._ensure_session(profile, "same-id", state)
+        references.append(
+            tuple(
+                weakref.ref(item)
+                for item in (state, state._completion, profile.client, profile.sessions)
+            )
+        )
+        plugin._close_profile(profile)
+    del profile, state
+    gc.collect()
+    for group in references[: -min(cache_cap, 2)]:
+        assert all(ref() is None for ref in group), (
+            "no global index may pin discarded heavy ownership"
+        )

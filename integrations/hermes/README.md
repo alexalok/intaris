@@ -104,9 +104,14 @@ Intaris sessions, intention context, and counters when the backend URL,
 credentials, user/agent identity, and effective path policy are unchanged.
 Runtime callbacks, tools, MCP cache, and timers are replaced. Admission
 continuity is cached for the 100 most recently unloaded profiles, without
-retaining managers or timers. Outstanding sessions keep their original client
-and state solely for lifecycle completion until their terminal end event. These
-records preserve final recording/status/summary routing across identity changes
+retaining managers or timers. Up to 100 outstanding retired session owners keep
+their original client and state solely for lifecycle completion. This budget
+counts sessions across all unloaded profiles and incompatible generations,
+including repeated replacements of the same home and Hermes session ID.
+Compatible adoption transfers existing owners without completing them. Capacity
+retirement cancels the old lifetime and sends its final recording/status/summary
+after pending creation and admitted tool calls drain; discarded continuity cannot
+reopen the retired session. Retained records preserve final recording/status/summary routing across identity changes
 and cannot authorize new tool calls. Duplicate end callbacks produce one local
 completion transition; HTTP delivery retains its existing best-effort behavior.
 The 100-session cap also completes evicted sessions through their original owner,

@@ -92,6 +92,7 @@ def _clean_state():
     mod._registration_locks.clear()
     mod._registered_homes.clear()
     mod._completion_owners.clear()
+    mod._retired_owners.clear()
     _registry._tools.clear()
     yield
     mod._profiles.clear()
@@ -99,6 +100,7 @@ def _clean_state():
     mod._registration_locks.clear()
     mod._registered_homes.clear()
     mod._completion_owners.clear()
+    mod._retired_owners.clear()
 
 
 @pytest.fixture
