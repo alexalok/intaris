@@ -1262,3 +1262,70 @@ class TestSearchFileOptionOperands:
             )
             == Classification.READ
         )
+
+
+class TestRipgrepPatternlessOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--files "/etc/private"',
+            '--files --hidden "/etc/private"',
+            '--files -uuu "/etc/private"',
+            '--files -g txt "/etc/private"',
+            '--files --glob txt "/etc/private"',
+            '--files --iglob txt "/etc/private"',
+            '--files --type-add custom:txt "/etc/private"',
+            '--files --type-list "/etc/private"',
+            '"/etc/private" --files',
+            '--files -- "/etc/private"',
+            "--files /etc/private",
+        ],
+    )
+    def test_ripgrep_files_keeps_first_directory(self, tool, arguments):
+        args = {"command": f"rg {arguments}"}
+        assert "/etc/private" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--files "docs"',
+            '--files -g "/etc/private" "docs"',
+            '--files --glob "/etc/private" "docs"',
+            '--files --iglob "/etc/private" "docs"',
+            '--files --glob="/etc/private" "docs"',
+            '--files --type-add "custom:/etc/private" "docs"',
+            '--files --path-separator "/" "docs"',
+            "--type-list",
+            '--files-with-matches "/etc/private" README.md',
+            '--files-without-match "/etc/private" README.md',
+            '-e "--files" README.md',
+            '-- "--files" README.md',
+        ],
+    )
+    def test_ripgrep_file_modes_preserve_data_and_search_patterns(
+        self, tool, arguments
+    ):
+        assert (
+            classify(
+                tool,
+                {"command": f"rg {arguments}"},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )

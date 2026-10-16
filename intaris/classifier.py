@@ -586,6 +586,7 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
     operands: list[str] = []
     first_positional: int | None = None
     pattern_seen = False
+    patternless = False
     pending_value: str | None = None
     short_values = {"f": "file", "e": "pattern"}
     short_values.update(dict.fromkeys("mABC", "option"))
@@ -605,6 +606,9 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
                 first_positional = len(operands)
             operands.extend(remaining)
             break
+        if command == "rg" and token in {"--files", "--type-list"}:
+            patternless = True
+            continue
         if token == "--file":
             pending_value = "file"
             continue
@@ -627,6 +631,25 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
             "--binary-files",
             "--devices",
             "--directories",
+        }:
+            pending_value = "option"
+            continue
+        if command == "rg" and token in {
+            "--glob",
+            "--iglob",
+            "--type",
+            "--type-not",
+            "--type-add",
+            "--type-clear",
+            "--encoding",
+            "--threads",
+            "--max-columns",
+            "--replace",
+            "--sort",
+            "--sortr",
+            "--path-separator",
+            "--max-depth",
+            "--max-filesize",
         }:
             pending_value = "option"
             continue
@@ -654,7 +677,7 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
         operands.append(token)
     # -e/-f may appear after positional operands. Only infer a positional
     # pattern after all options have been considered.
-    if not pattern_seen and first_positional is not None:
+    if not pattern_seen and not patternless and first_positional is not None:
         del operands[first_positional]
     return operands
 

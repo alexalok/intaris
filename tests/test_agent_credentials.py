@@ -1170,3 +1170,32 @@ def test_agent_search_file_flags_enforce_path_denies(client, tool, command):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "critical"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "deny_paths", [[], ["/etc/*"]], ids=["boundary", "explicit-deny"]
+)
+def test_agent_ripgrep_file_listing_obeys_path_policy(client, tool, deny_paths):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": deny_paths}
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Unapproved directory",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(client, tool=tool, command='rg --files "/etc/private"')
+    assert result["decision"] == "deny", result
+    assert result["path"] == ("critical" if deny_paths else "llm"), result
+    assert inference.call_count == (0 if deny_paths else 1)
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == ("critical" if deny_paths else "write")
+    assert audit["tool"] == tool
