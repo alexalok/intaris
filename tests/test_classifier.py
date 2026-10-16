@@ -123,7 +123,7 @@ class TestReadOnlyBash:
             "git status",
             "git log --oneline",
             "git diff",
-            "git diff HEAD^1",
+            "git diff HEAD~1",
             "git show HEAD",
             "git branch -a",
             "git remote -v",
@@ -1469,9 +1469,6 @@ class TestTildeShellExpansion:
             "cat ~-1/notes.txt",
             'cat "~alex/notes.txt"',
             r"cat \~alex/notes.txt",
-            "cat ./~alex/notes.txt",
-            "cat notes~.txt",
-            "git diff HEAD~1",
         ],
     )
     def test_tilde_syntax_requires_evaluation(self, tool, command):
@@ -1487,7 +1484,17 @@ class TestTildeShellExpansion:
 
     @pytest.mark.parametrize("tool", ["terminal", "bash"])
     @pytest.mark.parametrize(
-        "command", ["cat notes.txt", 'cat "notes file.txt"', "pwd"]
+        "command",
+        [
+            "cat notes.txt",
+            'cat "notes file.txt"',
+            "pwd",
+            "git diff HEAD~1",
+            "cat path/name~suffix",
+            "cat notes~.txt",
+            "cat ./~alex/notes.txt",
+            'cat "path/name~suffix"',
+        ],
     )
     def test_literal_reads_without_expansion_remain_fast(self, tool, command):
         assert (

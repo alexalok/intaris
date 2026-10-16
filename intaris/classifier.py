@@ -1195,9 +1195,8 @@ def _is_read_only_bash(args: dict[str, Any]) -> bool:
     # and redirection require evaluation even when the first command is safe.
     # Brace/pathname expansion can synthesize write/exec options that
     # shlex misses. Reject glob syntax (including extglob parentheses),
-    # braces, tildes, and quoted/escaped forms conservatively. Tilde expansion
-    # depends on the client shell/user; never resolve it using the server host.
-    if any(char in command for char in ";&|\n\r`${}*?[]()~"):
+    # braces, and quoted/escaped forms conservatively.
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
         return False
 
     return _is_single_command_read_only(command)
@@ -1210,7 +1209,7 @@ _REDIRECT_OPS: set[str] = {">", ">>", "2>", "2>>", "&>", "&>>", "<", "<<"}
 def _is_single_command_read_only(command: str) -> bool:
     """Check if a single (non-piped, non-chained) command is read-only."""
     # Mixed/remaining shell control syntax is not a simple command.
-    if any(char in command for char in ";&|\n\r`${}*?[]()~"):
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
         return False
 
     # Check for shell redirection BEFORE shlex.split, since shlex treats
@@ -1225,6 +1224,12 @@ def _is_single_command_read_only(command: str) -> bool:
         return False
 
     if not tokens:
+        return False
+
+    # Tilde prefixes depend on the client shell/user, never the server host.
+    # shlex strips quoting, so quoted/escaped prefixes are conservative too.
+    # Mid-token tildes (HEAD~1, file~suffix) are literal and remain eligible.
+    if any(token.startswith("~") for token in tokens):
         return False
 
     base_cmd = tokens[0]

@@ -1289,3 +1289,15 @@ def test_agent_stat_cluster_format_is_data(client, tool):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "read"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("command", ["git diff HEAD~1", "cat path/name~suffix"])
+def test_agent_mid_token_tildes_remain_fast(client, tool, command):
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command=command)
+    assert result["decision"] == "approve", result
+    assert result["path"] == "fast", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "read"
+    assert audit["tool"] == tool
