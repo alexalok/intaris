@@ -555,7 +555,7 @@ def _generic_file_operands(command: str, args: list[str]) -> list[str]:
         "tail": {"-n", "-c", "--lines", "--bytes"},
         "diff": {"--label", "-L"},
         "du": {"-d", "--max-depth"},
-        "stat": {"--format", "--printf"},
+        "stat": {"-c", "--format", "--printf"},
     }.get(command, set())
     operands: list[str] = []
     skip_next = False

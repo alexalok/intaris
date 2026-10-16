@@ -1199,3 +1199,17 @@ def test_agent_ripgrep_file_listing_obeys_path_policy(client, tool, deny_paths):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+def test_agent_stat_format_is_not_a_denied_path(client, tool):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": ["/etc/*"]}
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command='stat -c "/etc/passwd" README.md')
+    assert result["decision"] == "approve", result
+    assert result["path"] == "fast", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "read"
+    assert audit["tool"] == tool

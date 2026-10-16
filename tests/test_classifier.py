@@ -1329,3 +1329,50 @@ class TestRipgrepPatternlessOperands:
             )
             == Classification.READ
         )
+
+
+class TestStatFormatOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-c "/etc/passwd" README.md',
+            '-c"/etc/passwd" README.md',
+            '--format "/etc/passwd" README.md',
+            '--format="/etc/passwd" README.md',
+            '--printf "/etc/passwd" README.md',
+            '-c "/etc/passwd" -- README.md',
+        ],
+    )
+    def test_stat_quoted_formats_are_data(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        ['-c "%n" "/etc/passwd"', '-c "%n" -- "/etc/passwd"', '-f "/etc/passwd"'],
+    )
+    def test_stat_format_flag_does_not_hide_actual_files(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
