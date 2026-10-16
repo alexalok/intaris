@@ -71,6 +71,10 @@ from hermes_intaris import (  # noqa: E402
 )
 from hermes_intaris.client import ApiResult, IntarisClient  # noqa: E402
 
+from . import test_waits  # noqa: E402
+
+host = test_waits.host
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -101,7 +105,7 @@ def env_vars(monkeypatch):
 
 
 @pytest.fixture
-def scripted_http(monkeypatch):
+def scripted_http(monkeypatch, host):
     """Control only transport and time; keep adapter/client/polling real."""
     clock = types.SimpleNamespace(now=0.0)
 
@@ -110,6 +114,10 @@ def scripted_http(monkeypatch):
 
     monkeypatch.setattr("time.sleep", sleep)
     monkeypatch.setattr("time.monotonic", lambda: clock.now)
+    monkeypatch.setattr(
+        "hermes_intaris.waits.Invocation._wait_slice",
+        lambda _self, seconds: sleep(seconds),
+    )
 
     def script(*replies):
         responses = []
