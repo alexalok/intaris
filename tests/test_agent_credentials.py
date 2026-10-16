@@ -1252,3 +1252,26 @@ def test_agent_auxiliary_search_files_obey_policy(
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("command", ["cat ~alex/notes.txt", "cat ~-/notes.txt"])
+def test_agent_unresolved_tilde_requires_evaluation(client, tool, command):
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Unresolved client path",
+                "decision": "deny",
+            }
+        ),
+    ):
+        result = evaluate(client, tool=tool, command=command)
+    assert result["decision"] == "deny", result
+    assert result["path"] == "llm", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "write"
+    assert audit["tool"] == tool

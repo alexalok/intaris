@@ -123,7 +123,7 @@ class TestReadOnlyBash:
             "git status",
             "git log --oneline",
             "git diff",
-            "git diff HEAD~1",
+            "git diff HEAD^1",
             "git show HEAD",
             "git branch -a",
             "git remote -v",
@@ -1451,4 +1451,46 @@ class TestSearchAuxiliaryFiles:
                 session_policy={"deny_paths": ["/etc/*"]},
             )
             == Classification.CRITICAL
+        )
+
+
+class TestTildeShellExpansion:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat ~",
+            "cat ~/notes.txt",
+            "cat ~alex/notes.txt",
+            "cat ~+/notes.txt",
+            "cat ~-/notes.txt",
+            "cat ~1/notes.txt",
+            "cat ~+1/notes.txt",
+            "cat ~-1/notes.txt",
+            'cat "~alex/notes.txt"',
+            r"cat \~alex/notes.txt",
+            "cat ./~alex/notes.txt",
+            "cat notes~.txt",
+            "git diff HEAD~1",
+        ],
+    )
+    def test_tilde_syntax_requires_evaluation(self, tool, command):
+        assert (
+            classify(
+                tool,
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": []},
+            )
+            == Classification.WRITE
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command", ["cat notes.txt", 'cat "notes file.txt"', "pwd"]
+    )
+    def test_literal_reads_without_expansion_remain_fast(self, tool, command):
+        assert (
+            classify(tool, {"command": command}, working_directory="/tmp/project")
+            == Classification.READ
         )
