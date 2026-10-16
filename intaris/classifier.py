@@ -655,7 +655,9 @@ _GREP_LONG_OPTION_ROLES: dict[str, str] = {
 
 def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], bool]:
     """Return file operands and whether GNU grep long-option parsing is uncertain."""
-    operands: list[str] = []
+    # Keep the positional slot for a lone "-" until pattern inference. Neither
+    # that pattern nor stdin is a filesystem path, so represent it with None.
+    operands: list[str | None] = []
     first_positional: int | None = None
     pattern_seen = False
     patternless = False
@@ -667,7 +669,10 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
     for index, token in enumerate(args):
         if pending_value is not None:
             if pending_value in {"file", "auxiliary_file"}:
-                operands.append(token)
+                is_stdin = token == "-" and (
+                    pending_value == "file" or command == "grep"
+                )
+                operands.append(None if is_stdin else token)
             if pending_value in {"file", "pattern"}:
                 pattern_seen = True
             pending_value = None
@@ -676,7 +681,7 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
             remaining = args[index + 1 :]
             if first_positional is None and remaining:
                 first_positional = len(operands)
-            operands.extend(remaining)
+            operands.extend(None if arg == "-" else arg for arg in remaining)
             break
         option, separator, value = token.partition("=")
         if command == "grep" and token.startswith("--"):
@@ -689,7 +694,7 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
                 pass
             elif separator:
                 if role in {"file", "auxiliary_file"}:
-                    operands.append(value)
+                    operands.append(None if value == "-" else value)
                 if role in {"file", "pattern"}:
                     pattern_seen = True
             else:
@@ -709,7 +714,7 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
             pending_value = "file"
             continue
         if token.startswith("--file="):
-            operands.append(token.split("=", 1)[1])
+            operands.append(None if value == "-" else value)
             pattern_seen = True
             continue
         if token == "--regexp":
@@ -749,7 +754,7 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
         }:
             pending_value = "option"
             continue
-        if token.startswith("-") and not token.startswith("--"):
+        if token != "-" and token.startswith("-") and not token.startswith("--"):
             # In a short-option cluster, the first value-taking option consumes
             # the remainder (or the next token): -nf PATH and -nfPATH both read PATH.
             for offset, option in enumerate(token[1:], start=2):
@@ -761,16 +766,16 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
                     pending_value = kind
                 else:
                     if kind == "file":
-                        operands.append(value)
+                        operands.append(None if value == "-" else value)
                     if kind in {"file", "pattern"}:
                         pattern_seen = True
                 break
             continue
-        if token.startswith("-"):
+        if token.startswith("--"):
             continue
         if first_positional is None:
             first_positional = len(operands)
-        operands.append(token)
+        operands.append(None if token == "-" else token)
     if command == "grep" and pending_value is not None:
         unknown_options = True
     if unknown_options:
@@ -785,7 +790,9 @@ def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], b
         # -e/-f may appear after positional operands. Infer a positional pattern
         # only after all known options have been considered.
         del operands[first_positional]
-    return list(dict.fromkeys(operands)), unknown_options
+    return list(
+        dict.fromkeys(arg for arg in operands if arg is not None)
+    ), unknown_options
 
 
 def _sed_file_operands(args: list[str]) -> list[str]:

@@ -1368,3 +1368,56 @@ def test_agent_known_grep_data_options_remain_fast(client, tool, command):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "read"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("command", ["grep", "rg"])
+@pytest.mark.parametrize("pattern", ["-", '"-"'])
+@pytest.mark.parametrize(
+    "deny_paths", [[], ["/etc/*"]], ids=["boundary", "explicit-deny"]
+)
+def test_agent_hyphen_pattern_obeys_path_policy(
+    client, tool, command, pattern, deny_paths
+):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": deny_paths}
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Unapproved outside-project read",
+                "decision": "deny",
+            }
+        ),
+    ):
+        result = evaluate(
+            client, tool=tool, command=f'{command} {pattern} "/etc/passwd"'
+        )
+    assert result["decision"] == "deny", result
+    assert result["path"] == ("critical" if deny_paths else "llm"), result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == ("critical" if deny_paths else "write")
+    assert audit["tool"] == tool
+    if not deny_paths:
+        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        assert context["target_paths"] == ["/etc/passwd"]
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("command", ["grep", "rg"])
+@pytest.mark.parametrize("arguments", ["- -", "-f - README.md"])
+def test_agent_search_stdin_remains_fast(client, tool, command, arguments):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": ["/tmp/project/-"]}
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command=f"{command} {arguments}")
+    assert result["decision"] == "approve", result
+    assert result["path"] == "fast", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "read"
+    assert audit["tool"] == tool

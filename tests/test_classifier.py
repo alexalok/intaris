@@ -1722,3 +1722,135 @@ class TestGrepUnknownLongOptions:
     @pytest.mark.parametrize("option", ["--regexp", "--file", "--label"])
     def test_missing_long_option_value_requires_evaluation(self, tool, option):
         assert classify(tool, {"command": f"grep {option}"}) == Classification.WRITE
+
+
+class TestSearchHyphenOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "pattern", ["-", "'-'", '"-"', r"\-", "-n -", "-- -", "-e -"]
+    )
+    def test_lone_hyphen_pattern_preserves_target_file(self, tool, command, pattern):
+        args = {"command": f'{command} {pattern} "/etc/passwd"'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == ["/etc/passwd"]
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize("arguments", ["root -", "-e root -", "-f -", "--file=-"])
+    def test_stdin_operand_does_not_hide_following_file(self, tool, command, arguments):
+        args = {"command": f'{command} {arguments} "/etc/passwd"'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == ["/etc/passwd"]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments,paths",
+        [
+            ("root -", []),
+            ("root -- -", []),
+            ("- -", []),
+            ("-- - -", []),
+            ("-e - -", []),
+            ("-f - README.md", ["/tmp/project/README.md"]),
+            ("-f- README.md", ["/tmp/project/README.md"]),
+            ("--file=- README.md", ["/tmp/project/README.md"]),
+        ],
+    )
+    def test_stdin_is_not_a_filesystem_operand(self, tool, command, arguments, paths):
+        args = {"command": f"{command} {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == paths
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize("arguments", ["root ./-", "-f ./- README.md"])
+    def test_hyphen_filename_is_not_stdin(self, tool, command, arguments):
+        args = {"command": f"{command} {arguments}"}
+        assert "/tmp/project/-" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    @pytest.mark.parametrize(
+        "command,option,paths,expected",
+        [
+            ("grep", "--exclude-from", ["/tmp/project/README.md"], Classification.READ),
+            (
+                "rg",
+                "--ignore-file",
+                ["/tmp/project/-", "/tmp/project/README.md"],
+                Classification.CRITICAL,
+            ),
+        ],
+    )
+    def test_auxiliary_hyphen_uses_command_contract(
+        self, tool, separator, command, option, paths, expected
+    ):
+        args = {"command": f'{command} {option}{separator}"-" root README.md'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == paths
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        ['grep --future - "/etc/passwd"', 'grep - "/etc/passwd" --future'],
+    )
+    def test_hyphen_keeps_unknown_option_fallback(self, tool, command):
+        args = {"command": command}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert classify(tool, args) == Classification.WRITE
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
