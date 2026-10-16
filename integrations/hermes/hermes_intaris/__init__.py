@@ -1917,16 +1917,13 @@ def _continuity(profile: ProfileRuntime) -> _SessionContinuity:
 
 def _retire_continuity(retained: _SessionContinuity, *, discard: bool = False) -> None:
     """Account for detached owners under _profiles_lock, deferring all effects."""
-    # Compatible adoption and a provisional replacement's rollback source are
-    # still live ownership. Cache eviction must not complete either lifetime.
+    # Published runtimes and their rollback maps stay owned through cleanup,
+    # even after admission closes. Settlement explicitly accounts released maps.
     if any(
-        profile.active
-        and (
-            profile.sessions is retained.sessions
-            or (
-                profile.predecessor is not None
-                and profile.predecessor.sessions is retained.sessions
-            )
+        profile.sessions is retained.sessions
+        or (
+            profile.predecessor is not None
+            and profile.predecessor.sessions is retained.sessions
         )
         for profile in _profiles.values()
     ):
@@ -1962,7 +1959,7 @@ def _retire_continuity(retained: _SessionContinuity, *, discard: bool = False) -
 
 
 def _adopt_continuity(retained: _SessionContinuity) -> None:
-    """Transfer compatible ownership out of the retired budget without ending it."""
+    """Remove published continuity from retired accounting without ending it."""
     with retained.sessions_lock, _completion_owners_lock:
         for state in retained.sessions.values():
             if state._completion is not None:
@@ -2007,6 +2004,7 @@ def _close_profile(profile: ProfileRuntime) -> None:
                 logger.exception("[intaris] Failed to dispose profile registration")
     finally:
         with _profiles_lock:
+            previous = profile.predecessor
             if _profiles.get(profile.home) is profile:
                 # Keep shared state/locks for already-admitted callbacks, but
                 # do not retain registration context, tools, or timers.
@@ -2016,7 +2014,6 @@ def _close_profile(profile: ProfileRuntime) -> None:
                 # identity that never registered must not replace it.
                 if profile.registered or profile.continuity_adopted:
                     _retain_sessions(profile)
-                previous = profile.predecessor
                 if previous is not None and previous.active:
                     _profiles[profile.home] = previous
                 else:
@@ -2030,6 +2027,8 @@ def _close_profile(profile: ProfileRuntime) -> None:
                         _retain_sessions(previous)
                     del _profiles[profile.home]
             _retire_continuity(_continuity(profile))
+            if previous is not None:
+                _retire_continuity(_continuity(previous))
         profile.closed.set()
 
 
@@ -2125,6 +2124,9 @@ def register(ctx: Any) -> None:
                 profile.continuity_adopted = True
                 _adopt_continuity(retained)
             _profiles[home] = profile
+            if previous is not None:
+                # Unload may have retired this rollback source while we waited.
+                _adopt_continuity(_continuity(previous))
         try:
             _register_profile(profile, ctx, registry, scoped)
         except Exception:
@@ -2155,6 +2157,8 @@ def register(ctx: Any) -> None:
                 discarded = _retired_sessions.pop(home, None)
                 if discarded is not None:
                     _retire_continuity(discarded)
+                if previous is not None:
+                    _retire_continuity(_continuity(previous))
                 # A lock records an attempt, not a successful load. Retain
                 # successful history even after continuity-cache eviction.
                 _registered_homes.add(home)
