@@ -940,3 +940,183 @@ def test_restricted_idle_resume_without_race_stays_fast(client):
     assert result["decision"] == "approve"
     assert result["path"] == "fast"
     assert client.get("/api/v1/session/s", headers=ADMIN).json()["status"] == "active"
+
+
+def _evaluate_path_read(client, path, headers=AGENT):
+    response = client.post(
+        "/api/v1/evaluate",
+        headers=headers,
+        json={
+            "session_id": "s",
+            "tool": "terminal",
+            "args": {"command": f"cat {path}"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("source", ["llm", "judge"])
+@pytest.mark.parametrize("adoption", ["agent", "other-worker", "legacy"])
+def test_restricted_adoption_ignores_prior_path_prefix(client, source, adoption):
+    import asyncio
+
+    import intaris.server as srv
+    from intaris.decision import Decision
+    from intaris.judge import resolve_with_side_effects
+    from intaris.session import SessionStore
+
+    create(client, headers=ADMIN, details={"working_directory": "/tmp/project"})
+    evaluator = srv._get_evaluator()
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision(
+            "approve" if source == "llm" else "escalate", "low", "Prior read", "llm"
+        ),
+    ):
+        prior = evaluator.evaluate(
+            user_id="owner",
+            session_id="s",
+            agent_id="operator",
+            tool="terminal",
+            args={"command": "cat /outside/first.txt"},
+        )
+    if source == "judge":
+        asyncio.run(
+            resolve_with_side_effects(
+                call_id=prior["call_id"],
+                user_id="owner",
+                user_decision="approve",
+                resolved_by="judge",
+                audit_store=evaluator._audit,
+                evaluator=evaluator,
+            )
+        )
+    assert evaluator._approved_paths[("owner", "s")]
+    if adoption == "other-worker":
+        # A different worker has no access to this evaluator's local cache.
+        SessionStore(srv._get_db()).restrict_agent_session("s", user_id="owner")
+    current_policy = {**POLICY, "deny_policies": ["Do not read outside project"]}
+    evaluator._agent_policy = current_policy
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "high", "Current policy rejects read", "llm"),
+    ) as inference:
+        result = _evaluate_path_read(
+            client, "/outside/second.txt", AGENT if adoption == "agent" else ADMIN
+        )
+    if adoption == "legacy":
+        assert result["decision"] == "approve", result
+        assert result["path"] == "fast"
+        inference.assert_not_called()
+    else:
+        assert result["decision"] == "deny", result
+        assert result["path"] == "llm"
+        inference.assert_called_once()
+        assert inference.call_args.kwargs["session"]["policy"] == current_policy
+        audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+        assert audit["classification"] == "write"
+
+
+@pytest.mark.parametrize("headers", [AGENT, ADMIN], ids=["agent", "admin"])
+def test_restricted_llm_read_approval_does_not_train_path_cache(client, headers):
+    import intaris.server as srv
+    from intaris.decision import Decision
+
+    create(client, details={"working_directory": "/tmp/project"})
+    evaluator = srv._get_evaluator()
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        side_effect=[
+            Decision("approve", "low", "One read approved", "llm"),
+            Decision("deny", "high", "Sibling read rejected", "llm"),
+        ],
+    ) as inference:
+        first = _evaluate_path_read(client, "/outside/first.txt", headers)
+        second = _evaluate_path_read(client, "/outside/second.txt", headers)
+    assert first["decision"] == "approve"
+    assert second["decision"] == "deny", second
+    assert second["path"] == "llm"
+    assert inference.call_count == 2
+    assert not evaluator._approved_paths.get(("owner", "s"))
+
+
+def test_admin_inference_finishing_after_adoption_cannot_train_path_cache(client):
+    import intaris.server as srv
+    from intaris.decision import Decision
+    from intaris.session import SessionStore
+
+    create(client, headers=ADMIN, details={"working_directory": "/tmp/project"})
+    evaluator = srv._get_evaluator()
+
+    def adopt_during_inference(**kwargs):
+        assert not kwargs["session"]["agent_restricted"]
+        # Deterministic interleaving: another worker adopts the session while
+        # this unrestricted request is awaiting its model response.
+        SessionStore(srv._get_db()).restrict_agent_session("s", user_id="owner")
+        return Decision("approve", "low", "Old admin inference completed", "llm")
+
+    with patch.object(evaluator, "_llm_evaluate", side_effect=adopt_during_inference):
+        assert (
+            _evaluate_path_read(client, "/outside/first.txt", ADMIN)["decision"]
+            == "approve"
+        )
+    assert not evaluator._approved_paths.get(("owner", "s"))
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "high", "Restricted read rejected", "llm"),
+    ) as inference:
+        result = _evaluate_path_read(client, "/outside/second.txt")
+    assert result["decision"] == "deny", result
+    inference.assert_called_once()
+
+
+@pytest.mark.parametrize("resolved_by", ["judge", "user"])
+def test_restricted_path_approval_reuses_only_exact_human_call(client, resolved_by):
+    import asyncio
+
+    import intaris.server as srv
+    from intaris.decision import Decision
+    from intaris.judge import resolve_with_side_effects
+
+    create(client, details={"working_directory": "/tmp/project"})
+    evaluator = srv._get_evaluator()
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "high", "Read needs approval", "llm"),
+    ):
+        prior = _evaluate_path_read(client, "/outside/first.txt")
+    if resolved_by == "user":
+        client.post(
+            "/api/v1/decision",
+            headers=ADMIN,
+            json={"call_id": prior["call_id"], "decision": "approve"},
+        ).raise_for_status()
+    else:
+        asyncio.run(
+            resolve_with_side_effects(
+                call_id=prior["call_id"],
+                user_id="owner",
+                user_decision="approve",
+                resolved_by="judge",
+                audit_store=evaluator._audit,
+                evaluator=evaluator,
+            )
+        )
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "high", "Current read rejected", "llm"),
+    ) as inference:
+        exact = _evaluate_path_read(client, "/outside/first.txt")
+        sibling = _evaluate_path_read(client, "/outside/second.txt")
+    assert exact["decision"] == ("approve" if resolved_by == "user" else "deny"), exact
+    assert sibling["decision"] == "deny", sibling
+    assert sibling["path"] == "llm"
+    assert inference.call_count == (1 if resolved_by == "user" else 2)
+    assert not evaluator._approved_paths.get(("owner", "s"))

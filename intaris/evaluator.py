@@ -341,6 +341,9 @@ class Evaluator:
         restricted = bool(session.get("agent_restricted"))
         session["policy"] = policy_for_session(session, self._agent_policy)
         if restricted:
+            # Prefixes have no approval provenance and can outlive agent adoption.
+            # Restricted reads must use current policy or an exact human retry.
+            self.clear_approved_paths(user_id, session_id)
             # Agent context cannot opt into autonomous Judge approval of denials.
             judge_unattended = False
             context = dict(context or {})
@@ -663,7 +666,8 @@ class Evaluator:
         path_reclassified = False
         resolved_paths: list[str] = []
         if (
-            classification == Classification.WRITE
+            not restricted
+            and classification == Classification.WRITE
             and working_directory
             and is_read_only(tool, args)
         ):
@@ -863,6 +867,10 @@ class Evaluator:
             and decision.decision == "approve"
             and not policy_overrode
             and working_directory
+            # Another worker may have adopted this session during inference.
+            and not self._sessions.get(session_id, user_id=user_id).get(
+                "agent_restricted"
+            )
         ):
             for rp in resolved_paths:
                 if not is_path_within(rp, working_directory):
@@ -1178,7 +1186,7 @@ class Evaluator:
 
         # Get session's working_directory
         session = self._sessions.get(session_id, user_id=user_id)
-        if not session:
+        if not session or session.get("agent_restricted"):
             return
         details = session.get("details") or {}
         working_directory = details.get("working_directory")
