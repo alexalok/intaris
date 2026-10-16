@@ -790,3 +790,97 @@ def test_conflicting_agent_credentials_rejected(client):
         "/api/v1/profile", headers={**AGENT, "X-API-Key": "other-secret"}
     )
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("classification", ["write", "escalate"])
+@pytest.mark.parametrize("resolved_by", ["judge", "user"])
+@pytest.mark.parametrize("restricted", [True, False], ids=["restricted", "legacy"])
+def test_retry_approval_identity_for_every_classification(
+    client, classification, resolved_by, restricted
+):
+    import intaris.server as srv
+    from intaris.audit import AuditStore
+    from intaris.decision import Decision
+
+    create(client, "history", headers=ADMIN)
+    evaluator = srv._get_evaluator()
+    args = {"command": "touch /tmp/output"}
+    prior = evaluator.evaluate(
+        user_id="owner",
+        session_id="history",
+        agent_id="operator",
+        tool="terminal",
+        args=args,
+        tool_preferences={"terminal": "escalate"},
+    )
+    AuditStore(srv._get_db()).resolve_escalation(
+        prior["call_id"], "approve", user_id="owner", resolved_by=resolved_by
+    )
+    create(client, headers=AGENT if restricted else ADMIN)
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "high", "Current policy rejects write", "llm"),
+    ) as inference:
+        result = evaluator.evaluate(
+            user_id="owner",
+            session_id="s",
+            agent_id="hermes",
+            tool="terminal",
+            args=args,
+            tool_preferences=(
+                {"terminal": "escalate"} if classification == "escalate" else None
+            ),
+            restricted_agent=restricted,
+        )
+
+    if restricted and resolved_by == "judge":
+        assert result["decision"] == (
+            "deny" if classification == "write" else "escalate"
+        ), result
+        if classification == "write":
+            inference.assert_called_once()
+            assert inference.call_args.kwargs["session"]["policy"] == POLICY
+        else:
+            inference.assert_not_called()
+    else:
+        assert result["decision"] == "approve", result
+        assert result["path"] == "fast"
+        inference.assert_not_called()
+
+
+@pytest.mark.parametrize("history_session", ["history", "s"])
+def test_agent_write_cannot_reuse_old_judge_approval(client, history_session):
+    import intaris.server as srv
+    from intaris.audit import AuditStore
+
+    create(client, history_session, headers=ADMIN)
+    evaluator = srv._get_evaluator()
+    prior = evaluator.evaluate(
+        user_id="owner",
+        session_id=history_session,
+        agent_id="operator",
+        tool="terminal",
+        args={"command": "touch /tmp/output"},
+        tool_preferences={"terminal": "escalate"},
+    )
+    AuditStore(srv._get_db()).resolve_escalation(
+        prior["call_id"], "approve", user_id="owner", resolved_by="judge"
+    )
+    if history_session != "s":
+        create(client)
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Current policy rejects write",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(client, command="touch /tmp/output")
+    assert result["decision"] == "deny", result
+    assert result["path"] == "llm", result
+    inference.assert_called_once()

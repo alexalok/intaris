@@ -745,6 +745,7 @@ class Evaluator:
                     user_id=user_id,
                     tool=tool,
                     args_hash=args_hash,
+                    human_only=restricted,
                 )
                 if minimum_outcome is None and not unattended
                 else None
@@ -765,6 +766,7 @@ class Evaluator:
                     user_id=user_id,
                     tool=tool,
                     args_hash=args_hash,
+                    human_only=restricted,
                 )
                 if minimum_outcome is None and not unattended
                 else None
