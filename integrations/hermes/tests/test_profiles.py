@@ -4291,3 +4291,61 @@ def test_pending_duplicate_starts_coalesce_without_intervening_end(
     assert len(requests_for(runtime, "/intention")) == (
         1 if compatible or not initial_idle else 2
     )
+
+
+@pytest.mark.parametrize("admission", ["native", "mcp"])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_materializing_idle_start_cannot_clear_a_later_end(
+    runtime, monkeypatch, admission, terminal
+):
+    runtime.tools["a.invalid"] = [{"server": "docs", "name": "read", "inputSchema": {}}]
+    settings = {"mcp_tools": True, "fail_open": True}
+    old = runtime.register("a", settings)
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same")
+        old.emit("on_session_end", session_id="same", completed=False)
+    register = plugin._register_profile
+
+    def receive_start(profile, ctx, *args):
+        old.emit("on_session_start", session_id="same")
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_start)
+        current = runtime.register("a", settings)
+    state = plugin._profiles[str(home)].sessions["same"]
+    entered, release = threading.Event(), threading.Event()
+    resume = plugin._resume_session
+
+    def paused_resume(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return resume(*args, **kwargs)
+
+    def invoke():
+        with runtime.profile("a"):
+            entry = runtime.registry.get_entry(
+                "read_file" if admission == "native" else "docs_read"
+            )
+            return json.loads(entry.handler({"path": "live"}, session_id="same"))
+
+    monkeypatch.setattr(plugin, "_resume_session", paused_resume)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(invoke)
+        try:
+            assert entered.wait(5)
+            with runtime.profile("a"):
+                current.emit("on_session_end", session_id="same", completed=terminal)
+            cancelled = state._ended
+        finally:
+            release.set()
+        assert "error" in pending.result(5)
+    assert "error" in invoke(), "later tool must not consume an idle-invalidated start"
+    assert state._ended is cancelled and cancelled.is_set()
+    assert state.is_idle is (not terminal)
+    assert not requests_for(runtime, "/evaluate")
+    assert not requests_for(runtime, "/mcp/call")
+    with runtime.profile("a"):
+        current.emit("on_session_start", session_id="same")
+    assert invoke() == {"result": "live" if admission == "native" else "a.invalid"}

@@ -479,9 +479,13 @@ def _materialize_pending_start(
         # Publish the owner before creation or a wrapped helper can block.
         _get_completion_owner(profile, session_id, state)
         must_resume = state.is_idle
-    if must_resume and not _resume_session(profile, session_id, state):
-        return state, False
-    ended = state._ended
+        ended = state._ended
+    if must_resume:
+        if not _resume_session(
+            profile, session_id, state, pending_start=pending, ended=ended
+        ):
+            return state, False
+        ended = state._ended
     remote_id = _ensure_session(
         profile, session_id, state, pending.platform, pending.model
     )
@@ -945,15 +949,31 @@ def _emit_lifecycle(owner: _CompletionOwner, *, deadline: float | None = None) -
 
 
 def _resume_session(
-    profile: ProfileRuntime, session_id: str, state: SessionState
+    profile: ProfileRuntime,
+    session_id: str,
+    state: SessionState,
+    *,
+    pending_start: _PendingStart | None = None,
+    ended: threading.Event | None = None,
 ) -> bool:
-    owner = _get_completion_owner(profile, session_id, state)
-    with owner.lock:
-        if owner.status == "completed":
-            return False
-        state._ended = threading.Event()
-        state.is_idle = False
-        owner.status = "active"
+    # Receipt changes take the map lock; lifecycle claims take the owner lock.
+    # Validate both together with the local transition, before any HTTP effects.
+    with profile.lifecycle_lock, profile.sessions_lock:
+        owner = _get_completion_owner(profile, session_id, state)
+        with owner.lock:
+            if owner.status == "completed":
+                return False
+            if pending_start is not None and (
+                not profile.active
+                or not profile.ready
+                or profile.sessions.get(session_id) is not state
+                or state._pending_start is not pending_start
+                or state._ended is not ended
+            ):
+                return False
+            state._ended = threading.Event()
+            state.is_idle = False
+            owner.status = "active"
     _emit_lifecycle(owner)
     return not state._ended.is_set()
 
