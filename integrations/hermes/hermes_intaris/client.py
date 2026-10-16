@@ -227,13 +227,18 @@ class IntarisClient:
         )
 
     def update_status(
-        self, session_id: str, status: str, agent_id: str | None = None
+        self,
+        session_id: str,
+        status: str,
+        agent_id: str | None = None,
+        *,
+        timeout_s: float = 2.0,
     ) -> ApiResult:
         return self.call_api(
             "PATCH",
             f"/api/v1/session/{urllib.parse.quote(session_id, safe='')}/status",
             {"status": status},
-            timeout_s=2.0,
+            timeout_s=timeout_s,
             agent_id=agent_id,
         )
 
@@ -269,13 +274,18 @@ class IntarisClient:
         )
 
     def submit_agent_summary(
-        self, session_id: str, summary: str, agent_id: str | None = None
+        self,
+        session_id: str,
+        summary: str,
+        agent_id: str | None = None,
+        *,
+        timeout_s: float = 2.0,
     ) -> ApiResult:
         return self.call_api(
             "POST",
             f"/api/v1/session/{urllib.parse.quote(session_id, safe='')}/agent-summary",
             {"summary": summary},
-            timeout_s=2.0,
+            timeout_s=timeout_s,
             agent_id=agent_id,
         )
 

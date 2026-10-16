@@ -2984,6 +2984,8 @@ def test_retired_owner_cache_eviction_and_compatible_adoption(runtime, monkeypat
 @pytest.mark.parametrize("phase", ["before_http", "during_http"])
 def test_retired_owner_settles_creation_and_same_sid_reuse(runtime, monkeypatch, phase):
     monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0, raising=False)
+    # An expired batch must leave actual pending work to settle its own lifetime.
+    monkeypatch.setattr(plugin, "TEARDOWN_FLUSH_TIMEOUT_S", 0)
     old = runtime.register("a")
     entered, release = threading.Event(), threading.Event()
     ensure = plugin._ensure_session
@@ -3040,7 +3042,16 @@ def test_retired_owner_effects_release_registration_locks(
     runtime, monkeypatch, operation, effect
 ):
     monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0, raising=False)
-    monkeypatch.setattr(plugin, "TEARDOWN_FLUSH_TIMEOUT_S", 0)
+    flush = plugin._flush_recording_buffer
+
+    def leave_retirement_buffer(profile, *args, **kwargs):
+        # Isolate retirement I/O from the earlier teardown flush; a captured
+        # producer can leave a buffer after that earlier flush has finished.
+        if isinstance(profile, plugin.ProfileRuntime) and not profile.active:
+            return
+        return flush(profile, *args, **kwargs)
+
+    monkeypatch.setattr(plugin, "_flush_recording_buffer", leave_retirement_buffer)
     old = runtime.register("a", {"session_recording": True})
     with runtime.profile("a") as home:
         old.emit("on_session_start", session_id="same-id")
@@ -3096,6 +3107,8 @@ def test_retired_owner_effects_release_registration_locks(
 @pytest.mark.parametrize("is_async", [False, True])
 def test_retired_owner_cancels_outer_foreign_wrapper(runtime, monkeypatch, is_async):
     monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0)
+    # An expired batch must leave actual pending work to settle its own lifetime.
+    monkeypatch.setattr(plugin, "TEARDOWN_FLUSH_TIMEOUT_S", 0)
     entered, release = threading.Event(), threading.Event()
     with runtime.profile("a") as home:
         old = runtime.register("a")
@@ -3199,3 +3212,94 @@ def test_retired_owner_releases_client_and_session_dictionary(
         assert all(ref() is None for ref in group), (
             "no global index may pin discarded heavy ownership"
         )
+
+
+@pytest.mark.parametrize("operation", ["unload", "replace"])
+@pytest.mark.parametrize("recording", [False, True])
+@pytest.mark.parametrize("transport_fails", [False, True])
+def test_retirement_batch_shares_teardown_deadline(
+    runtime, monkeypatch, operation, recording, transport_fails
+):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0)
+    old = runtime.register("a", {"session_recording": recording})
+    states = []
+    with runtime.profile("a") as home:
+        for index in range(3):
+            old.emit("on_session_start", session_id=f"session-{index}")
+            states.append(plugin._profiles[str(home)].sessions[f"session-{index}"])
+            old.emit(
+                "post_llm_call",
+                session_id=f"session-{index}",
+                assistant_response=f"buffer-{index}",
+            )
+    clock, attempts = [0.0], []
+
+    def slow_http(req, *, timeout):
+        attempts.append((clock[0], timeout, req.full_url.rsplit("/", 1)[-1]))
+        clock[0] += min(3.0, timeout)
+        if transport_fails:
+            raise TimeoutError("synthetic lifecycle timeout")
+        response = io.BytesIO(b'{"ok":true}')
+        response.status = 200
+        return response
+
+    with monkeypatch.context() as slow:
+        slow.setattr(plugin.time, "monotonic", lambda: clock[0])
+        slow.setattr("urllib.request.urlopen", slow_http)
+        if operation == "replace":
+            runtime.register("a", {"session_recording": recording, "agent_id": "new"})
+        else:
+            for callback in old.unload:
+                callback()
+    assert clock[0] <= 5.0, f"retirement exceeded shared deadline: {attempts}"
+    assert attempts
+    assert all(0 < timeout <= 5.0 - started for started, timeout, _ in attempts)
+    assert all(
+        state._ended.is_set() and state._completion.status == "completed"
+        for state in states
+    )
+    assert not plugin._completion_owners and not plugin._retired_owners
+    # Expired best-effort retirement must not reopen admission or remove a new SID.
+    current = runtime.register("a", {"agent_id": "new"})
+    with runtime.profile("a"):
+        current.emit("on_session_start", session_id="session-0")
+        replacement = plugin._profiles[str(home)].sessions["session-0"]
+    assert replacement not in states
+    assert replacement.start_confirmed and not replacement._ended.is_set()
+
+
+def test_retirement_batch_bounds_effect_lock_wait(runtime, monkeypatch):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0)
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="same-id")
+        state = plugin._profiles[str(home)].sessions["same-id"]
+    clock, timeouts = [0.0], []
+
+    class BusyEffectsLock:
+        def acquire(self, *, timeout=-1):
+            timeouts.append(timeout)
+            clock[0] += 11.0 if timeout < 0 else timeout
+            return timeout < 0
+
+        def release(self):
+            pass
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    state._completion.effects_lock = BusyEffectsLock()
+    with monkeypatch.context() as slow:
+        slow.setattr(plugin.time, "monotonic", lambda: clock[0])
+        runtime.register("a", {"agent_id": "new"})
+    assert clock[0] <= 5.0, (
+        "an existing effect worker cannot bypass retirement's batch deadline"
+    )
+    assert timeouts == [5.0]
+    assert state._ended.is_set() and state._completion.status == "completed"
+    assert not requests_for(runtime, "/agent-summary")
+    assert not plugin._completion_owners

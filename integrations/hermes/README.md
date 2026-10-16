@@ -113,7 +113,12 @@ retirement cancels the old lifetime and sends its final recording/status/summary
 after pending creation and admitted tool calls drain; discarded continuity cannot
 reopen the retired session. Retained records preserve final recording/status/summary routing across identity changes
 and cannot authorize new tool calls. Duplicate end callbacks produce one local
-completion transition; HTTP delivery retains its existing best-effort behavior.
+completion transition; HTTP delivery remains best effort. Teardown recording and
+retirement effects share one five-second budget per outer unload/replacement,
+including waits for another lifecycle sender. Once that budget expires, remaining
+retirement uploads/status/summary attempts are skipped. Creation or tool calls
+still in flight keep their original owner and settle deferred completion when
+their captured lifetime finishes.
 The 100-session cap also completes evicted sessions through their original owner,
 flushes retained recording, and releases that owner after pending creation and
 already-admitted outer tool calls finish; an evicted session cannot reopen its

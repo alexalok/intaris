@@ -909,7 +909,7 @@ class TestHooks:
 
             mod._on_session_end(profile, session_id="task-1", completed=True)
 
-        mock_status.assert_called_once_with("hm-test", "completed")
+        mock_status.assert_called_once_with("hm-test", "completed", timeout_s=2.0)
         mock_summary.assert_called_once()
         summary_text = mock_summary.call_args[0][1]
         assert "5 tool calls" in summary_text

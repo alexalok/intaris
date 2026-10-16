@@ -716,13 +716,18 @@ def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
                 del owner.sessions[owner.session_id]
 
 
-def _emit_lifecycle(owner: _CompletionOwner) -> None:
+def _emit_lifecycle(owner: _CompletionOwner, *, deadline: float | None = None) -> None:
     """Serialize local claims/emissions; HTTP retains best-effort semantics."""
     pending = getattr(_completion_effects, "pending", None)
     if pending is not None:
         pending[owner.token] = owner
+        _completion_deadline()
         return
-    with owner.effects_lock:
+    if deadline is None:
+        owner.effects_lock.acquire()
+    elif not owner.effects_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        return  # The existing effect worker still owns this pending transition.
+    try:
         while True:
             with owner.lock:
                 if (
@@ -741,16 +746,27 @@ def _emit_lifecycle(owner: _CompletionOwner) -> None:
             # and cancellation signals never wait for global network locks.
             if status == "completed":
                 try:
-                    _signal_completion(owner, owner.session_id, owner.state)
+                    _signal_completion(
+                        owner, owner.session_id, owner.state, deadline=deadline
+                    )
                 finally:
                     _forget_completion_owner(owner)
                 return
-            if status == "idle":
-                _flush_recording_buffer(owner, owner.session_id, _state=owner.state)
-            try:
-                owner.client.update_status(owner.state.intaris_session_id, status)
-            except Exception:
-                pass
+            remaining = _lifecycle_timeout(deadline, 5.0)
+            if status == "idle" and remaining > 0:
+                _flush_recording_buffer(
+                    owner, owner.session_id, _state=owner.state, timeout_s=remaining
+                )
+            remaining = _lifecycle_timeout(deadline, 2.0)
+            if remaining > 0:
+                try:
+                    owner.client.update_status(
+                        owner.state.intaris_session_id, status, timeout_s=remaining
+                    )
+                except Exception:
+                    pass
+    finally:
+        owner.effects_lock.release()
 
 
 def _resume_session(
@@ -767,24 +783,43 @@ def _resume_session(
     return not state._ended.is_set()
 
 
+def _lifecycle_timeout(deadline: float | None, limit: float) -> float:
+    """Cap each best-effort request by the outer operation's remaining budget."""
+    return (
+        limit if deadline is None else min(limit, max(0.0, deadline - time.monotonic()))
+    )
+
+
 def _signal_completion(
-    profile: ProfileRuntime | _CompletionOwner, task_id: str, state: SessionState
+    profile: ProfileRuntime | _CompletionOwner,
+    task_id: str,
+    state: SessionState,
+    *,
+    deadline: float | None = None,
 ) -> None:
-    """Signal session completion to Intaris."""
+    """Signal session completion to Intaris within an optional shared deadline."""
     if not state.intaris_session_id:
         return
 
-    _flush_recording_buffer(profile, task_id, _state=state)
+    remaining = _lifecycle_timeout(deadline, 5.0)
+    if remaining > 0:
+        _flush_recording_buffer(profile, task_id, _state=state, timeout_s=remaining)
 
     sid = state.intaris_session_id
-    try:
-        profile.client.update_status(sid, "completed")
-    except Exception:
-        pass
-    try:
-        profile.client.submit_agent_summary(sid, _build_agent_summary(state))
-    except Exception:
-        pass
+    remaining = _lifecycle_timeout(deadline, 2.0)
+    if remaining > 0:
+        try:
+            profile.client.update_status(sid, "completed", timeout_s=remaining)
+        except Exception:
+            pass
+    remaining = _lifecycle_timeout(deadline, 2.0)
+    if remaining > 0:
+        try:
+            profile.client.submit_agent_summary(
+                sid, _build_agent_summary(state), timeout_s=remaining
+            )
+        except Exception:
+            pass
 
 
 def _send_checkpoint(
@@ -1851,12 +1886,22 @@ def _defer_completion_effects() -> Iterator[None]:
         return
     pending: dict[object, _CompletionOwner] = {}
     _completion_effects.pending = pending
+    _completion_effects.deadline = None
     try:
         yield
     finally:
+        deadline = _completion_effects.deadline
         del _completion_effects.pending
+        del _completion_effects.deadline
         for owner in pending.values():
-            _emit_lifecycle(owner)
+            _emit_lifecycle(owner, deadline=deadline)
+
+
+def _completion_deadline() -> float:
+    """Share one teardown budget across nested close and retirement effects."""
+    if _completion_effects.deadline is None:
+        _completion_effects.deadline = time.monotonic() + TEARDOWN_FLUSH_TIMEOUT_S
+    return _completion_effects.deadline
 
 
 def _continuity(profile: ProfileRuntime) -> _SessionContinuity:
@@ -1948,7 +1993,7 @@ def _close_profile(profile: ProfileRuntime) -> None:
     try:
         with profile.sessions_lock:
             task_ids = list(profile.sessions)
-        deadline = time.monotonic() + TEARDOWN_FLUSH_TIMEOUT_S
+        deadline = _completion_deadline()
         for task_id in task_ids:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
