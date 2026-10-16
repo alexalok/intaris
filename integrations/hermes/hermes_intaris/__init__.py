@@ -2020,6 +2020,14 @@ def _close_profile(profile: ProfileRuntime) -> None:
                 if previous is not None and previous.active:
                     _profiles[profile.home] = previous
                 else:
+                    # An incompatible provisional load may outlive an unloaded
+                    # predecessor whose protected cache entry was evicted.
+                    if (
+                        previous is not None
+                        and previous.registered
+                        and not (profile.registered or profile.continuity_adopted)
+                    ):
+                        _retain_sessions(previous)
                     del _profiles[profile.home]
             _retire_continuity(_continuity(profile))
         profile.closed.set()
