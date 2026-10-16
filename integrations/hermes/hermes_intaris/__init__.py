@@ -46,10 +46,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
-from .client import IntarisClient
+from .client import ApiResult, IntarisClient
 
 logger = logging.getLogger(__name__)
 
@@ -473,8 +472,28 @@ def _get_mcp_tool_names() -> set[str]:
 # ============================================================================
 
 
+def _decision_response_error(result: ApiResult) -> str | None:
+    """Reject invalid decision replies without conflating them with outages."""
+    if result.protocol_error:
+        return result.error or "Invalid API response"
+    if result.data is None and (result.status is None or result.status >= 400):
+        return None  # Transport/HTTP failure, handled by the caller.
+    if not isinstance(result.data, dict):
+        return "Invalid API response: expected a JSON object"
+    decision = result.data.get("decision")
+    if not isinstance(decision, str) or decision not in ("approve", "deny", "escalate"):
+        return (
+            "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
+        )
+    if decision == "escalate":
+        call_id = result.data.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return "Invalid API response: escalation requires a non-empty call_id"
+    return None
+
+
 def _poll_escalation(call_id: str, tool_name: str) -> str:
-    """Poll for escalation resolution.  Returns 'approve' or 'deny'."""
+    """Return 'approve', 'deny', 'timeout', or 'invalid_response'."""
     assert _cfg is not None and _client is not None
 
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
@@ -506,10 +525,16 @@ def _poll_escalation(call_id: str, tool_name: str) -> str:
 
         # Check resolution
         result = _client.get_audit(call_id)
-        if not result.data:
+        if result.protocol_error:
+            return "invalid_response"
+        if result.data is None:
             continue  # Server unreachable — keep polling
+        if not isinstance(result.data, dict) or "user_decision" not in result.data:
+            return "invalid_response"
 
         user_decision = result.data.get("user_decision")
+        if user_decision is None:
+            continue  # A pending audit record is not an approval.
         if user_decision == "approve":
             logger.info("[intaris] Escalation approved: %s (%s)", tool_name, call_id)
             return "approve"
@@ -523,7 +548,7 @@ def _poll_escalation(call_id: str, tool_name: str) -> str:
                 note_suffix,
             )
             return "deny"
-        # No decision yet — continue polling
+        return "invalid_response"
 
 
 def _poll_session_status(session_id: str, tool_name: str) -> str:
@@ -617,6 +642,10 @@ def _make_guarded_handler(
         if intention_pending:
             state.intention_pending = False
 
+        response_error = _decision_response_error(result)
+        if response_error:
+            return json.dumps({"error": f"[intaris] {tool_name}: {response_error}"})
+
         if not result.data:
             # Distinguish config errors (4xx) from transient failures
             if result.status is not None and 400 <= result.status < 500:
@@ -640,7 +669,7 @@ def _make_guarded_handler(
             )
 
         data = result.data
-        decision = data.get("decision", "deny")
+        decision = data["decision"]
         reasoning = data.get("reasoning", "")
         call_id = data.get("call_id", "")
         risk = data.get("risk", "")
@@ -702,6 +731,11 @@ def _make_guarded_handler(
                     re_result = _client.evaluate(
                         state.intaris_session_id, tool_name, args
                     )
+                    response_error = _decision_response_error(re_result)
+                    if response_error:
+                        return json.dumps(
+                            {"error": f"[intaris] {tool_name}: {response_error}"}
+                        )
                     if re_result.data and re_result.data.get("decision") == "approve":
                         _queue_pending_tool_result(
                             state,
@@ -718,6 +752,12 @@ def _make_guarded_handler(
                             )
                         )
                         poll_result = _poll_escalation(re_call_id, tool_name)
+                        if poll_result == "invalid_response":
+                            return json.dumps(
+                                {
+                                    "error": f"[intaris] Invalid escalation response ({re_call_id})"
+                                }
+                            )
                         if poll_result == "approve":
                             _queue_pending_tool_result(
                                 state, tool_name, args, re_call_id
@@ -784,6 +824,10 @@ def _make_guarded_handler(
                 reasoning,
             )
             poll_result = _poll_escalation(call_id, tool_name)
+            if poll_result == "invalid_response":
+                return json.dumps(
+                    {"error": f"[intaris] Invalid escalation response ({call_id})"}
+                )
             if poll_result == "approve":
                 _queue_pending_tool_result(state, tool_name, args, call_id)
                 return original_handler(args, **kwargs)
@@ -803,8 +847,10 @@ def _make_guarded_handler(
             )
 
         # -- APPROVE -----------------------------------------------------------
-        _queue_pending_tool_result(state, tool_name, args, call_id)
-        return original_handler(args, **kwargs)
+        if decision == "approve":
+            _queue_pending_tool_result(state, tool_name, args, call_id)
+            return original_handler(args, **kwargs)
+        return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
     return guarded_handler
 
@@ -855,6 +901,14 @@ def _register_mcp_tools(ctx: Any) -> None:
 
                 result = _client.call_mcp_tool(intaris_session_id, srv, tn, args)
 
+                response_error = _decision_response_error(result)
+                if response_error:
+                    # The server may already have executed the tool. Report the
+                    # invalid reply; do not claim success or retry it here.
+                    return json.dumps(
+                        {"error": f"[intaris] MCP tool call: {response_error}"}
+                    )
+
                 if not result.data:
                     return json.dumps(
                         {
@@ -864,7 +918,7 @@ def _register_mcp_tools(ctx: Any) -> None:
 
                 data = result.data
                 decision = data.get("decision")
-                content = data.get("content", [])
+                content = data.get("content")
 
                 if decision == "deny":
                     reason = data.get(
@@ -881,6 +935,23 @@ def _register_mcp_tools(ctx: Any) -> None:
                                 f"[intaris] ESCALATED ({call_id}): {reason}\n"
                                 f"Approve or deny in the Intaris UI, then retry."
                             )
+                        }
+                    )
+
+                # The REST proxy normalizes MCP results to text blocks.
+                if (
+                    not isinstance(content, list)
+                    or any(
+                        not isinstance(c, dict)
+                        or c.get("type") != "text"
+                        or not isinstance(c.get("text"), str)
+                        for c in content
+                    )
+                    or not isinstance(data.get("isError", False), bool)
+                ):
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Invalid MCP response: malformed tool result"
                         }
                     )
 
