@@ -205,6 +205,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._profiles.clear()
         plugin._retired_sessions.clear()
         plugin._registration_locks.clear()
+        plugin._registered_homes.clear()
     if hasattr(plugin, "_sessions"):
         plugin._sessions.clear()
         plugin._mcp_tool_cache = None
@@ -277,6 +278,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._profiles.clear()
         plugin._retired_sessions.clear()
         plugin._registration_locks.clear()
+        plugin._registered_homes.clear()
 
 
 def requests_for(runtime, suffix):
@@ -844,6 +846,55 @@ def test_reload_observes_admitted_session_start_completion(runtime, same_identit
         assert not requests_for(runtime, "/reasoning")
 
 
+@pytest.mark.parametrize("fail_open", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["abandoned", "invalid_setting", "legacy_rejection", "hook_failure"]
+)
+def test_failed_first_load_allows_later_llm_bootstrap(
+    runtime, monkeypatch, failure, fail_open
+):
+    if failure == "abandoned":
+        with runtime.profile("a") as home:
+            abandoned = Context(runtime.registry, home)
+            abandoned._load_abandoned = True
+            plugin.register(abandoned)
+    elif failure == "invalid_setting":
+        with pytest.raises(
+            ValueError, match="Intaris setting user_id must be a string"
+        ):
+            runtime.register("a", {"user_id": {"invalid": True}})
+    elif failure == "legacy_rejection":
+        monkeypatch.setattr(runtime.registry, "get_all_entries", None)
+        other = runtime.register("b")
+        with pytest.raises(RuntimeError, match="profile-scoped tool registry"):
+            runtime.register("a")
+        for callback in other.unload:
+            callback()
+    else:
+        original = Context.register_hook
+
+        def fail_registration(*args, **kwargs):
+            raise RuntimeError("synthetic first-load failure")
+
+        monkeypatch.setattr(Context, "register_hook", fail_registration)
+        with pytest.raises(RuntimeError, match="synthetic first-load failure"):
+            runtime.register("a", {"user_id": "failed-load"})
+        monkeypatch.setattr(Context, "register_hook", original)
+
+    with runtime.profile("a"):
+        ctx = runtime.register("a", {"fail_open": fail_open})
+        # Reload after a failed first attempt does not replay session-start.
+        ctx.emit("pre_llm_call", session_id="already-running", user_message="Continue")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "checked"})
+        ) == {"result": "checked"}
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 1
+    sid = created[0]["body"]["session_id"]
+    assert requests_for(runtime, "/reasoning")[-1]["body"]["session_id"] == sid
+    assert requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == sid
+
+
 def test_failed_reload_keeps_session_for_retry(runtime, monkeypatch):
     old = runtime.register("a")
     with runtime.profile("a"):
@@ -1334,3 +1385,11 @@ def test_unload_during_discovery_disposes_late_tools_and_timer(runtime):
             "_intaris_original_handler",
             None,
         )
+        recovered = runtime.register("a", {"url": "https://recovered.invalid"})
+        recovered.emit(
+            "pre_llm_call", session_id="already-running", user_message="Continue"
+        )
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "recovered"})
+        ) == {"result": "recovered"}
+    assert len(requests_for(runtime, "/evaluate")) == 1

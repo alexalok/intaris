@@ -259,6 +259,7 @@ _profiles: dict[str, ProfileRuntime] = {}
 _retired_sessions: dict[str, _SessionContinuity] = {}
 _profiles_lock = threading.RLock()
 _registration_locks: dict[str, Any] = {}
+_registered_homes: set[str] = set()
 
 
 def _profile_key() -> str:
@@ -1449,12 +1450,12 @@ def register(ctx: Any) -> None:
         "scope" in inspect.signature(registry.register).parameters
     )
     with _profiles_lock:
-        known_home = home in _registration_locks
         registration_lock = _registration_locks.setdefault(home, threading.RLock())
     # Network requests and recording flushes must not hold up another home.
     with registration_lock:
         with _profiles_lock:
             previous = _profiles.get(home)
+            known_home = home in _registered_homes
         if previous is not None and previous.context is ctx and previous.active:
             return
         if getattr(ctx, "_load_abandoned", False) is True:
@@ -1493,6 +1494,11 @@ def register(ctx: Any) -> None:
         except Exception:
             _close_profile(profile)
             raise
+        with _profiles_lock:
+            if profile.active and _profiles.get(home) is profile:
+                # A lock records an attempt, not a successful load. Retain
+                # successful history even after continuity-cache eviction.
+                _registered_homes.add(home)
 
 
 def _register_profile(
