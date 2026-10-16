@@ -113,7 +113,10 @@ retirement cancels the old lifetime and sends its final recording/status/summary
 after pending creation and admitted tool calls drain; discarded continuity cannot
 reopen the retired session. Retained records preserve final recording/status/summary routing across identity changes
 and cannot authorize new tool calls. Duplicate end callbacks produce one local
-completion transition; HTTP delivery remains best effort. Teardown recording and
+completion transition; HTTP delivery remains best effort. A retained predecessor
+end callback can finish its original owners but cannot cancel a fresh lifetime
+created by a later registration, even when the Hermes session ID is reused.
+Teardown recording and
 retirement effects share one five-second budget per outer unload/replacement,
 including waits for another lifecycle sender. Once that budget expires, remaining
 retirement uploads/status/summary attempts are skipped. Creation or tool calls
@@ -130,7 +133,13 @@ enabled until that session starts.
 If replacement registration fails, the last successful profile's retained
 sessions remain available when retrying with that profile's configuration.
 Direct in-process replacement keeps old guards blocking until the new guards
-are ready, including failed replacement attempts. Hermes' force discovery
+are ready, including failed replacement attempts. Explicit starts received during
+the published replacement handoff are retained locally within the same session
+limits, including rollback cleanup. The first subsequent native/MCP/pre-LLM
+admission creates the remote session using the settled profile's configuration;
+the start hook does not wait for registration or replay remote creation during it.
+An intervening terminal end invalidates that pending start, and a later explicit
+start establishes a distinct lifetime. Hermes' force discovery
 unloads plugin registrations before calling the adapter; tool dispatch must be
 paused by the host during that unload/reload interval.
 Legacy global-only tool registrations are restored on unload, provided another

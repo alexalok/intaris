@@ -190,6 +190,17 @@ def _resolve_config(ctx: Any = None) -> Config:
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class _PendingStart:
+    """Local explicit-start evidence; remote authority binds after settlement."""
+
+    model: str
+    platform: str
+    birth_generation: int
+    resume_idle: bool = True
+    token: object = field(default_factory=object, repr=False)
+
+
 @dataclass
 class SessionState:
     working_directory: str = field(default_factory=os.getcwd)
@@ -199,6 +210,7 @@ class SessionState:
     session_created: bool = False
     # Only this Hermes session's successful start proves post-reload freshness.
     start_confirmed: bool = False
+    _pending_start: _PendingStart | None = field(default=None, repr=False)
     call_count: int = 0
     approved_count: int = 0
     denied_count: int = 0
@@ -364,25 +376,164 @@ def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
                 state = SessionState()
                 profile.sessions[task_id] = state
                 _get_completion_owner(profile, task_id, state)
-                # Evict oldest entries if over limit. Publish ownership even when
-                # a start has not entered creation yet, so it cannot outlive eviction.
-                if len(profile.sessions) > MAX_SESSIONS:
-                    excess = len(profile.sessions) - MAX_SESSIONS
-                    keys = list(profile.sessions.keys())[:excess]
-                    for k in keys:
-                        evicted = profile.sessions.pop(k, None)
-                        if evicted is not None:
-                            evicted._ended.set()
-                            evicted_owners.append(
-                                _get_completion_owner(profile, k, evicted)
-                            )
-    # Claim every cancellation before effects, with no map/global lock over I/O.
-    # Pending creation settles this terminal claim in its own finally block.
-    for owner in evicted_owners:
-        _claim_session_end(owner, terminal=True)
-    for owner in evicted_owners:
-        _emit_lifecycle(owner)
+                evicted_owners = _trim_sessions(profile)
+    _finish_evictions(evicted_owners)
     return state
+
+
+def _trim_sessions(profile: ProfileRuntime) -> list[_CompletionOwner]:
+    """Bound actual sessions and unmaterialized start records in the same map."""
+    evicted = []
+    while len(profile.sessions) > MAX_SESSIONS:
+        state = profile.sessions.pop(next(iter(profile.sessions)))
+        state._ended.set()
+        state._pending_start = None
+        if state._completion is not None:
+            evicted.append(state._completion)
+    return evicted
+
+
+def _finish_evictions(owners: list[_CompletionOwner]) -> None:
+    for owner in owners:
+        _claim_session_end(owner, terminal=True)
+    for owner in owners:
+        _emit_lifecycle(owner)
+
+
+def _receive_explicit_start(
+    profile: ProfileRuntime, session_id: str, model: str, platform: str
+) -> tuple[ProfileRuntime, SessionState] | None:
+    """Record one start locally, including the exact published handoff interval."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    with _profiles_lock:
+        current = _profiles.get(profile.home)
+        if current is profile or (current is None and profile.active and profile.ready):
+            target = profile
+        elif (
+            current is not None and not current.ready and current.predecessor is profile
+        ):
+            target = current
+        else:
+            return None  # Disposed callbacks gain no general forwarding authority.
+        with target.lifecycle_lock:
+            # Cleanup still owns the published handoff until rollback settles.
+            # Accept local evidence there, but never in an unloaded standalone
+            # runtime or after a failed generation has lost that reference.
+            if not target.active and not (
+                current is target
+                and target.predecessor is not None
+                and not target.registered
+            ):
+                return None
+            with target.sessions_lock:
+                state = target.sessions.get(session_id)
+                if state is None:
+                    state = SessionState()
+                    target.sessions[session_id] = state
+                if state._ended.is_set() and not state.is_idle:
+                    return None
+                if (
+                    state.is_idle
+                    and (
+                        state._pending_start is None
+                        or not state._pending_start.resume_idle
+                    )
+                ) or (not state.start_confirmed and state._pending_start is None):
+                    generation = (
+                        state._completion.birth_generation
+                        if state._completion is not None
+                        else target.generation
+                    )
+                    state._pending_start = _PendingStart(model, platform, generation)
+                evicted = _trim_sessions(target)
+    _finish_evictions(evicted)
+    return target, state
+
+
+def _materialize_pending_start(
+    profile: ProfileRuntime,
+    session_id: Any,
+    *,
+    expected: SessionState | None = None,
+    resume_idle: bool = False,
+) -> tuple[SessionState | None, bool]:
+    """Create outside bookkeeping locks and validate the exact local receipt."""
+    with profile.lifecycle_lock, profile.sessions_lock:
+        state = (
+            profile.sessions.get(session_id) if isinstance(session_id, str) else None
+        )
+        if expected is not None and state is not expected:
+            return expected, False
+        if state is None or state._pending_start is None:
+            return state, True
+        pending = state._pending_start
+        if (
+            not profile.active
+            or not profile.ready
+            or (state._ended.is_set() and not state.is_idle)
+            or (state.is_idle and not (pending.resume_idle or resume_idle))
+            or getattr(_completion_effects, "pending", None) is not None
+        ):
+            return state, False
+        # Publish the owner before creation or a wrapped helper can block.
+        _get_completion_owner(profile, session_id, state)
+        must_resume = state.is_idle
+    if must_resume and not _resume_session(profile, session_id, state):
+        return state, False
+    ended = state._ended
+    remote_id = _ensure_session(
+        profile, session_id, state, pending.platform, pending.model
+    )
+    with profile.lifecycle_lock, profile.sessions_lock:
+        valid = bool(
+            remote_id
+            and profile.active
+            and profile.ready
+            and profile.sessions.get(session_id) is state
+            and state._pending_start is pending
+            and state._ended is ended
+            and not ended.is_set()
+        )
+        if valid:
+            state.start_confirmed = True
+            state._pending_start = None
+    return state, valid
+
+
+def _restore_pending_starts(profile: ProfileRuntime, previous: ProfileRuntime) -> None:
+    """Return only raw evidence on rollback, never provisional remote authority."""
+    with profile.sessions_lock:
+        pending = [
+            (sid, state)
+            for sid, state in profile.sessions.items()
+            if state._pending_start is not None and state._completion is None
+        ]
+        if profile.sessions is not previous.sessions:
+            for sid, state in pending:
+                if profile.sessions.get(sid) is state:
+                    del profile.sessions[sid]
+    with previous.sessions_lock:
+        for sid, state in pending:
+            receipt = state._pending_start
+            if receipt is None or (state._ended.is_set() and not state.is_idle):
+                continue
+            state._pending_start = replace(
+                receipt, birth_generation=previous.generation
+            )
+            existing = previous.sessions.get(sid)
+            if existing is None or existing is state:
+                previous.sessions[sid] = state
+            elif existing.is_idle or not existing.start_confirmed:
+                existing._pending_start = state._pending_start
+                state._pending_start = None
+                state._ended.set()
+            else:
+                state._pending_start = None
+                state._ended.set()
+        evicted = _trim_sessions(previous)
+    # Caller is in close's deferred-effects scope; HTTP drains after outer locks.
+    _finish_evictions(evicted)
 
 
 def _requires_fresh_start(profile: ProfileRuntime, session_id: Any) -> bool:
@@ -694,7 +845,11 @@ def _get_completion_owner(
                 profile.sessions_lock,
                 profile.recording_lock,
                 profile.session_start_required,
-                profile.generation,
+                (
+                    state._pending_start.birth_generation
+                    if state._pending_start is not None
+                    else profile.generation
+                ),
             )
             state._completion = owner
             _completion_owners.setdefault((profile.home, session_id), {})[
@@ -725,6 +880,9 @@ def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
         state.is_idle = not terminal
         if terminal:
             state.start_confirmed = False
+            state._pending_start = None
+        elif state._pending_start is not None:
+            state._pending_start = replace(state._pending_start, resume_idle=False)
     if terminal:
         # Detach before HTTP so a fresh start can reuse the Hermes SID. A later
         # cleanup must never remove a replacement state under that same key.
@@ -1347,6 +1505,23 @@ def _make_guarded_handler(
                 )
             admission = _admission
         else:
+            if (
+                not profile.active
+                or not profile.ready
+                or _profile_key() != profile.home
+            ):
+                return json.dumps(
+                    {
+                        "error": "[intaris] Tool belongs to a different or unloaded profile"
+                    }
+                )
+            prepared, start_valid = _materialize_pending_start(
+                profile, kwargs.get("session_id")
+            )
+            if not start_valid:
+                return stopped_result(
+                    WaitStopped("CANCELLED: explicit session start is not active")
+                )
             # Admission and quiescing serialize before publishing cancellation.
             with profile.lifecycle_lock:
                 if (
@@ -1368,6 +1543,10 @@ def _make_guarded_handler(
                 session_id = kwargs.get("session_id")
                 try:
                     state = _resolve_invocation_session(profile, session_id)
+                    if prepared is not None and state is not prepared:
+                        return stopped_result(
+                            WaitStopped("CANCELLED: Hermes session changed")
+                        )
                 except ValueError as exc:
                     return json.dumps(
                         {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
@@ -1497,6 +1676,15 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                             "error": "[intaris] MCP tool belongs to a different or unloaded profile"
                         }
                     )
+                prepared, start_valid = _materialize_pending_start(
+                    profile, kwargs.get("session_id")
+                )
+                if not start_valid or not profile.active or not profile.ready:
+                    return json.dumps(
+                        {
+                            "error": "[intaris] CANCELLED: explicit session start is not active"
+                        }
+                    )
                 if _requires_fresh_start(profile, kwargs.get("session_id")):
                     return json.dumps(
                         {
@@ -1510,6 +1698,10 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                     state = _resolve_invocation_session(
                         profile, kwargs.get("session_id")
                     )
+                    if prepared is not None and state is not prepared:
+                        return json.dumps(
+                            {"error": "[intaris] CANCELLED: Hermes session changed"}
+                        )
                 except ValueError as exc:
                     return json.dumps(
                         {"error": f"[intaris] {exc} Cannot call MCP tool {srv}:{tn}."}
@@ -1612,21 +1804,22 @@ def _on_session_start(
     **kwargs: Any,
 ) -> None:
     """on_session_start: Create Intaris session."""
-    state = _get_or_create_state(profile, session_id)
-    if state.is_idle:
-        if not _resume_session(profile, session_id, state):
-            return
-    elif state._ended.is_set():
+    received = _receive_explicit_start(profile, session_id, model, platform)
+    if received is None:
         return
-    if _ensure_session(profile, session_id, state, platform, model):
-        with profile.sessions_lock:
-            if profile.sessions.get(session_id) is state and not state._ended.is_set():
-                state.start_confirmed = True
+    target, state = received
+    if not target.ready or getattr(_completion_effects, "pending", None) is not None:
+        return  # Local receipt only during registration; never wait or do HTTP.
+    _materialize_pending_start(target, session_id, expected=state)
 
-    # Refresh MCP tool cache on session start
-    if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
+    if (
+        target.active
+        and target.ready
+        and target.cfg.mcp_tools
+        and _is_mcp_cache_stale(target)
+    ):
         try:
-            _refresh_mcp_tool_cache(profile)
+            _refresh_mcp_tool_cache(target)
         except Exception:
             pass
 
@@ -1641,19 +1834,48 @@ def _on_session_end(
     **kwargs: Any,
 ) -> None:
     """on_session_end: Signal completion or idle."""
-    # Successors may finish original owners; a retained predecessor callback
-    # cannot acquire authority over a newer lifetime, even in a shared map.
-    with profile.lifecycle_lock:
+    terminal = completed or interrupted
+    # Only an exact active handoff lets the predecessor invalidate successor
+    # raw start evidence. After settlement, the ordinary generation fence wins.
+    with _profiles_lock, profile.lifecycle_lock:
+        current = _profiles.get(profile.home)
+        handoff = (
+            current
+            if current is not None
+            and not current.ready
+            and (current is profile or current.predecessor is profile)
+            else None
+        )
         with _invocations_lock:
             for record in _active_invocations.get(
                 (profile.home, session_id), {}
             ).values():
                 if record.birth_generation <= profile.generation:
                     record.ended.set()
-        with profile.sessions_lock:
-            state = profile.sessions.get(session_id)
-            if state is not None:
-                _get_completion_owner(profile, session_id, state)
+        targets = [profile]
+        if handoff is not None and handoff.sessions is not profile.sessions:
+            targets.append(handoff)
+        for target in targets:
+            with target.sessions_lock:
+                state = target.sessions.get(session_id)
+                if state is None:
+                    continue
+                receipt = state._pending_start
+                if state._completion is None and receipt is not None:
+                    if receipt.birth_generation <= profile.generation or (
+                        handoff is not None and target.sessions is handoff.sessions
+                    ):
+                        state._ended.set()
+                        state.is_idle = not terminal
+                        if terminal:
+                            state._pending_start = None
+                            state.start_confirmed = False
+                            if target.sessions.get(session_id) is state:
+                                del target.sessions[session_id]
+                        else:
+                            state._pending_start = replace(receipt, resume_idle=False)
+                elif state._completion is None:
+                    _get_completion_owner(target, session_id, state)
         with _completion_owners_lock:
             owners = tuple(
                 owner
@@ -1662,10 +1884,8 @@ def _on_session_end(
                 ).values()
                 if owner.birth_generation <= profile.generation
             )
-        # Snapshot and claim eligible exact owners before any effects. A newer
-        # same-SID state created during a blocked flush is a separate lifetime.
         for owner in owners:
-            _claim_session_end(owner, completed or interrupted)
+            _claim_session_end(owner, terminal)
     for owner in owners:
         _emit_lifecycle(owner)
 
@@ -1685,10 +1905,15 @@ def _on_pre_llm_call(
     Returns ``{"context": "..."}`` to inject behavioral alerts into the
     system prompt when there are cached warnings from recent evaluations.
     """
-    if _requires_fresh_start(profile, session_id):
+    prepared, start_valid = _materialize_pending_start(
+        profile, session_id, resume_idle=bool(user_message)
+    )
+    if not start_valid or _requires_fresh_start(profile, session_id):
         return None
 
     state = profile.sessions.get(session_id)
+    if prepared is not None and state is not prepared:
+        return None
     if not state:
         state = _get_or_create_state(profile, session_id)
         _ensure_session(profile, session_id, state, platform, model)
@@ -1888,7 +2113,9 @@ def _bind_hook(profile: ProfileRuntime, callback: Callable) -> Callable:
     def bound(*args: Any, **kwargs: Any) -> Any:
         # Session end remains authoritative through replacement and for a
         # callback already captured before old hook registrations were disposed.
-        if callback is _on_session_end or (profile.active and profile.ready):
+        if callback in (_on_session_start, _on_session_end) or (
+            profile.active and profile.ready
+        ):
             return callback(profile, *args, **kwargs)
         return None
 
@@ -1957,6 +2184,18 @@ def _retire_continuity(retained: _SessionContinuity, *, discard: bool = False) -
     ):
         return
     with retained.sessions_lock:
+        # Raw receipts have no remote owner. Keep them only in the existing
+        # bounded continuity cache; discard invalidates them without HTTP.
+        cached = any(
+            item.sessions is retained.sessions for item in _retired_sessions.values()
+        )
+        if discard or not cached:
+            for sid, state in list(retained.sessions.items()):
+                if state._completion is None and state._pending_start is not None:
+                    state._ended.set()
+                    state._pending_start = None
+                    retained.session_start_required.set()
+                    del retained.sessions[sid]
         owners = [state._completion for state in retained.sessions.values()]
     retiring = []
     with _completion_owners_lock:
@@ -2034,6 +2273,8 @@ def _close_profile(profile: ProfileRuntime) -> None:
         with _profiles_lock:
             previous = profile.predecessor
             if _profiles.get(profile.home) is profile:
+                if not profile.registered and previous is not None:
+                    _restore_pending_starts(profile, previous)
                 # Keep shared state/locks for already-admitted callbacks, but
                 # do not retain registration context, tools, or timers.
                 # Outstanding lifecycle records own their original client.
@@ -2158,7 +2399,7 @@ def register(ctx: Any) -> None:
         except Exception:
             _close_profile(profile)
             raise
-        with profile.lifecycle_lock, _profiles_lock:
+        with _profiles_lock, profile.lifecycle_lock:
             if (
                 profile.active
                 and getattr(ctx, "_load_abandoned", False) is not True

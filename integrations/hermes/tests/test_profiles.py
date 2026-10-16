@@ -3952,3 +3952,342 @@ def test_stale_predecessor_end_cannot_cancel_fresh_successor(
         current.emit("on_session_end", session_id="same-id")
     assert fresh._completion.status == "completed"
     assert not plugin._active_invocations
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("delivery", ["predecessor", "provisional"])
+@pytest.mark.parametrize("outcome", ["success", "exception", "abandoned"])
+@pytest.mark.parametrize("admission", ["native", "mcp", "pre_llm"])
+def test_explicit_start_survives_direct_replacement(
+    runtime, monkeypatch, compatible, delivery, outcome, admission
+):
+    tool = {"server": "docs", "name": "read", "description": "Read", "inputSchema": {}}
+    runtime.tools["a.invalid"] = [tool]
+    runtime.tools["new.invalid"] = [tool]
+    settings = {"mcp_tools": True, "fail_open": True}
+    old = runtime.register("a", settings)
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="existing")
+    changed = settings | (
+        {} if compatible else {"url": "https://new.invalid", "agent_id": "new"}
+    )
+    register = plugin._register_profile
+    injected = False
+
+    def receive_start(profile, ctx, *args):
+        nonlocal injected
+        if profile.home != str(home) or injected:
+            return register(profile, ctx, *args)
+        injected = True
+        if delivery == "provisional":
+            register(profile, ctx, *args)
+        source = old if delivery == "predecessor" else ctx
+        source.emit(
+            "on_session_start",
+            session_id="new-session",
+            model="pending-model",
+            platform="pending-platform",
+        )
+        if outcome == "exception":
+            raise RuntimeError("synthetic failure after start receipt")
+        if outcome == "abandoned":
+            ctx._load_abandoned = True
+        if delivery == "predecessor":
+            return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_start)
+        if outcome == "exception":
+            with pytest.raises(
+                RuntimeError, match="synthetic failure after start receipt"
+            ):
+                runtime.register("a", changed)
+        else:
+            current = runtime.register("a", changed)
+    if outcome != "success":
+        current = runtime.register("a", settings)
+    assert not [
+        r
+        for r in requests_for(runtime, "/intention")
+        if r["body"]["details"]["session_key"] == "new-session"
+    ], "registration must not create queued remote sessions"
+    with runtime.profile("a"):
+        native = runtime.registry.get_entry("read_file").handler
+        assert "error" in json.loads(
+            native({"path": "unstarted"}, session_id="unrelated")
+        )
+        if admission == "mcp":
+            result = json.loads(
+                runtime.registry.get_entry("docs_read").handler(
+                    {}, session_id="new-session"
+                )
+            )
+            expected = (
+                "a.invalid" if compatible or outcome != "success" else "new.invalid"
+            )
+            assert result == {"result": expected}
+        else:
+            if admission == "pre_llm":
+                current.emit(
+                    "pre_llm_call", session_id="new-session", user_message="Continue"
+                )
+            assert json.loads(
+                native({"path": "started"}, session_id="new-session")
+            ) == {"result": "started"}
+        state = plugin._profiles[str(home)].sessions["new-session"]
+        assert state.start_confirmed and not state._ended.is_set()
+        current.emit("on_session_end", session_id="new-session")
+    created = [
+        r
+        for r in requests_for(runtime, "/intention")
+        if r["body"]["details"]["session_key"] == "new-session"
+    ]
+    assert len(created) == 1
+    expected_url = (
+        "https://a.invalid"
+        if compatible or outcome != "success"
+        else "https://new.invalid"
+    )
+    assert created[0]["url"].startswith(expected_url)
+    assert created[0]["body"]["details"]["model"] == "pending-model"
+    assert created[0]["body"]["details"]["platform"] == "pending-platform"
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("delivery", ["predecessor", "provisional"])
+@pytest.mark.parametrize("order", ["terminal", "terminal_start", "idle_resume"])
+def test_pending_explicit_start_respects_lifecycle_order(
+    runtime, monkeypatch, compatible, delivery, order
+):
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        pass
+    register = plugin._register_profile
+    captured = []
+
+    def receive_events(profile, ctx, *args):
+        if delivery == "provisional":
+            register(profile, ctx, *args)
+        source = old if delivery == "predecessor" else ctx
+        source.emit("on_session_start", session_id="pending")
+        captured.append(profile.sessions.get("pending"))
+        source.emit(
+            "on_session_end", session_id="pending", completed=order != "idle_resume"
+        )
+        if order == "terminal_start":
+            source.emit("on_session_start", session_id="pending")
+        if delivery == "predecessor":
+            return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_events)
+        current = runtime.register("a", {} if compatible else {"agent_id": "new"})
+    assert captured[0] is not None, "explicit start must have local evidence"
+    assert not requests_for(runtime, "/intention")
+    with runtime.profile("a"):
+        handler = runtime.registry.get_entry("read_file").handler
+        if order in ("terminal", "idle_resume"):
+            assert "error" in json.loads(
+                handler({"path": "ended"}, session_id="pending")
+            )
+            assert not requests_for(runtime, "/intention")
+        if order == "terminal":
+            assert captured[0]._ended.is_set()
+            assert "pending" not in plugin._profiles[str(home)].sessions
+        else:
+            if order == "idle_resume":
+                current.emit(
+                    "pre_llm_call", session_id="pending", user_message="Resume"
+                )
+            else:
+                assert (
+                    plugin._profiles[str(home)].sessions["pending"] is not captured[0]
+                )
+                assert captured[0]._ended.is_set()
+            assert json.loads(handler({"path": "live"}, session_id="pending")) == {
+                "result": "live"
+            }
+            assert len(requests_for(runtime, "/intention")) == 1
+            current.emit("on_session_end", session_id="pending")
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_pending_explicit_starts_share_session_capacity(
+    runtime, monkeypatch, compatible
+):
+    monkeypatch.setattr(plugin, "MAX_SESSIONS", 2)
+    old = runtime.register("a")
+    register = plugin._register_profile
+    captured = []
+
+    def receive_many(profile, ctx, *args):
+        for index in range(4):
+            old.emit("on_session_start", session_id=f"pending-{index}")
+            captured.append(profile.sessions.get(f"pending-{index}"))
+        assert len(profile.sessions) <= 2
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_many)
+        current = runtime.register("a", {} if compatible else {"agent_id": "new"})
+    assert all(state is not None for state in captured)
+    assert not requests_for(runtime, "/intention")
+    assert all(state._ended.is_set() for state in captured[:2])
+    with runtime.profile("a"):
+        handler = runtime.registry.get_entry("read_file").handler
+        assert "error" in json.loads(
+            handler({"path": "evicted"}, session_id="pending-0")
+        )
+        assert json.loads(handler({"path": "kept"}, session_id="pending-3")) == {
+            "result": "kept"
+        }
+        current.emit("on_session_end", session_id="pending-3")
+    assert len(requests_for(runtime, "/intention")) == 1
+
+
+@pytest.mark.parametrize("recreate", [False, True])
+def test_pending_start_creation_cannot_rebind_ended_call(
+    runtime, monkeypatch, recreate
+):
+    old = runtime.register("a")
+    with runtime.profile("a") as home:
+        pass
+    register = plugin._register_profile
+
+    def receive(profile, ctx, *args):
+        old.emit("on_session_start", session_id="pending")
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive)
+        current = runtime.register("a", {"agent_id": "new"})
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_creation(req):
+        if req.full_url.endswith("/intention") and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    def invoke():
+        with runtime.profile("a"):
+            return json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "abandoned"}, session_id="pending"
+                )
+            )
+
+    runtime.request_hook.append(hold_creation)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(invoke)
+        try:
+            assert entered.wait(5)
+            assert plugin._registration_locks[str(home)].acquire(blocking=False)
+            plugin._registration_locks[str(home)].release()
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="other")
+            with runtime.profile("a"):
+                original = plugin._profiles[str(home)].sessions["pending"]
+                current.emit("on_session_end", session_id="pending")
+                if recreate:
+                    current.emit("on_session_start", session_id="pending")
+                    fresh = plugin._profiles[str(home)].sessions["pending"]
+        finally:
+            release.set()
+        result = pending.result(5)
+    assert "error" in result
+    assert not requests_for(runtime, "/evaluate"), (
+        "abandoned caller cannot resolve fresh SID lifetime"
+    )
+    assert original._ended.is_set() and not original.start_confirmed
+    if recreate:
+        assert (
+            fresh is not original
+            and fresh.start_confirmed
+            and not fresh._ended.is_set()
+        )
+        assert plugin._profiles[str(home)].sessions["pending"] is fresh
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("outcome", ["exception", "abandoned"])
+@pytest.mark.parametrize("delivery", ["predecessor", "provisional"])
+def test_pending_start_received_during_failed_handoff_cleanup(
+    runtime, monkeypatch, compatible, outcome, delivery
+):
+    old = runtime.register("a")
+    register = plugin._register_profile
+    captured = []
+
+    def fail_after_install(profile, ctx, *args):
+        register(profile, ctx, *args)
+        source = old if delivery == "predecessor" else ctx
+        start = source.hooks["on_session_start"][0]
+
+        def start_during_cleanup():
+            assert not profile.active and not profile.ready
+            start(session_id="cleanup-start", model="cleanup-model")
+            captured.append(profile.sessions.get("cleanup-start"))
+
+        profile.registrations.append(Handle(start_during_cleanup))
+        if outcome == "exception":
+            raise RuntimeError("failed after installing successor hooks")
+        ctx._load_abandoned = True
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", fail_after_install)
+        settings = {} if compatible else {"url": "https://failed.invalid"}
+        if outcome == "exception":
+            with pytest.raises(RuntimeError, match="failed after installing"):
+                runtime.register("a", settings)
+        else:
+            runtime.register("a", settings)
+    assert len(captured) == 1 and captured[0] is not None
+    assert not requests_for(runtime, "/intention")
+    current = runtime.register("a")
+    with runtime.profile("a"):
+        result = runtime.registry.get_entry("read_file").handler(
+            {"path": "after-cleanup"}, session_id="cleanup-start"
+        )
+        assert json.loads(result) == {"result": "after-cleanup"}
+        current.emit("on_session_end", session_id="cleanup-start")
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 1
+    assert created[0]["url"] == "https://a.invalid/api/v1/intention"
+    assert created[0]["body"]["details"]["model"] == "cleanup-model"
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("initial_idle", [False, True])
+def test_pending_duplicate_starts_coalesce_without_intervening_end(
+    runtime, monkeypatch, compatible, initial_idle
+):
+    old = runtime.register("a")
+    if initial_idle:
+        with runtime.profile("a"):
+            old.emit("on_session_start", session_id="same")
+            old.emit("on_session_end", session_id="same", completed=False)
+    register = plugin._register_profile
+
+    def receive_duplicates(profile, ctx, *args):
+        old.emit("on_session_start", session_id="same", model="first")
+        state = profile.sessions["same"]
+        receipt = state._pending_start
+        assert receipt is not None
+        old.emit("on_session_start", session_id="same", model="duplicate")
+        assert state._pending_start is receipt
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_duplicates)
+        current = runtime.register("a", {} if compatible else {"agent_id": "new"})
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "once"}, session_id="same"
+            )
+        ) == {"result": "once"}
+        current.emit("on_session_end", session_id="same")
+    assert len(requests_for(runtime, "/intention")) == (
+        1 if compatible or not initial_idle else 2
+    )
