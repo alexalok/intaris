@@ -192,6 +192,8 @@ class SessionState:
     details: dict[str, Any] = field(default_factory=dict)
     intaris_session_id: str | None = None
     session_created: bool = False
+    # Only this Hermes session's successful start proves post-reload freshness.
+    start_confirmed: bool = False
     call_count: int = 0
     approved_count: int = 0
     denied_count: int = 0
@@ -315,6 +317,17 @@ def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
                     if evicted is not None:
                         evicted._ended.set()
         return state
+
+
+def _requires_fresh_start(profile: ProfileRuntime, session_id: Any) -> bool:
+    """Keep post-reload admission proof scoped to each Hermes session."""
+    if not profile.session_start_required.is_set():
+        return False
+    with profile.sessions_lock:
+        state = (
+            profile.sessions.get(session_id) if isinstance(session_id, str) else None
+        )
+        return state is None or not state.start_confirmed
 
 
 def _resolve_invocation_session(
@@ -1123,7 +1136,7 @@ def _make_guarded_handler(
                             "error": "[intaris] Tool belongs to a different or unloaded profile"
                         }
                     )
-                if profile.session_start_required.is_set():
+                if _requires_fresh_start(profile, kwargs.get("session_id")):
                     return json.dumps(
                         {
                             "error": "[intaris] Profile changed; start a fresh Hermes session"
@@ -1240,7 +1253,7 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                             "error": "[intaris] MCP tool belongs to a different or unloaded profile"
                         }
                     )
-                if profile.session_start_required.is_set():
+                if _requires_fresh_start(profile, kwargs.get("session_id")):
                     return json.dumps(
                         {
                             "error": "[intaris] Profile changed; start a fresh Hermes session"
@@ -1359,7 +1372,8 @@ def _on_session_start(
     if state._ended.is_set():
         state._ended = threading.Event()
     if _ensure_session(profile, session_id, state, platform, model):
-        profile.session_start_required.clear()
+        with profile.sessions_lock:
+            state.start_confirmed = True
 
     # Refresh MCP tool cache on session start
     if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
@@ -1423,7 +1437,7 @@ def _on_pre_llm_call(
     Returns ``{"context": "..."}`` to inject behavioral alerts into the
     system prompt when there are cached warnings from recent evaluations.
     """
-    if profile.session_start_required.is_set():
+    if _requires_fresh_start(profile, session_id):
         return None
 
     state = profile.sessions.get(session_id)

@@ -796,6 +796,74 @@ def test_reload_identity_change_requires_fresh_start(runtime, monkeypatch, chang
     assert created[0]["body"]["session_id"] != created[1]["body"]["session_id"]
 
 
+@pytest.mark.parametrize("changed", ["url", "user_id", "agent_id", "api_key", "policy"])
+@pytest.mark.parametrize("fail_open", [False, True])
+@pytest.mark.parametrize("reload_again", ["none", "compatible", "failed_replacement"])
+def test_reload_requires_fresh_start_for_each_session(
+    runtime, monkeypatch, changed, fail_open, reload_again
+):
+    settings = {
+        "url": "https://a.invalid",
+        "user_id": "a",
+        "fail_open": fail_open,
+        "mcp_tools": True,
+    }
+    for host in ("a.invalid", "changed.invalid"):
+        runtime.tools[host] = [{"server": "shared", "name": "tool"}]
+    old = runtime.register("a", settings)
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="first")
+        old.emit("on_session_start", session_id="stale")
+        if changed == "api_key":
+            runtime.secrets["a"] = {"INTARIS_API_KEY": "changed-key"}
+        elif changed == "policy":
+            monkeypatch.setenv("TMPDIR", "/different-temp-root")
+        else:
+            settings[changed] = "https://changed.invalid" if changed == "url" else "b"
+        current = runtime.register("a", settings)
+        current.emit("on_session_start", session_id="first")
+        if reload_again == "failed_replacement":
+
+            def fail_registration(*args):
+                raise RuntimeError("synthetic replacement failure")
+
+            with monkeypatch.context() as failure:
+                failure.setattr(plugin, "_register_profile", fail_registration)
+                with pytest.raises(RuntimeError, match="synthetic replacement failure"):
+                    runtime.register("a", settings)
+        if reload_again != "none":
+            current = runtime.register("a", settings)
+        handler = runtime.registry.get_entry("read_file").handler
+        mcp_handler = runtime.registry.get_entry("shared_tool").handler
+        assert json.loads(handler({"path": "fresh"}, session_id="first")) == {
+            "result": "fresh"
+        }
+        before = len(runtime.requests)
+        current.emit("pre_llm_call", session_id="stale", user_message="Continue")
+        native_result = json.loads(handler({"path": "blocked"}, session_id="stale"))
+        mcp_result = json.loads(mcp_handler({}, session_id="stale"))
+        assert "error" in native_result, (
+            "one fresh session must not unlock stale native calls"
+        )
+        assert "error" in mcp_result, (
+            "one fresh session must not unlock stale MCP calls"
+        )
+        assert len(runtime.requests) == before, (
+            "stale session must not bootstrap or send reasoning"
+        )
+        current.emit("on_session_start", session_id="stale")
+        assert json.loads(handler({"path": "now fresh"}, session_id="stale")) == {
+            "result": "now fresh"
+        }
+        assert json.loads(mcp_handler({}, session_id="stale"))["result"] in (
+            "a.invalid",
+            "changed.invalid",
+        )
+    assert len(requests_for(runtime, "/intention")) == 4
+    assert len(requests_for(runtime, "/evaluate")) == 2
+    assert len(requests_for(runtime, "/mcp/call")) == 1
+
+
 def test_evicted_reload_state_requires_fresh_start(runtime, monkeypatch):
     monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 1)
     for name in ("a", "b"):
