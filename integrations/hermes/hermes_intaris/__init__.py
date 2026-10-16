@@ -254,6 +254,7 @@ class _GuardAdmission:
     session_id: str
     state: SessionState
     invocation: Invocation
+    completion: _CompletionOwner
 
 
 @dataclass
@@ -283,6 +284,7 @@ class _CompletionOwner:
     effects_lock: Any = field(default_factory=threading.Lock, repr=False)
     status: str = "active"
     emitted_status: str = "active"
+    admissions: set[object] = field(default_factory=set, repr=False)
 
 
 def _session_fingerprint(profile: ProfileRuntime) -> str:
@@ -699,7 +701,11 @@ def _emit_lifecycle(owner: _CompletionOwner) -> None:
     with owner.effects_lock:
         while True:
             with owner.lock:
-                if owner.state._creating or owner.status == owner.emitted_status:
+                if (
+                    owner.state._creating
+                    or owner.status == owner.emitted_status
+                    or (owner.status == "completed" and owner.admissions)
+                ):
                     return
                 status = owner.status
                 if not owner.state.intaris_session_id:
@@ -1290,17 +1296,27 @@ def _make_guarded_handler(
                     return json.dumps(
                         {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
                     )
-                ended = state._ended
-                admission = _GuardAdmission(
-                    profile,
-                    session_id,
-                    state,
-                    Invocation(ended, profile.cfg.escalation_timeout_s),
-                )
-                admission_token = object()
-                with _invocations_lock:
-                    key = (profile.home, session_id)
-                    _active_invocations.setdefault(key, {})[admission_token] = ended
+                owner = _get_completion_owner(profile, session_id, state)
+                with owner.lock:
+                    # Lease the captured outer lifetime atomically against
+                    # retirement. Private continuations share this same lease.
+                    if owner.status == "completed":
+                        return stopped_result(
+                            WaitStopped("CANCELLED: Hermes session ended")
+                        )
+                    ended = state._ended
+                    admission = _GuardAdmission(
+                        profile,
+                        session_id,
+                        state,
+                        Invocation(ended, profile.cfg.escalation_timeout_s),
+                        owner,
+                    )
+                    admission_token = object()
+                    owner.admissions.add(admission_token)
+                    with _invocations_lock:
+                        key = (profile.home, session_id)
+                        _active_invocations.setdefault(key, {})[admission_token] = ended
 
         invocation = admission.invocation
 
@@ -1310,10 +1326,17 @@ def _make_guarded_handler(
             invocation.close()
             with _invocations_lock:
                 key = (profile.home, admission.session_id)
-                pending = _active_invocations[key]
-                del pending[admission_token]
-                if not pending:
-                    del _active_invocations[key]
+                pending = _active_invocations.get(key)
+                if pending is not None:
+                    pending.pop(admission_token, None)
+                    if not pending:
+                        del _active_invocations[key]
+            owner = admission.completion
+            with owner.lock:
+                owner.admissions.discard(admission_token)
+            # The last sync/awaited outer lifetime settles deferred terminal
+            # effects without holding admission, profile or session-map locks.
+            _emit_lifecycle(owner)
 
         try:
             invocation.check()

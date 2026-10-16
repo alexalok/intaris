@@ -110,8 +110,9 @@ records preserve final recording/status/summary routing across identity changes
 and cannot authorize new tool calls. Duplicate end callbacks produce one local
 completion transition; HTTP delivery retains its existing best-effort behavior.
 The 100-session cap also completes evicted sessions through their original owner,
-flushes retained recording, and releases that owner after any pending creation
-finishes; an evicted session cannot reopen its old lifetime.
+flushes retained recording, and releases that owner after pending creation and
+already-admitted outer tool calls finish; an evicted session cannot reopen its
+old lifetime.
 Changing identity or policy, or reloading after admission continuity was evicted,
 requires each Hermes session to receive its own fresh session-start event. One
 session's start cannot unlock another; tools remain blocked even with fail-open

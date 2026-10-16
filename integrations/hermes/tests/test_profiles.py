@@ -2690,3 +2690,201 @@ def test_session_eviction_flush_does_not_hold_map_or_delete_reused_id(
                 {"path": "new lifetime"}, session_id="same-id"
             )
         ) == {"result": "new lifetime"}
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("pause", ["control", "native", "foreign"])
+def test_real_hermes_eviction_waits_for_outer_guard(
+    runtime, monkeypatch, is_async, pause
+):
+    if not os.environ.get("HERMES_SOURCE"):
+        pytest.skip("Set HERMES_SOURCE to test real Hermes dispatch and observer hooks")
+    evict = pause != "control"
+    import tools.registry as registry_module
+    from hermes_cli import config, lifecycle, plugins
+
+    monkeypatch.setattr(plugin, "MAX_SESSIONS", 1)
+    monkeypatch.setattr(registry_module, "discover_builtin_tools", lambda: None)
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_observe", lambda *a, **k: None)
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
+    model_tools = importlib.import_module("model_tools")
+    monkeypatch.setattr(model_tools, "registry", runtime.registry)
+    settings = {
+        "plugins": {
+            "entries": {
+                "intaris": {
+                    "allow_tool_override": True,
+                    "settings": {
+                        "url": "https://a.invalid",
+                        "user_id": "a",
+                        "session_recording": True,
+                        "mcp_tools": False,
+                    },
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(plugins, "load_config_readonly", lambda: settings)
+    monkeypatch.setattr(config, "load_config", lambda: settings)
+    entered, release = threading.Event(), threading.Event()
+    native_returned = threading.Event()
+    outer_returned = threading.Event()
+    terminal_observations = []
+    post_calls, failures, result = [], [], []
+
+    def native(args, **kwargs):
+        if pause != "foreign":
+            entered.set()
+            assert release.wait(5)
+        native_returned.set()
+        return json.dumps({"result": "native-finished"})
+
+    async def async_native(args, **kwargs):
+        await asyncio.sleep(0)
+        return native(args, **kwargs)
+
+    def observe_terminal(req):
+        if req.full_url.endswith(("/status", "/agent-summary")):
+            terminal_observations.append(
+                (native_returned.is_set(), outer_returned.is_set())
+            )
+
+    runtime.request_hook.append(observe_terminal)
+    runtime.secrets["a"] = {"INTARIS_API_KEY": "key-a"}
+    with runtime.profile("a") as home:
+        runtime.registry.register(
+            name="read_file",
+            toolset="files",
+            schema={"name": "read_file", "parameters": {}},
+            handler=async_native if is_async else native,
+            check_fn=None,
+            requires_env=[],
+            is_async=is_async,
+            description="Blocked test native",
+            emoji="",
+        )
+        manifest = plugins.PluginManifest(
+            name="intaris", source="entrypoint", path="hermes_intaris"
+        )
+        manager = plugins.PluginManager(scope_key=str(home))
+        manager._track_tool_override_policy(manifest, "hermes_intaris")
+        ctx = plugins.PluginContext(manifest, manager)
+        plugin.register(ctx)
+        monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+        manager.invoke_hook("on_session_start", session_id="same-id")
+        profile = plugin._profiles[str(home)]
+        original = profile.sessions["same-id"]
+        original_id = original.intaris_session_id
+        guarded = runtime.registry.get_entry("read_file").handler
+
+        def after_native(result):
+            if pause == "foreign":
+                entered.set()
+                assert release.wait(5)
+            outer_returned.set()
+            return result
+
+        @wraps(guarded)
+        def foreign(args, **kwargs):
+            return after_native(guarded(args, **kwargs))
+
+        @wraps(guarded)
+        async def async_foreign(args, **kwargs):
+            return after_native(await guarded(args, **kwargs))
+
+        runtime.registry.register(
+            name="read_file",
+            toolset="files",
+            schema={"name": "read_file", "parameters": {}},
+            handler=async_foreign if is_async else foreign,
+            scope=str(home),
+            check_fn=None,
+            requires_env=[],
+            is_async=is_async,
+            description="Foreign wrapper",
+            emoji="",
+        )
+        plugin.register(plugins.PluginContext(manifest, manager))
+
+        def observe(**kwargs):
+            post_calls.append(
+                dict(
+                    kwargs,
+                    admission_present=bool(
+                        plugin._active_invocations.get((str(home), "same-id"))
+                    ),
+                )
+            )
+
+        manager._hooks["post_tool_call"].append(observe)
+
+    def invoke():
+        try:
+            with runtime.profile("a"):
+                result.append(
+                    model_tools.handle_function_call(
+                        "read_file",
+                        {"path": "old"},
+                        task_id="worker-task",
+                        session_id="same-id",
+                        tool_call_id="host-call-1",
+                        skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
+                    )
+                )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    try:
+        assert entered.wait(5), failures
+        if evict:
+            with runtime.profile("a"):
+                manager.invoke_hook("on_session_start", session_id="other-id")
+        early = [
+            r
+            for r in requests_for(runtime, "/status")
+            if r["url"].endswith(f"/{original_id}/status")
+        ]
+        early_summary = [
+            r
+            for r in requests_for(runtime, "/agent-summary")
+            if r["url"].endswith(f"/{original_id}/agent-summary")
+        ]
+        assert not outer_returned.is_set()
+        assert not early, "completion must wait for the captured outer guard"
+        assert not early_summary, "summary must wait for the captured outer guard"
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not failures
+    assert json.loads(result[0]) == {"result": "native-finished"}
+    assert len(post_calls) == 1
+    assert post_calls[0]["tool_call_id"] == "host-call-1"
+    assert post_calls[0]["session_id"] == "same-id"
+    assert not post_calls[0]["admission_present"]
+    plugin._flush_recording_buffer(profile, "same-id")
+    events = list(original.recording_buffer)
+    for req in requests_for(runtime, "/events"):
+        if req["url"].endswith(f"/{original_id}/events"):
+            events.extend(req["body"])
+    recorded_results = [e for e in events if e["type"] == "tool_result"]
+    if evict:
+        assert terminal_observations == [(True, True), (True, True)]
+    else:
+        assert terminal_observations == []
+    # Baseline qualification, separate from the introduced timing regression:
+    # Hermes emits post_tool_call after guard release; capped-session lookup
+    # already omitted this recording before completion ownership was introduced.
+    assert len(recorded_results) == (0 if evict else 1)
+    if not evict:
+        assert recorded_results[0]["data"]["call_id"] == "call-1"
+    manager.unload()
+    for loop in (
+        model_tools._tool_loop,
+        getattr(model_tools._worker_thread_local, "loop", None),
+    ):
+        if loop is not None and not loop.is_running():
+            loop.close()
