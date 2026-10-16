@@ -159,18 +159,35 @@ _cfg: Config | None = None
 _client: IntarisClient | None = None
 
 
-def _get_or_create_state(task_id: str) -> SessionState:
+def _get_or_create_state(session_id: str) -> SessionState:
     with _sessions_lock:
-        state = _sessions.get(task_id)
+        state = _sessions.get(session_id)
         if state is None:
             state = SessionState()
-            _sessions[task_id] = state
+            _sessions[session_id] = state
             # Evict oldest entries if over limit
             if len(_sessions) > MAX_SESSIONS:
                 excess = len(_sessions) - MAX_SESSIONS
                 keys = list(_sessions.keys())[:excess]
                 for k in keys:
                     _sessions.pop(k, None)
+        return state
+
+
+def _resolve_invocation_session(session_id: Any) -> SessionState:
+    """Resolve only the authoritative Hermes invocation session identity.
+
+    Hermes passes session_id and task_id separately to handlers and hooks.
+    task_id identifies tool resources, not the session used by lifecycle hooks.
+    Missing or unknown identity must never borrow another session, even when
+    fail-open is enabled. Idle state and insertion order are not identity.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("Missing or invalid Hermes session_id.")
+    with _sessions_lock:
+        state = _sessions.get(session_id)
+        if state is None or not state.intaris_session_id:
+            raise ValueError("No active Intaris session for this Hermes session_id.")
         return state
 
 
@@ -605,28 +622,12 @@ def _make_guarded_handler(
     def guarded_handler(args: dict, **kwargs: Any) -> str:
         assert _cfg is not None and _client is not None
 
-        # Find the active session — use the most recent non-idle session
-        task_id: str | None = None
-        state: SessionState | None = None
-        with _sessions_lock:
-            for tid, s in reversed(list(_sessions.items())):
-                if s.intaris_session_id:
-                    task_id = tid
-                    state = s
-                    if not s.is_idle:
-                        break
-
-        if not state or not state.intaris_session_id:
-            if _cfg.fail_open:
-                logger.warning(
-                    "[intaris] No active session for %s — allowing (fail-open)",
-                    tool_name,
-                )
-                return original_handler(args, **kwargs)
+        session_id = kwargs.get("session_id")
+        try:
+            state = _resolve_invocation_session(session_id)
+        except ValueError as exc:
             return json.dumps(
-                {
-                    "error": f"[intaris] No active Intaris session. Cannot evaluate {tool_name}."
-                }
+                {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
             )
 
         # Evaluate the tool call
@@ -708,7 +709,7 @@ def _make_guarded_handler(
                 _client.update_session(
                     state.intaris_session_id,
                     _build_intention(),
-                    _build_details(session_id=task_id or ""),
+                    _build_details(session_id=session_id),
                 )
             except Exception:
                 pass
@@ -885,21 +886,14 @@ def _register_mcp_tools(ctx: Any) -> None:
             def mcp_handler(args: dict, **kwargs: Any) -> str:
                 assert _client is not None
 
-                # Find active session
-                intaris_session_id: str | None = None
-                with _sessions_lock:
-                    for s in reversed(list(_sessions.values())):
-                        if s.intaris_session_id:
-                            intaris_session_id = s.intaris_session_id
-                            if not s.is_idle:
-                                break
-
-                if not intaris_session_id:
+                try:
+                    state = _resolve_invocation_session(kwargs.get("session_id"))
+                except ValueError as exc:
                     return json.dumps(
-                        {"error": "[intaris] No active session for MCP tool call"}
+                        {"error": f"[intaris] {exc} Cannot call MCP tool {srv}:{tn}."}
                     )
 
-                result = _client.call_mcp_tool(intaris_session_id, srv, tn, args)
+                result = _client.call_mcp_tool(state.intaris_session_id, srv, tn, args)
 
                 response_error = _decision_response_error(result)
                 if response_error:
@@ -1101,13 +1095,19 @@ def _on_pre_llm_call(
 
 
 def _on_pre_tool_call(
-    tool_name: str = "", args: dict | None = None, task_id: str = "", **kwargs: Any
+    tool_name: str = "",
+    args: dict | None = None,
+    task_id: str = "",
+    session_id: str = "",
+    **kwargs: Any,
 ) -> None:
     """pre_tool_call: Record tool call event (evaluation happens in wrapper)."""
-    if not task_id:
+    try:
+        _resolve_invocation_session(session_id)
+    except ValueError:
         return
     _record_event(
-        task_id,
+        session_id,
         {
             "type": "tool_call",
             "data": {
@@ -1120,7 +1120,7 @@ def _on_pre_tool_call(
                     or ""
                 )
                 or None,
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )
@@ -1131,12 +1131,14 @@ def _on_post_tool_call(
     args: dict | None = None,
     result: Any = "",
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     """post_tool_call: Record tool result."""
-    if not task_id:
+    try:
+        state = _resolve_invocation_session(session_id)
+    except ValueError:
         return
-    state = _sessions.get(task_id)
     args_key = _args_fingerprint(args)
     mapped_call_id: str | None = None
     if state:
@@ -1147,7 +1149,7 @@ def _on_post_tool_call(
                 del state.pending_tool_results[i]
                 break
     _record_event(
-        task_id,
+        session_id,
         {
             "type": "tool_result",
             "data": {
@@ -1173,7 +1175,7 @@ def _on_post_tool_call(
                     or kwargs.get("error")
                 ),
                 "error": kwargs.get("error"),
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )

@@ -70,6 +70,14 @@ The plugin uses a **tool wrapping** approach: during initialization, it captures
 
 This works because Hermes plugins load **after** built-in tools, and the tool registry allows handler replacement. The wrapper is transparent -- same schema, same toolset, same availability checks.
 
+### Invocation Identity
+
+Native tool handlers and Intaris-proxied MCP handlers require the `session_id` keyword supplied by Hermes's tool dispatcher. It must match a session established by `on_session_start` or `pre_llm_call`. Tool recording hooks use the same identity. Hermes's separate `task_id` identifies tool resources; it is not a substitute for `session_id`. Tool arguments cannot supply or override this identity.
+
+The plugin resolves that exact session regardless of session insertion order or idle status. Missing, invalid, or unknown identity blocks the call before evaluation, MCP forwarding, or native execution, even with `INTARIS_FAIL_OPEN=true`. Integrations that dispatch tools directly must forward the originating Hermes `session_id`; the plugin never guesses from the latest, only, or active session.
+
+Host paths that omit `session_id` are also blocked. For example, the nested `execute_code` RPC and kernel dispatchers in Hermes revision `63d0b94120027d487c9a5235b9ec64b696af1b26` forward only `task_id`. Those paths need the host to propagate the originating session identity before their nested tool calls can run through this guard.
+
 ### Hook Flow
 
 1. **`on_session_start`**: Creates an Intaris session via `POST /api/v1/intention`
