@@ -792,6 +792,58 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
     )
 
 
+@pytest.mark.parametrize("same_identity", [True, False])
+def test_reload_observes_admitted_session_start_completion(runtime, same_identity):
+    old = runtime.register("a")
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="old-session")
+    starting = runtime.register("a", {"user_id": "b", "fail_open": True})
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+
+    def hold_creation(req):
+        if req.full_url.endswith("/intention"):
+            entered.set()
+            assert release.wait(5)
+
+    def start():
+        try:
+            with runtime.profile("a"):
+                starting.emit("on_session_start", session_id="fresh-session")
+        except Exception as exc:
+            failures.append(exc)
+
+    runtime.request_hook.append(hold_creation)
+    thread = threading.Thread(target=start)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        new = runtime.register(
+            "a", {"user_id": "b" if same_identity else "c", "fail_open": True}
+        )
+    finally:
+        runtime.request_hook.clear()
+        release.set()
+        thread.join(5)
+    assert not failures
+    with runtime.profile("a"):
+        result = json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after start"})
+        )
+        new.emit("pre_llm_call", session_id="fresh-session", user_message="Continue")
+    if same_identity:
+        assert result == {"result": "after start"}
+        assert (
+            requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
+            == (requests_for(runtime, "/intention")[-1]["body"]["session_id"])
+        )
+        assert len(requests_for(runtime, "/reasoning")) == 1
+    else:
+        assert "error" in result
+        assert not requests_for(runtime, "/evaluate")
+        assert not requests_for(runtime, "/reasoning")
+
+
 def test_failed_reload_keeps_session_for_retry(runtime, monkeypatch):
     old = runtime.register("a")
     with runtime.profile("a"):

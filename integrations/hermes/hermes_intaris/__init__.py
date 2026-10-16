@@ -229,7 +229,9 @@ class ProfileRuntime:
     flush_timer: threading.Timer | None = field(default=None, repr=False)
     registrations: list[Any] = field(default_factory=list, repr=False)
     closed: threading.Event = field(default_factory=threading.Event, repr=False)
-    session_start_required: bool = False
+    session_start_required: threading.Event = field(
+        default_factory=threading.Event, repr=False
+    )
     active: bool = True
 
 
@@ -241,7 +243,7 @@ class _SessionContinuity:
     sessions: dict[str, SessionState]
     sessions_lock: Any
     recording_lock: Any
-    session_start_required: bool
+    session_start_required: threading.Event
 
 
 def _session_fingerprint(profile: ProfileRuntime) -> str:
@@ -748,7 +750,7 @@ def _make_guarded_handler(
             return json.dumps(
                 {"error": "[intaris] Tool belongs to a different or unloaded profile"}
             )
-        if profile.session_start_required:
+        if profile.session_start_required.is_set():
             return json.dumps(
                 {"error": "[intaris] Profile changed; start a fresh Hermes session"}
             )
@@ -1024,7 +1026,7 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                             "error": "[intaris] MCP tool belongs to a different or unloaded profile"
                         }
                     )
-                if profile.session_start_required:
+                if profile.session_start_required.is_set():
                     return json.dumps(
                         {
                             "error": "[intaris] Profile changed; start a fresh Hermes session"
@@ -1117,7 +1119,7 @@ def _on_session_start(
     """on_session_start: Create Intaris session."""
     state = _get_or_create_state(profile, session_id)
     if _ensure_session(profile, session_id, state, platform, model):
-        profile.session_start_required = False
+        profile.session_start_required.clear()
 
     # Refresh MCP tool cache on session start
     if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
@@ -1170,7 +1172,7 @@ def _on_pre_llm_call(
     Returns ``{"context": "..."}`` to inject behavioral alerts into the
     system prompt when there are cached warnings from recent evaluations.
     """
-    if profile.session_start_required:
+    if profile.session_start_required.is_set():
         return None
 
     state = profile.sessions.get(session_id)
@@ -1470,8 +1472,9 @@ def register(ctx: Any) -> None:
             context=ctx,
             client=IntarisClient(cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id),
             policy=_build_policy(cfg.allow_paths),
-            session_start_required=known_home,
         )
+        if known_home:
+            profile.session_start_required.set()
         fingerprint = _session_fingerprint(profile)
         with _profiles_lock:
             if not scoped and any(key != home for key in _profiles):
