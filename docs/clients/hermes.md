@@ -36,9 +36,9 @@ All configuration is via environment variables.
 | `INTARIS_URL` | `http://localhost:8060` | Intaris server URL |
 | `INTARIS_API_KEY` | (required) | API key for authentication |
 | `INTARIS_USER_ID` | (empty) | User ID. Optional if API key maps to a user. |
-| `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable. 4xx errors always block regardless. |
+| `INTARIS_FAIL_OPEN` | `false` | Allow tool calls when Intaris is unreachable. 4xx errors and invalid protocol responses always block regardless. |
 | `INTARIS_ALLOW_PATHS` | (empty) | Comma-separated parent dirs for `allow_paths` policy. Supports `~` expansion. |
-| `INTARIS_ESCALATION_TIMEOUT` | `0` (no timeout) | Max seconds to wait for escalation approval. |
+| `INTARIS_ESCALATION_TIMEOUT` | `0` | Additional approval-wait limit in seconds; 0 uses only Hermes's finite approval limit. |
 | `INTARIS_CHECKPOINT_INTERVAL` | `25` | Evaluate calls between periodic checkpoints. `0` = disabled. |
 | `INTARIS_SESSION_RECORDING` | `false` | Enable session recording. |
 | `INTARIS_MCP_TOOLS` | `true` | Enable MCP tool proxy (registers upstream MCP tools as native Hermes tools). |
@@ -76,13 +76,20 @@ The plugin registers 6 lifecycle hooks plus the tool wrapping:
 3. **Tool wrapper**: Core guardrail -- evaluates every tool call via `POST /api/v1/evaluate`:
    - **approve**: calls original handler, returns result
    - **deny**: returns error JSON to the LLM (blocks execution)
-   - **escalate**: enters polling only when `/evaluate` still returns unresolved escalation (2s, 4s, 8s, 16s, 30s cap)
+   - **escalate**: polls immediately when `/evaluate` returns unresolved escalation, then backs off (2s, 4s, 8s, 16s, 30s cap)
    - **session suspended**: polls session status until reactivated or terminated
    - **session terminated**: immediate block
 4. **`pre_tool_call`**: Records tool call events when session recording is enabled.
 5. **`post_tool_call`**: Records tool results when session recording is enabled.
 6. **`post_llm_call`**: Captures last assistant text for reasoning context on the next user turn.
 7. **`on_session_end`**: Signals session completion (`PATCH /session/{id}/status` + `POST /session/{id}/agent-summary`).
+
+Human waits register with Hermes's sequential/concurrent deadline accounting and
+stop on interruption, session end, or the smaller of Hermes `approvals.timeout`
+and a positive `INTARIS_ESCALATION_TIMEOUT`. Cancellation is checked before tool
+dispatch, including after reactivation and re-evaluation. Hosts without the
+required wait/interrupt APIs return an approval/retry error instead of polling.
+See [compatibility and cancellation limits](../../integrations/hermes/README.md#approval-deadlines-and-cancellation).
 
 ### MCP Tool Proxy
 

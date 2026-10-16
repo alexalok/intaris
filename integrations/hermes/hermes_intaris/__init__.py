@@ -53,7 +53,8 @@ from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from .client import IntarisClient
+from .client import ApiResult, IntarisClient
+from .waits import Invocation, WaitStopped
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,8 @@ class SessionState:
     recording_buffer: list[dict[str, Any]] = field(default_factory=list)
     last_assistant_text: str = ""
     pending_tool_results: list[dict[str, str]] = field(default_factory=list)
+    # A new event is installed on resume; old invocations retain cancellation.
+    _ended: threading.Event = field(default_factory=threading.Event, repr=False)
     # Lock for session creation dedup
     _creating: bool = False
 
@@ -288,7 +291,28 @@ def _get_or_create_state(profile: ProfileRuntime, task_id: str) -> SessionState:
                 excess = len(profile.sessions) - MAX_SESSIONS
                 keys = list(profile.sessions.keys())[:excess]
                 for k in keys:
-                    profile.sessions.pop(k, None)
+                    evicted = profile.sessions.pop(k, None)
+                    if evicted is not None:
+                        evicted._ended.set()
+        return state
+
+
+def _resolve_invocation_session(
+    profile: ProfileRuntime, session_id: Any
+) -> SessionState:
+    """Resolve only the authoritative Hermes invocation session identity.
+
+    Hermes passes session_id and task_id separately to handlers and hooks.
+    task_id identifies tool resources, not the session used by lifecycle hooks.
+    Missing or unknown identity must never borrow another session, even when
+    fail-open is enabled. Idle state and insertion order are not identity.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("Missing or invalid Hermes session_id.")
+    with profile.sessions_lock:
+        state = profile.sessions.get(session_id)
+        if state is None or not state.intaris_session_id:
+            raise ValueError("No active Intaris session for this Hermes session_id.")
         return state
 
 
@@ -303,18 +327,23 @@ def _args_fingerprint(args: dict[str, Any] | None) -> str:
 
 
 def _queue_pending_tool_result(
-    state: SessionState, tool_name: str, args: dict[str, Any] | None, call_id: str
-) -> None:
-    """Remember the audit call id for the next executed post_tool_call hook."""
+    profile: ProfileRuntime,
+    state: SessionState,
+    tool_name: str,
+    args: dict[str, Any] | None,
+    call_id: str,
+) -> dict[str, str] | None:
+    """Remember and return the correlation entry owned by this invocation."""
     if not call_id:
-        return
-    state.pending_tool_results.append(
-        {
-            "tool": tool_name,
-            "args": _args_fingerprint(args),
-            "call_id": str(call_id),
-        }
-    )
+        return None
+    pending = {
+        "tool": tool_name,
+        "args": _args_fingerprint(args),
+        "call_id": str(call_id),
+    }
+    with profile.sessions_lock:
+        state.pending_tool_results.append(pending)
+    return pending
 
 
 # ============================================================================
@@ -554,18 +583,26 @@ def _signal_completion(
         pass
 
 
-def _send_checkpoint(profile: ProfileRuntime, state: SessionState) -> None:
+def _send_checkpoint(
+    profile: ProfileRuntime, state: SessionState, invocation: Invocation
+) -> None:
     """Send a periodic checkpoint if interval reached."""
+    assert profile.cfg is not None and profile.client is not None
     if profile.cfg.checkpoint_interval <= 0:
         return
     if state.call_count % profile.cfg.checkpoint_interval != 0:
         return
     if not state.intaris_session_id:
         return
+    client = profile.client
     try:
-        profile.client.submit_checkpoint(
-            state.intaris_session_id, _build_checkpoint_content(profile, state)
+        invocation.request(
+            lambda: client.submit_checkpoint(
+                state.intaris_session_id, _build_checkpoint_content(profile, state)
+            )
         )
+    except WaitStopped:
+        raise
     except Exception:
         pass
 
@@ -616,101 +653,105 @@ def _get_mcp_tool_names(profile: ProfileRuntime) -> set[str]:
 # ============================================================================
 
 
-def _poll_escalation(profile: ProfileRuntime, call_id: str, tool_name: str) -> str:
-    """Poll for escalation resolution.  Returns 'approve' or 'deny'."""
+def _decision_response_error(result: ApiResult) -> str | None:
+    """Reject invalid decision replies without conflating them with outages."""
+    if result.protocol_error:
+        return result.error or "Invalid API response"
+    if result.data is None and (result.status is None or result.status >= 400):
+        return None  # Transport/HTTP failure, handled by the caller.
+    if not isinstance(result.data, dict):
+        return "Invalid API response: expected a JSON object"
+    decision = result.data.get("decision")
+    if not isinstance(decision, str) or decision not in ("approve", "deny", "escalate"):
+        return (
+            "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
+        )
+    if decision == "escalate":
+        call_id = result.data.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return "Invalid API response: escalation requires a non-empty call_id"
+    return None
 
+
+def _poll_human(
+    invocation: Invocation,
+    label: str,
+    fetch: Callable[[], ApiResult],
+    field_name: str,
+    terminal_values: tuple[str, ...],
+) -> str:
+    """Poll only while the originating invocation and its approval budget live."""
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
-    attempt = 0
     last_reminder = start
+    attempt = 0
+    with invocation.human_wait(label) as heartbeat:
+        while True:
+            invocation.check()
+            now = time.monotonic()
+            if now - last_reminder >= 60.0:
+                logger.warning(
+                    "[intaris] Still waiting for %s... %.0fs elapsed",
+                    label,
+                    now - start,
+                )
+                last_reminder = now
+            # Poll once immediately, then back off in interruptible slices.
+            if attempt:
+                delay = backoff[min(attempt - 1, len(backoff) - 1)]
+                end = time.monotonic() + delay
+                while time.monotonic() < end:
+                    invocation.sleep(min(1.0, end - time.monotonic()))
+                    heartbeat()
+            attempt += 1
+            result = invocation.request(fetch)
+            if result.protocol_error:
+                return "invalid_response"
+            if result.data is None:
+                continue  # Server unreachable; remain within the wait budget.
+            if not isinstance(result.data, dict):
+                return "invalid_response"
+            value = result.data.get(field_name)
+            if field_name == "user_decision":
+                if field_name not in result.data:
+                    return "invalid_response"
+                if value is not None and value not in terminal_values:
+                    return "invalid_response"
+            if value in terminal_values:
+                logger.info("[intaris] %s: %s", label, value)
+                return value
 
-    while True:
-        # Check timeout
-        elapsed = time.monotonic() - start
-        if (
-            profile.cfg.escalation_timeout_s > 0
-            and elapsed > profile.cfg.escalation_timeout_s
-        ):
-            return "timeout"
 
-        # Periodic reminder every 60s
-        now = time.monotonic()
-        if now - last_reminder >= 60.0:
-            logger.warning(
-                "[intaris] Still waiting for escalation approval for %s (%s)... %.0fs elapsed",
-                tool_name,
-                call_id,
-                elapsed,
-            )
-            last_reminder = now
-
-        # Wait with exponential backoff
-        delay = backoff[min(attempt, len(backoff) - 1)]
-        time.sleep(delay)
-        attempt += 1
-
-        # Check resolution
-        result = profile.client.get_audit(call_id)
-        if not result.data:
-            continue  # Server unreachable — keep polling
-
-        user_decision = result.data.get("user_decision")
-        if user_decision == "approve":
-            logger.info("[intaris] Escalation approved: %s (%s)", tool_name, call_id)
-            return "approve"
-        if user_decision == "deny":
-            user_note = result.data.get("user_note", "")
-            note_suffix = f" -- {user_note}" if user_note else ""
-            logger.info(
-                "[intaris] Escalation denied: %s (%s)%s",
-                tool_name,
-                call_id,
-                note_suffix,
-            )
-            return "deny"
-        # No decision yet — continue polling
+def _poll_escalation(
+    profile: ProfileRuntime, call_id: str, tool_name: str, invocation: Invocation
+) -> str:
+    """Poll for escalation resolution within a Hermes human-wait window."""
+    assert profile.client is not None
+    client = profile.client
+    return _poll_human(
+        invocation,
+        f"{tool_name} escalation ({call_id})",
+        lambda: client.get_audit(call_id),
+        "user_decision",
+        ("approve", "deny"),
+    )
+    # No decision yet — continue polling
 
 
 def _poll_session_status(
-    profile: ProfileRuntime, session_id: str, tool_name: str
+    profile: ProfileRuntime, session_id: str, tool_name: str, invocation: Invocation
 ) -> str:
-    """Poll for session reactivation.  Returns 'active', 'terminated', or 'timeout'."""
-
-    backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
-    start = time.monotonic()
-    attempt = 0
-    last_reminder = start
-
-    while True:
-        elapsed = time.monotonic() - start
-        if (
-            profile.cfg.escalation_timeout_s > 0
-            and elapsed > profile.cfg.escalation_timeout_s
-        ):
-            return "timeout"
-
-        now = time.monotonic()
-        if now - last_reminder >= 60.0:
-            logger.warning(
-                "[intaris] Still waiting for session approval... %.0fs elapsed",
-                elapsed,
-            )
-            last_reminder = now
-
-        delay = backoff[min(attempt, len(backoff) - 1)]
-        time.sleep(delay)
-        attempt += 1
-
-        result = profile.client.get_session(session_id)
-        if not result.data:
-            continue
-
-        status = result.data.get("status")
-        if status == "active":
-            return "active"
-        if status == "terminated":
-            return "terminated"
-        # Still suspended — continue polling
+    """Poll for session reactivation within a Hermes human-wait window."""
+    assert profile.client is not None
+    client = profile.client
+    return _poll_human(
+        invocation,
+        f"{tool_name} session reactivation ({session_id})",
+        lambda: client.get_session(session_id),
+        "status",
+        ("active", "terminated"),
+    )
+    # Still suspended — continue polling
 
 
 # ============================================================================
@@ -754,50 +795,46 @@ def _make_guarded_handler(
             }
         return original_handler(args, **kwargs)
 
-    def guarded_handler(args: dict, **kwargs: Any) -> Any:
-        if not profile.active or not profile.ready or _profile_key() != profile.home:
-            return json.dumps(
-                {"error": "[intaris] Tool belongs to a different or unloaded profile"}
-            )
-        if profile.session_start_required.is_set():
-            return json.dumps(
-                {"error": "[intaris] Profile changed; start a fresh Hermes session"}
-            )
+    def evaluate_and_dispatch(
+        args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
+    ) -> Any:
 
-        # Find the active session — use the most recent non-idle session
-        state: SessionState | None = None
-        with profile.sessions_lock:
-            for s in reversed(list(profile.sessions.values())):
-                if s.intaris_session_id:
-                    state = s
-                    if not s.is_idle:
-                        break
-
-        if not state or not state.intaris_session_id:
-            if profile.cfg.fail_open:
-                logger.warning(
-                    "[intaris] No active session for %s — allowing (fail-open)",
-                    tool_name,
-                )
-                return invoke_original(args, **kwargs)
-            return json.dumps(
-                {
-                    "error": f"[intaris] No active Intaris session. Cannot evaluate {tool_name}."
-                }
+        def dispatch(call_id: str = "") -> Any:
+            invocation.check()
+            pending = _queue_pending_tool_result(
+                profile, state, tool_name, args, call_id
             )
+            try:
+                invocation.check()
+            except WaitStopped:
+                # No tool ran, so this invocation must not consume a later result.
+                with profile.sessions_lock:
+                    for i, candidate in enumerate(state.pending_tool_results):
+                        if candidate is pending:
+                            del state.pending_tool_results[i]
+                            break
+                raise
+            return invoke_original(args, **kwargs)
 
         # Evaluate the tool call
         intention_pending = state.intention_pending
-        result = profile.client.evaluate(
-            state.intaris_session_id,
-            tool_name,
-            args,
-            intention_pending=intention_pending,
+        client = profile.client
+        result = invocation.request(
+            lambda: client.evaluate(
+                state.intaris_session_id,
+                tool_name,
+                args,
+                intention_pending=intention_pending,
+            )
         )
 
         # Clear intention_pending after first evaluate
         if intention_pending:
             state.intention_pending = False
+
+        response_error = _decision_response_error(result)
+        if response_error:
+            return json.dumps({"error": f"[intaris] {tool_name}: {response_error}"})
 
         if not result.data:
             # Distinguish config errors (4xx) from transient failures
@@ -811,7 +848,7 @@ def _make_guarded_handler(
                 logger.warning(
                     "[intaris] Evaluate failed for %s — allowing (fail-open)", tool_name
                 )
-                return invoke_original(args, **kwargs)
+                return dispatch()
             return json.dumps(
                 {
                     "error": (
@@ -822,7 +859,7 @@ def _make_guarded_handler(
             )
 
         data = result.data
-        decision = data.get("decision", "deny")
+        decision = data["decision"]
         reasoning = data.get("reasoning", "")
         call_id = data.get("call_id", "")
         risk = data.get("risk", "")
@@ -852,17 +889,21 @@ def _make_guarded_handler(
         )
 
         # Send periodic checkpoint
-        _send_checkpoint(profile, state)
+        _send_checkpoint(profile, state, invocation)
 
         # Update intention after gathering enough context
         if not state.intention_updated and state.call_count >= 3:
             state.intention_updated = True
             try:
-                profile.client.update_session(
-                    state.intaris_session_id,
-                    state.intention,
-                    state.details,
+                invocation.request(
+                    lambda: client.update_session(
+                        state.intaris_session_id,
+                        state.intention,
+                        state.details,
+                    )
                 )
+            except WaitStopped:
+                raise
             except Exception:
                 pass
 
@@ -875,25 +916,28 @@ def _make_guarded_handler(
                     status_reason,
                 )
                 poll_result = _poll_session_status(
-                    profile, state.intaris_session_id, tool_name
+                    profile, state.intaris_session_id, tool_name, invocation
                 )
+                if poll_result == "invalid_response":
+                    return json.dumps({"error": "[intaris] Invalid session response"})
                 if poll_result == "active":
                     # Re-evaluate after reactivation
                     logger.info(
                         "[intaris] Session reactivated — re-evaluating %s",
                         tool_name,
                     )
-                    re_result = profile.client.evaluate(
-                        state.intaris_session_id, tool_name, args
-                    )
-                    if re_result.data and re_result.data.get("decision") == "approve":
-                        _queue_pending_tool_result(
-                            state,
-                            tool_name,
-                            args,
-                            str(re_result.data.get("call_id") or ""),
+                    re_result = invocation.request(
+                        lambda: client.evaluate(
+                            state.intaris_session_id, tool_name, args
                         )
-                        return invoke_original(args, **kwargs)
+                    )
+                    response_error = _decision_response_error(re_result)
+                    if response_error:
+                        return json.dumps(
+                            {"error": f"[intaris] {tool_name}: {response_error}"}
+                        )
+                    if re_result.data and re_result.data.get("decision") == "approve":
+                        return dispatch(str(re_result.data.get("call_id") or ""))
                     if re_result.data and re_result.data.get("decision") == "escalate":
                         re_call_id = str(re_result.data.get("call_id") or "")
                         re_reason = str(
@@ -901,25 +945,20 @@ def _make_guarded_handler(
                                 "reasoning", "Tool call requires human approval"
                             )
                         )
-                        poll_result = _poll_escalation(profile, re_call_id, tool_name)
-                        if poll_result == "approve":
-                            _queue_pending_tool_result(
-                                state, tool_name, args, re_call_id
-                            )
-                            return invoke_original(args, **kwargs)
-                        if poll_result == "deny":
+                        poll_result = _poll_escalation(
+                            profile, re_call_id, tool_name, invocation
+                        )
+                        if poll_result == "invalid_response":
                             return json.dumps(
                                 {
-                                    "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
+                                    "error": f"[intaris] Invalid escalation response ({re_call_id})"
                                 }
                             )
+                        if poll_result == "approve":
+                            return dispatch(re_call_id)
                         return json.dumps(
                             {
-                                "error": (
-                                    f"[intaris] ESCALATION TIMEOUT ({re_call_id}): {re_reason}\n"
-                                    f"No response within {profile.cfg.escalation_timeout_s:.0f}s. "
-                                    f"Approve or deny in the Intaris UI."
-                                )
+                                "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
                             }
                         )
                     re_reason = (
@@ -928,19 +967,9 @@ def _make_guarded_handler(
                         else "re-evaluation failed"
                     )
                     return json.dumps({"error": f"[intaris] DENIED: {re_reason}"})
-                if poll_result == "terminated":
-                    return json.dumps(
-                        {
-                            "error": f"[intaris] Session terminated: {status_reason or 'terminated by user'}"
-                        }
-                    )
-                # Timeout
                 return json.dumps(
                     {
-                        "error": (
-                            f"[intaris] SESSION SUSPENSION TIMEOUT: {status_reason}\n"
-                            f"No response within {profile.cfg.escalation_timeout_s:.0f}s."
-                        )
+                        "error": f"[intaris] Session terminated: {status_reason or 'terminated by user'}"
                     }
                 )
 
@@ -967,28 +996,52 @@ def _make_guarded_handler(
                 call_id,
                 reasoning,
             )
-            poll_result = _poll_escalation(profile, call_id, tool_name)
-            if poll_result == "approve":
-                _queue_pending_tool_result(state, tool_name, args, call_id)
-                return invoke_original(args, **kwargs)
-            if poll_result == "deny":
+            poll_result = _poll_escalation(profile, call_id, tool_name, invocation)
+            if poll_result == "invalid_response":
                 return json.dumps(
-                    {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
+                    {"error": f"[intaris] Invalid escalation response ({call_id})"}
                 )
-            # Timeout
+            if poll_result == "approve":
+                return dispatch(call_id)
             return json.dumps(
-                {
-                    "error": (
-                        f"[intaris] ESCALATION TIMEOUT ({call_id}): {reasoning}\n"
-                        f"No response within {profile.cfg.escalation_timeout_s:.0f}s. "
-                        f"Approve or deny in the Intaris UI."
-                    )
-                }
+                {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
             )
 
         # -- APPROVE -----------------------------------------------------------
-        _queue_pending_tool_result(state, tool_name, args, call_id)
-        return invoke_original(args, **kwargs)
+        if decision == "approve":
+            return dispatch(call_id)
+        return json.dumps({"error": "[intaris] Invalid evaluation response"})
+
+    def guarded_handler(args: dict, **kwargs: Any) -> Any:
+        if not profile.active or not profile.ready or _profile_key() != profile.home:
+            return json.dumps(
+                {"error": "[intaris] Tool belongs to a different or unloaded profile"}
+            )
+        if profile.session_start_required.is_set():
+            return json.dumps(
+                {"error": "[intaris] Profile changed; start a fresh Hermes session"}
+            )
+
+        try:
+            state = _resolve_invocation_session(profile, kwargs.get("session_id"))
+        except ValueError as exc:
+            return json.dumps(
+                {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
+            )
+        # Evaluation and cancellation use the same authoritative session state.
+        invocation = Invocation(state._ended, profile.cfg.escalation_timeout_s)
+        try:
+            invocation.check()
+            return evaluate_and_dispatch(args, state, invocation, **kwargs)
+        except WaitStopped as exc:
+            return json.dumps(
+                {
+                    "error": (
+                        f"[intaris] {exc}. Tool was not executed. "
+                        "Review approval in the Intaris UI, then retry in a new invocation."
+                    )
+                }
+            )
 
     guarded_handler._intaris_original_handler = original_handler
     if is_async:
@@ -1046,21 +1099,28 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                         }
                     )
 
-                # Find active session
-                intaris_session_id: str | None = None
-                with profile.sessions_lock:
-                    for s in reversed(list(profile.sessions.values())):
-                        if s.intaris_session_id:
-                            intaris_session_id = s.intaris_session_id
-                            if not s.is_idle:
-                                break
+                assert profile.client is not None
 
-                if not intaris_session_id:
+                try:
+                    state = _resolve_invocation_session(
+                        profile, kwargs.get("session_id")
+                    )
+                except ValueError as exc:
                     return json.dumps(
-                        {"error": "[intaris] No active session for MCP tool call"}
+                        {"error": f"[intaris] {exc} Cannot call MCP tool {srv}:{tn}."}
                     )
 
-                result = profile.client.call_mcp_tool(intaris_session_id, srv, tn, args)
+                result = profile.client.call_mcp_tool(
+                    state.intaris_session_id, srv, tn, args
+                )
+
+                response_error = _decision_response_error(result)
+                if response_error:
+                    # The server may already have executed the tool. Report the
+                    # invalid reply; do not claim success or retry it here.
+                    return json.dumps(
+                        {"error": f"[intaris] MCP tool call: {response_error}"}
+                    )
 
                 if not result.data:
                     return json.dumps(
@@ -1071,7 +1131,7 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
 
                 data = result.data
                 decision = data.get("decision")
-                content = data.get("content", [])
+                content = data.get("content")
 
                 if decision == "deny":
                     reason = data.get(
@@ -1088,6 +1148,23 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                                 f"[intaris] ESCALATED ({call_id}): {reason}\n"
                                 f"Approve or deny in the Intaris UI, then retry."
                             )
+                        }
+                    )
+
+                # The REST proxy normalizes MCP results to text blocks.
+                if (
+                    not isinstance(content, list)
+                    or any(
+                        not isinstance(c, dict)
+                        or c.get("type") != "text"
+                        or not isinstance(c.get("text"), str)
+                        for c in content
+                    )
+                    or not isinstance(data.get("isError", False), bool)
+                ):
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Invalid MCP response: malformed tool result"
                         }
                     )
 
@@ -1131,6 +1208,8 @@ def _on_session_start(
 ) -> None:
     """on_session_start: Create Intaris session."""
     state = _get_or_create_state(profile, session_id)
+    if state._ended.is_set():
+        state._ended = threading.Event()
     if _ensure_session(profile, session_id, state, platform, model):
         profile.session_start_required.clear()
 
@@ -1156,6 +1235,8 @@ def _on_session_end(
     if not state:
         return
 
+    # Cancel before any completion/recording HTTP can block, including reset/idle.
+    state._ended.set()
     if completed or interrupted:
         _signal_completion(profile, session_id, state)
         with profile.sessions_lock:
@@ -1198,6 +1279,7 @@ def _on_pre_llm_call(
 
     # Resume from idle when user provides new input
     if state.is_idle and user_message:
+        state._ended = threading.Event()
         state.is_idle = False
         try:
             profile.client.update_status(state.intaris_session_id, "active")
@@ -1254,14 +1336,17 @@ def _on_pre_tool_call(
     tool_name: str = "",
     args: dict | None = None,
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     """pre_tool_call: Record tool call event (evaluation happens in wrapper)."""
-    if not task_id:
+    try:
+        _resolve_invocation_session(profile, session_id)
+    except ValueError:
         return
     _record_event(
         profile,
-        task_id,
+        session_id,
         {
             "type": "tool_call",
             "data": {
@@ -1274,7 +1359,7 @@ def _on_pre_tool_call(
                     or ""
                 )
                 or None,
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )
@@ -1286,15 +1371,17 @@ def _on_post_tool_call(
     args: dict | None = None,
     result: Any = "",
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     """post_tool_call: Record tool result."""
-    if not task_id:
+    try:
+        state = _resolve_invocation_session(profile, session_id)
+    except ValueError:
         return
-    state = profile.sessions.get(task_id)
     args_key = _args_fingerprint(args)
     mapped_call_id: str | None = None
-    if state:
+    with profile.sessions_lock:
         # Oldest-match first keeps correlation stable for repeated identical calls.
         for i, candidate in enumerate(state.pending_tool_results):
             if candidate.get("tool") == tool_name and candidate.get("args") == args_key:
@@ -1303,7 +1390,7 @@ def _on_post_tool_call(
                 break
     _record_event(
         profile,
-        task_id,
+        session_id,
         {
             "type": "tool_result",
             "data": {
@@ -1329,7 +1416,7 @@ def _on_post_tool_call(
                     or kwargs.get("error")
                 ),
                 "error": kwargs.get("error"),
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )

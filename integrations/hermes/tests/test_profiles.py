@@ -250,7 +250,10 @@ def runtime(monkeypatch, tmp_path):
         elif req.full_url.endswith("/mcp/tools"):
             result = {"tools": mcp_tools.get(req.host, [])}
         elif req.full_url.endswith("/mcp/call"):
-            result = {"decision": "approve", "content": [{"text": req.host}]}
+            result = {
+                "decision": "approve",
+                "content": [{"type": "text", "text": req.host}],
+            }
         else:
             result = {"ok": True}
         response = io.BytesIO(json.dumps(result).encode())
@@ -313,7 +316,12 @@ def test_existing_wrapper_and_same_session_id_keep_profile_client(runtime, order
 
     for name in ("a", "b"):
         with runtime.profile(name):
-            assert json.loads(handlers[name]({"path": name}))["result"] == name
+            assert (
+                json.loads(handlers[name]({"path": name}, session_id="same-id"))[
+                    "result"
+                ]
+                == name
+            )
     created = requests_for(runtime, "/intention")
     evaluated = requests_for(runtime, "/evaluate")
     assert len(created) == 2
@@ -337,7 +345,9 @@ def test_concurrent_worker_contexts_keep_client_and_sessions(runtime):
     runtime.evaluate_hook.append(lambda: barrier.wait(timeout=5))
 
     def invoke():
-        return runtime.registry.get_entry("read_file").handler({"path": "ok"})
+        return runtime.registry.get_entry("read_file").handler(
+            {"path": "ok"}, session_id="same-id"
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = []
@@ -406,7 +416,7 @@ def test_mcp_exposure_cache_and_captured_handler_are_profile_owned(
         assert runtime.registry.get_entry("private_b") is not None
     with runtime.profile("a"):
         assert runtime.registry.get_entry("private_b") is None
-        assert json.loads(handler({}))["result"] == "a.invalid"
+        assert json.loads(handler({}, session_id="same-id"))["result"] == "a.invalid"
     call = requests_for(runtime, "/mcp/call")[-1]
     assert call["headers"]["Authorization"] == "Bearer key-a"
 
@@ -442,7 +452,9 @@ def test_repeat_registration_does_not_stack_guards_hooks_or_timers(
     with runtime.profile("a"):
         plugin.register(ctx)
         ctx.emit("on_session_start", session_id="same-id")
-        runtime.registry.get_entry("read_file").handler({"path": "ok"})
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "ok"}, session_id="same-id"
+        )
     assert len(requests_for(runtime, "/evaluate")) == 1
     assert all(len(handlers) == 1 for handlers in ctx.hooks.values())
     assert len(Timer.instances) == 1
@@ -479,7 +491,9 @@ def test_session_updates_retain_originating_working_directory(
         b.emit("on_session_start", session_id="same-id")
     with runtime.profile("a"):
         for _ in range(3):
-            runtime.registry.get_entry("read_file").handler({"path": "ok"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "ok"}, session_id="same-id"
+            )
         a.emit("on_session_end", session_id="same-id")
     updates = [
         r
@@ -553,13 +567,28 @@ def test_profile_defaults_and_explicit_empty_false_zero_settings(runtime, monkey
         cb.mcp_tools_cache_ttl_s,
     ) == (0, 2, 3, 40)
     assert [timer.interval for timer in Timer.instances] == [7]
+    # Fail-open remains an availability policy; both calls need valid identity.
+    with runtime.profile("a"):
+        a.emit("on_session_start", session_id="same-id")
+    with runtime.profile("b"):
+        b.emit("on_session_start", session_id="same-id")
+
+    def unavailable(req):
+        if req.full_url.endswith("/evaluate"):
+            raise OSError("synthetic evaluation outage")
+
+    runtime.request_hook.append(unavailable)
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "ok"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "ok"}, session_id="same-id"
+            )
         ) == {"result": "ok"}
     with runtime.profile("b"):
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "ok"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "ok"}, session_id="same-id"
+            )
         )
 
 
@@ -596,7 +625,9 @@ def test_captured_handler_refuses_foreign_profile_even_with_fail_open(runtime):
         handler = runtime.registry.get_entry("read_file").handler
     runtime.register("b")
     with runtime.profile("b"):
-        assert "error" in json.loads(handler({"path": "must-not-run"}))
+        assert "error" in json.loads(
+            handler({"path": "must-not-run"}, session_id="same-id")
+        )
     assert not requests_for(runtime, "/evaluate")
 
 
@@ -615,7 +646,9 @@ def test_profile_secret_scope_overrides_process_environment(runtime, monkeypatch
         ctx = runtime.register(name, env=False)
         with runtime.profile(name):
             ctx.emit("on_session_start", session_id="same-id")
-            runtime.registry.get_entry("read_file").handler({"path": "ok"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "ok"}, session_id="same-id"
+            )
     evaluated = requests_for(runtime, "/evaluate")
     assert [r["url"] for r in evaluated] == [
         "https://a.invalid/api/v1/evaluate",
@@ -635,7 +668,9 @@ def test_reload_keeps_active_session_without_start_replay(
     old = runtime.register("a", {"fail_open": fail_open})
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id", model="original-model")
-        runtime.registry.get_entry("read_file").handler({"path": "before"})
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "before"}, session_id="same-id"
+        )
         old.emit(
             "post_llm_call", session_id="same-id", assistant_response="prior context"
         )
@@ -648,7 +683,9 @@ def test_reload_keeps_active_session_without_start_replay(
                 callback()
         new = runtime.register("a", {"fail_open": fail_open, "checkpoint_interval": 2})
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after"}, session_id="same-id"
+            )
         ) == {"result": "after"}
         new.emit("pre_llm_call", session_id="same-id", user_message="Continue")
         new.emit("on_session_end", session_id="same-id")
@@ -690,8 +727,12 @@ def test_reloading_profile_retires_old_callbacks_and_mcp_exposure(runtime):
         )
         assert runtime.registry.get_entry("old_tool") is None
         new.emit("on_session_start", session_id="same-id")
-        runtime.registry.get_entry("read_file").handler({"path": "ok"})
-        assert "error" in json.loads(handler({"path": "must-not-run"}))
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "ok"}, session_id="same-id"
+        )
+        assert "error" in json.loads(
+            handler({"path": "must-not-run"}, session_id="same-id")
+        )
         timer.fire()
     assert timer.cancelled
     assert len(Timer.instances) == 1
@@ -725,20 +766,26 @@ def test_reload_identity_change_requires_fresh_start(runtime, monkeypatch, chang
         count = len(runtime.requests)
         new.emit("pre_llm_call", session_id="same-id", user_message="Continue")
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "blocked"}, session_id="same-id"
+            )
         )
         assert "error" in json.loads(
-            runtime.registry.get_entry("shared_tool").handler({})
+            runtime.registry.get_entry("shared_tool").handler({}, session_id="same-id")
         )
         assert len(runtime.requests) == count
         # Another reload cannot bypass the requirement for a genuine start.
         new = runtime.register("a", settings)
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "still blocked"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "still blocked"}, session_id="same-id"
+            )
         )
         new.emit("on_session_start", session_id="fresh-session")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "fresh"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "fresh"}, session_id="fresh-session"
+            )
         ) == {"result": "fresh"}
     created = requests_for(runtime, "/intention")
     assert len(created) == 2
@@ -762,12 +809,16 @@ def test_evicted_reload_state_requires_fresh_start(runtime, monkeypatch):
         before = len(runtime.requests)
         ctx.emit("pre_llm_call", session_id="same-id", user_message="Continue")
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "blocked"}, session_id="same-id"
+            )
         )
         assert len(runtime.requests) == before
         ctx.emit("on_session_start", session_id="fresh-id")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "fresh"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "fresh"}, session_id="fresh-id"
+            )
         ) == {"result": "fresh"}
 
 
@@ -785,7 +836,9 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
 
     def invoke():
         with runtime.profile("a"):
-            results.append(json.loads(old_handler({"path": "in flight"})))
+            results.append(
+                json.loads(old_handler({"path": "in flight"}, session_id="same-id"))
+            )
 
     runtime.evaluate_hook.append(hold_evaluation)
     thread = threading.Thread(target=invoke)
@@ -802,7 +855,9 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
         thread.join(5)
     assert results == [{"result": "in flight"}]
     with runtime.profile("a"):
-        runtime.registry.get_entry("read_file").handler({"path": "after"})
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "after"}, session_id="same-id"
+        )
         new.emit("on_session_end", session_id="same-id")
     assert len(requests_for(runtime, "/intention")) == 1
     assert (
@@ -847,7 +902,9 @@ def test_reload_observes_admitted_session_start_completion(runtime, same_identit
     assert not failures
     with runtime.profile("a"):
         result = json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after start"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after start"}, session_id="fresh-session"
+            )
         )
         new.emit("pre_llm_call", session_id="fresh-session", user_message="Continue")
     if same_identity:
@@ -903,7 +960,9 @@ def test_failed_first_load_allows_later_llm_bootstrap(
         # Reload after a failed first attempt does not replay session-start.
         ctx.emit("pre_llm_call", session_id="already-running", user_message="Continue")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "checked"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "checked"}, session_id="already-running"
+            )
         ) == {"result": "checked"}
     created = requests_for(runtime, "/intention")
     assert len(created) == 1
@@ -949,7 +1008,9 @@ def test_failed_reload_keeps_session_for_retry(
         monkeypatch.setattr(Context, "register_hook", original)
         runtime.register("a")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after retry"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after retry"}, session_id="same-id"
+            )
         ) == {"result": "after retry"}
     assert len(requests_for(runtime, "/intention")) == 1
     assert (
@@ -997,7 +1058,9 @@ def test_reload_never_exposes_unguarded_native_tool(
         with runtime.profile("a"):
             before = len(requests_for(runtime, "/evaluate"))
             result = json.loads(
-                runtime.registry.get_entry("read_file").handler({"path": "during"})
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "during"}, session_id="same-id"
+                )
             )
             assert "error" in result
             assert len(requests_for(runtime, "/evaluate")) == before
@@ -1009,14 +1072,18 @@ def test_reload_never_exposes_unguarded_native_tool(
     with runtime.profile("a"):
         before = len(requests_for(runtime, "/evaluate"))
         result = json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after"}, session_id="same-id"
+            )
         )
         assert "error" in result or len(requests_for(runtime, "/evaluate")) > before
         if fail_registration:
             monkeypatch.setattr(plugin, "_register_profile", register)
             replacements.append(runtime.register("a"))
             assert json.loads(
-                runtime.registry.get_entry("read_file").handler({"path": "retry"})
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "retry"}, session_id="same-id"
+                )
             ) == {"result": "retry"}
         # Final explicit unload must still release every guard generation.
         for ctx in [old, *replacements]:
@@ -1037,7 +1104,9 @@ def test_rejected_guard_replacement_keeps_old_guard_installed(runtime, monkeypat
         with pytest.raises(RuntimeError, match="did not register Intaris guard"):
             runtime.register("a", {"fail_open": True})
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "blocked"}, session_id="same-id"
+            )
         )
     assert not requests_for(runtime, "/evaluate")
 
@@ -1076,7 +1145,9 @@ def test_unload_recording_uses_one_total_http_timeout_budget(runtime, monkeypatc
         new = runtime.register("a", {"session_recording": True})
         Timer.instances[-1].fire()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after"}, session_id="session-2"
+            )
         ) == {"result": "after"}
         new.emit("on_session_end", session_id="session-2")
     events = requests_for(runtime, "/events")
@@ -1129,7 +1200,9 @@ def test_reload_waits_for_external_unload_flush_and_cleanup(runtime):
     assert loaded.is_set()
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after"}, session_id="same-id"
+            )
         ) == {"result": "after"}
         for callback in contexts[0].unload:
             callback()
@@ -1193,12 +1266,16 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
                 plugin.register(plugins.PluginContext(manifest, manager))
                 assert len(manager._hooks["on_session_start"]) == 1
     with runtime.profile("a"):
-        runtime.registry.get_entry("read_file").handler({"path": "ok"})
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "ok"}, session_id="same-id"
+        )
         assert runtime.registry.get_entry("b_tool") is None
     # Host unload can be requested from another profile, but releases only A.
     with runtime.profile("b"):
         managers["a"].unload()
-        runtime.registry.get_entry("read_file").handler({"path": "ok"})
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "ok"}, session_id="same-id"
+        )
         assert runtime.registry.get_entry("b_tool") is not None
     with runtime.profile("a"):
         assert runtime.registry.get_entry("a_tool") is None
@@ -1219,7 +1296,9 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
         manager._track_tool_override_policy(manifest, "hermes_intaris")
         plugin.register(plugins.PluginContext(manifest, manager))
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "after reload"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "after reload"}, session_id="same-id"
+            )
         ) == {"result": "after reload"}
         assert (
             requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
@@ -1246,13 +1325,17 @@ def test_legacy_unload_restores_original_tool(runtime, monkeypatch, public_resto
             for callback in previous.unload:
                 callback()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "guarded"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "guarded"}, session_id="same-id"
+            )
         ) == {"result": "guarded"}
         for callback in ctx.unload:
             callback()
             callback()  # Host cleanup may be repeated after a failed reload.
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "restored"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "restored"}, session_id="same-id"
+            )
         ) == {"result": "restored"}
     assert runtime.registry._tools["read_file"] is original
     assert len(requests_for(runtime, "/evaluate")) == 1
@@ -1288,9 +1371,11 @@ def test_legacy_registry_refuses_second_profile_without_redirecting_first(
         runtime.register("b")
     with runtime.profile("a"):
         assert (
-            json.loads(runtime.registry.get_entry("read_file").handler({"path": "ok"}))[
-                "result"
-            ]
+            json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "ok"}, session_id="same-id"
+                )
+            )["result"]
             == "ok"
         )
     assert [r["headers"]["X-user-id"] for r in requests_for(runtime, "/evaluate")] == [
@@ -1329,9 +1414,11 @@ def test_legacy_public_enumerator_does_not_imply_profile_scope(runtime, monkeypa
     with runtime.profile("a"):
         a.emit("on_session_start", session_id="same-id")
         assert (
-            json.loads(runtime.registry.get_entry("read_file").handler({"path": "ok"}))[
-                "result"
-            ]
+            json.loads(
+                runtime.registry.get_entry("read_file").handler(
+                    {"path": "ok"}, session_id="same-id"
+                )
+            )["result"]
             == "ok"
         )
     with pytest.raises(RuntimeError, match="profile-scoped tool registry"):
@@ -1374,7 +1461,10 @@ def test_same_mcp_name_has_profile_specific_schema_and_credentials(runtime):
             tool = runtime.registry.get_entry("shared_tool")
             assert set(tool.schema["parameters"]["properties"]) == {name}
             assert (
-                json.loads(tool.handler({name: "input"}))["result"] == f"{name}.invalid"
+                json.loads(tool.handler({name: "input"}, session_id="same-id"))[
+                    "result"
+                ]
+                == f"{name}.invalid"
             )
     assert [
         r["headers"]["Authorization"] for r in requests_for(runtime, "/mcp/call")
@@ -1564,6 +1654,8 @@ def test_unload_during_discovery_disposes_late_tools_and_timer(runtime):
             "pre_llm_call", session_id="already-running", user_message="Continue"
         )
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler({"path": "recovered"})
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "recovered"}, session_id="already-running"
+            )
         ) == {"result": "recovered"}
     assert len(requests_for(runtime, "/evaluate")) == 1

@@ -18,20 +18,27 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _reject_json_constant(value: str) -> None:
+    """Reject non-JSON numeric constants accepted by the stdlib decoder."""
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 class ApiResult:
     """Result of an API call."""
 
-    __slots__ = ("data", "error", "status")
+    __slots__ = ("data", "error", "status", "protocol_error")
 
     def __init__(
         self,
         data: dict[str, Any] | None = None,
         error: str | None = None,
         status: int | None = None,
+        protocol_error: bool = False,
     ):
         self.data = data
         self.error = error
         self.status = status
+        self.protocol_error = protocol_error
 
 
 class IntarisClient:
@@ -83,7 +90,25 @@ class IntarisClient:
 
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
+                try:
+                    data = json.loads(
+                        raw.decode("utf-8"), parse_constant=_reject_json_constant
+                    )
+                except (ValueError, RecursionError):
+                    # Invalid JSON/UTF-8 is a protocol failure, not an outage.
+                    # Preserve that distinction for retry and fail-open callers.
+                    return ApiResult(
+                        error="Invalid API response: expected a JSON object",
+                        status=resp.status,
+                        protocol_error=True,
+                    )
+                if not isinstance(data, dict):
+                    return ApiResult(
+                        error="Invalid API response: expected a JSON object",
+                        status=resp.status,
+                        protocol_error=True,
+                    )
                 return ApiResult(data=data, status=resp.status)
         except urllib.error.HTTPError as exc:
             raw = ""
@@ -115,7 +140,8 @@ class IntarisClient:
     ) -> ApiResult:
         """Call API with retries and exponential backoff.
 
-        Retries on network errors and 5xx responses.  Does NOT retry 4xx.
+        Retries on network errors and 5xx responses. Does not retry 4xx
+        or invalid protocol responses.
         """
         backoff = [1.0, 2.0, 4.0]
         last: ApiResult = ApiResult(error="no attempts")
@@ -127,8 +153,10 @@ class IntarisClient:
             if last.data is not None:
                 return last
 
-            # 4xx client errors — do not retry
-            if last.status is not None and 400 <= last.status < 500:
+            # Invalid replies and 4xx client errors are not transient outages.
+            if last.protocol_error or (
+                last.status is not None and 400 <= last.status < 500
+            ):
                 return last
 
             # 5xx or network error — retry with backoff (unless last attempt)
