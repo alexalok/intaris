@@ -1171,6 +1171,7 @@ def _is_single_command_read_only(command: str) -> bool:
             "--output",
             "--ext-diff",
             "--textconv",
+            "--filters",
             "--open-files-in-pager",
         )
         if any(

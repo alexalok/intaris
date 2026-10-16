@@ -497,7 +497,14 @@ def test_judge_uses_server_policy_for_existing_admin_session(client):
 
 @pytest.mark.parametrize("tool", ["bash", "terminal"])
 @pytest.mark.parametrize(
-    "command", ["cat README.md", "ls -la", "pwd", "git status --short"]
+    "command",
+    [
+        "cat README.md",
+        "ls -la",
+        "pwd",
+        "git status --short",
+        "git cat-file -p HEAD:README.md",
+    ],
 )
 def test_common_shell_reads_do_not_require_inference(client, tool, command):
     create(client)
@@ -644,6 +651,57 @@ def test_agent_pathname_expansion_reaches_inference(client, tmp_path, tool):
         ),
     ) as inference:
         result = evaluate(client, tool=tool, command="find . *")
+
+    assert result["decision"] == "deny", result
+    assert result["path"] == "llm", result
+    inference.assert_called_once()
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "write"
+    assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("policy", [None, POLICY], ids=["default", "mandatory"])
+@pytest.mark.parametrize(
+    "option", ["--filters", "--filter", "--filte", "--filt", "--fil", "--fi", "--f"]
+)
+def test_git_filter_options_require_evaluation(tmp_path, tool, policy, option):
+    from intaris.classifier import classify
+
+    # Long-option abbreviations and overlaps vary across Git versions.
+    # Check every prefix conservatively without executing configured filters.
+    command = f"git cat-file {option} HEAD:assets/model.bin"
+    assert (
+        classify(
+            tool,
+            {"command": command},
+            session_policy=policy,
+            working_directory=str(tmp_path),
+        ).value
+        == "write"
+    )
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize("option", ["--filters", "--filt"])
+def test_agent_git_filters_reach_inference(client, tmp_path, tool, option):
+    create(client, details={"working_directory": str(tmp_path)})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Git filters can execute commands with side effects",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(
+            client,
+            tool=tool,
+            command=f"git cat-file {option} HEAD:assets/model.bin",
+        )
 
     assert result["decision"] == "deny", result
     assert result["path"] == "llm", result
