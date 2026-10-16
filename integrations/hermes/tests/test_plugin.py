@@ -81,9 +81,13 @@ def _clean_state():
     import hermes_intaris as mod
 
     mod._profiles.clear()
+    mod._retired_sessions.clear()
+    mod._registration_locks.clear()
     _registry._tools.clear()
     yield
     mod._profiles.clear()
+    mod._retired_sessions.clear()
+    mod._registration_locks.clear()
 
 
 @pytest.fixture

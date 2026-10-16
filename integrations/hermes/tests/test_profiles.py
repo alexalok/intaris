@@ -203,6 +203,8 @@ def runtime(monkeypatch, tmp_path):
     # Clean either the baseline's shared state or the isolated implementation.
     if hasattr(plugin, "_profiles"):
         plugin._profiles.clear()
+        plugin._retired_sessions.clear()
+        plugin._registration_locks.clear()
     if hasattr(plugin, "_sessions"):
         plugin._sessions.clear()
         plugin._mcp_tool_cache = None
@@ -273,6 +275,8 @@ def runtime(monkeypatch, tmp_path):
     )
     if hasattr(plugin, "_profiles"):
         plugin._profiles.clear()
+        plugin._retired_sessions.clear()
+        plugin._registration_locks.clear()
 
 
 def requests_for(runtime, suffix):
@@ -604,6 +608,49 @@ def test_profile_secret_scope_overrides_process_environment(runtime, monkeypatch
     ]
 
 
+@pytest.mark.parametrize("unload_first", [False, True])
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_reload_keeps_active_session_without_start_replay(
+    runtime, unload_first, fail_open
+):
+    old = runtime.register("a", {"fail_open": fail_open})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id", model="original-model")
+        runtime.registry.get_entry("read_file").handler({"path": "before"})
+        old.emit(
+            "post_llm_call", session_id="same-id", assistant_response="prior context"
+        )
+    other = runtime.register("b")
+    with runtime.profile("b"):
+        other.emit("on_session_start", session_id="same-id")
+    with runtime.profile("a"):
+        if unload_first:
+            for callback in old.unload:
+                callback()
+        new = runtime.register("a", {"fail_open": fail_open, "checkpoint_interval": 2})
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after"})
+        ) == {"result": "after"}
+        new.emit("pre_llm_call", session_id="same-id", user_message="Continue")
+        new.emit("on_session_end", session_id="same-id")
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 2  # One per profile, none from reload or the LLM hook.
+    sid = created[0]["body"]["session_id"]
+    assert [r["body"]["session_id"] for r in requests_for(runtime, "/evaluate")] == [
+        sid,
+        sid,
+    ]
+    assert requests_for(runtime, "/reasoning")[-1]["body"] == {
+        "session_id": sid,
+        "content": "User message: Continue",
+        "context": "prior context",
+    }
+    assert requests_for(runtime, "/checkpoint")[-1]["body"]["session_id"] == sid
+    assert requests_for(runtime, "/agent-summary")[-1]["url"].endswith(
+        f"/{sid}/agent-summary"
+    )
+
+
 def test_reloading_profile_retires_old_callbacks_and_mcp_exposure(runtime):
     runtime.tools["a.invalid"] = [{"server": "old", "name": "tool"}]
     old = runtime.register("a", {"mcp_tools": True, "session_recording": True})
@@ -633,6 +680,198 @@ def test_reloading_profile_retires_old_callbacks_and_mcp_exposure(runtime):
     assert [r["url"] for r in requests_for(runtime, "/evaluate")] == [
         "https://new.invalid/api/v1/evaluate"
     ]
+
+
+@pytest.mark.parametrize("changed", ["url", "user_id", "agent_id", "api_key", "policy"])
+def test_reload_identity_change_requires_fresh_start(runtime, monkeypatch, changed):
+    settings = {
+        "url": "https://a.invalid",
+        "user_id": "a",
+        "fail_open": True,
+        "mcp_tools": True,
+    }
+    for host in ("a.invalid", "changed.invalid"):
+        runtime.tools[host] = [{"server": "shared", "name": "tool"}]
+    old = runtime.register("a", settings)
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        old.emit("post_llm_call", session_id="same-id", assistant_response="private")
+        if changed == "api_key":
+            runtime.secrets["a"] = {"INTARIS_API_KEY": "changed-key"}
+        elif changed == "policy":
+            monkeypatch.setenv("TMPDIR", "/different-temp-root")
+        else:
+            settings[changed] = "https://changed.invalid" if changed == "url" else "b"
+        new = runtime.register("a", settings)
+        count = len(runtime.requests)
+        new.emit("pre_llm_call", session_id="same-id", user_message="Continue")
+        assert "error" in json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+        )
+        assert "error" in json.loads(
+            runtime.registry.get_entry("shared_tool").handler({})
+        )
+        assert len(runtime.requests) == count
+        # Another reload cannot bypass the requirement for a genuine start.
+        new = runtime.register("a", settings)
+        assert "error" in json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "still blocked"})
+        )
+        new.emit("on_session_start", session_id="fresh-session")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "fresh"})
+        ) == {"result": "fresh"}
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 2
+    assert (
+        requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
+        == (created[-1]["body"]["session_id"])
+    )
+    assert created[0]["body"]["session_id"] != created[1]["body"]["session_id"]
+
+
+def test_evicted_reload_state_requires_fresh_start(runtime, monkeypatch):
+    monkeypatch.setattr(plugin, "MAX_RETIRED_PROFILES", 1)
+    for name in ("a", "b"):
+        ctx = runtime.register(name, {"fail_open": True})
+        with runtime.profile(name):
+            ctx.emit("on_session_start", session_id="same-id")
+        for callback in ctx.unload:
+            callback()
+    with runtime.profile("a"):
+        ctx = runtime.register("a", {"fail_open": True})
+        before = len(runtime.requests)
+        ctx.emit("pre_llm_call", session_id="same-id", user_message="Continue")
+        assert "error" in json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "blocked"})
+        )
+        assert len(runtime.requests) == before
+        ctx.emit("on_session_start", session_id="fresh-id")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "fresh"})
+        ) == {"result": "fresh"}
+
+
+def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
+    old = runtime.register("a")
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        old_handler = runtime.registry.get_entry("read_file").handler
+    entered, release = threading.Event(), threading.Event()
+    results = []
+
+    def hold_evaluation():
+        entered.set()
+        assert release.wait(5)
+
+    def invoke():
+        with runtime.profile("a"):
+            results.append(json.loads(old_handler({"path": "in flight"})))
+
+    runtime.evaluate_hook.append(hold_evaluation)
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a"):
+            new = runtime.register("a")
+            for callback in old.unload:
+                callback()  # Stale cleanup must not retire the new owner.
+    finally:
+        runtime.evaluate_hook.clear()
+        release.set()
+        thread.join(5)
+    assert results == [{"result": "in flight"}]
+    with runtime.profile("a"):
+        runtime.registry.get_entry("read_file").handler({"path": "after"})
+        new.emit("on_session_end", session_id="same-id")
+    assert len(requests_for(runtime, "/intention")) == 1
+    assert (
+        "2 tool calls (2 approved"
+        in requests_for(runtime, "/agent-summary")[-1]["body"]["summary"]
+    )
+
+
+def test_failed_reload_keeps_session_for_retry(runtime, monkeypatch):
+    old = runtime.register("a")
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        original = Context.register_hook
+
+        def fail_registration(*args, **kwargs):
+            raise RuntimeError("synthetic hook registration failure")
+
+        monkeypatch.setattr(Context, "register_hook", fail_registration)
+        with pytest.raises(RuntimeError, match="synthetic hook registration failure"):
+            runtime.register("a")
+        monkeypatch.setattr(Context, "register_hook", original)
+        runtime.register("a")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after retry"})
+        ) == {"result": "after retry"}
+    assert len(requests_for(runtime, "/intention")) == 1
+    assert (
+        requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
+        == (requests_for(runtime, "/intention")[0]["body"]["session_id"])
+    )
+
+
+def test_reload_waits_for_external_unload_flush_and_cleanup(runtime):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        old.emit("post_llm_call", session_id="same-id", assistant_response="before")
+    entered, release, loaded = threading.Event(), threading.Event(), threading.Event()
+    contexts, failures = [], []
+
+    def hold_flush(req):
+        if req.full_url.endswith("/events"):
+            entered.set()
+            assert release.wait(5)
+
+    def unload():
+        try:
+            for callback in old.unload:
+                callback()
+        except Exception as exc:
+            failures.append(exc)
+
+    def reload():
+        try:
+            contexts.append(runtime.register("a", {"session_recording": True}))
+            loaded.set()
+        except Exception as exc:
+            failures.append(exc)
+
+    runtime.request_hook.append(hold_flush)
+    closing, loading = threading.Thread(target=unload), threading.Thread(target=reload)
+    closing.start()
+    try:
+        assert entered.wait(5)
+        loading.start()
+        assert not loaded.wait(0.05)
+        runtime.register("b")  # Unrelated profiles must not wait for A's flush.
+    finally:
+        runtime.request_hook.clear()
+        release.set()
+        closing.join(5)
+        if loading.ident:
+            loading.join(5)
+    assert not failures
+    assert loaded.is_set()
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after"})
+        ) == {"result": "after"}
+        for callback in contexts[0].unload:
+            callback()
+        assert not getattr(
+            runtime.registry.get_entry("read_file").handler,
+            "_intaris_original_handler",
+            None,
+        )
+    assert len(requests_for(runtime, "/intention")) == 1
+    assert len(requests_for(runtime, "/events")) == 1
 
 
 def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkeypatch):
@@ -701,6 +940,21 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
         "b",
     ]
     assert Timer.instances[0].cancelled
+    # Force rediscovery unloads before re-registering, without replaying session start.
+    with runtime.profile("a"):
+        manager = managers["a"]
+        manifest = contexts["a"].manifest
+        manager._track_tool_override_policy(manifest, "hermes_intaris")
+        plugin.register(plugins.PluginContext(manifest, manager))
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "after reload"})
+        ) == {"result": "after reload"}
+        assert (
+            requests_for(runtime, "/evaluate")[-1]["body"]["session_id"]
+            == (requests_for(runtime, "/intention")[0]["body"]["session_id"])
+        )
+        assert len(requests_for(runtime, "/intention")) == 2
+        manager.unload()
     with runtime.profile("b"):
         managers["b"].unload()
 

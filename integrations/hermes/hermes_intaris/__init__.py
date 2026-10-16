@@ -40,6 +40,7 @@ Configuration via profile-scoped Hermes env/credentials and plugin settings:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -61,6 +62,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 MAX_SESSIONS = 100
+MAX_RETIRED_PROFILES = 100
 MAX_RECENT_TOOLS = 10
 
 # ============================================================================
@@ -226,12 +228,33 @@ class ProfileRuntime:
     lifecycle_lock: Any = field(default_factory=threading.RLock, repr=False)
     flush_timer: threading.Timer | None = field(default=None, repr=False)
     registrations: list[Any] = field(default_factory=list, repr=False)
+    closed: threading.Event = field(default_factory=threading.Event, repr=False)
+    session_start_required: bool = False
     active: bool = True
+
+
+@dataclass
+class _SessionContinuity:
+    """Session data retained across unload, without runtime resources or secrets."""
+
+    fingerprint: str
+    sessions: dict[str, SessionState]
+    sessions_lock: Any
+    recording_lock: Any
+    session_start_required: bool
+
+
+def _session_fingerprint(profile: ProfileRuntime) -> str:
+    """Bind retained sessions to the same remote identity and effective policy."""
+    cfg = profile.cfg
+    identity = [cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id, profile.policy]
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
 # Used only to coordinate registration/unload. Calls never resolve a client
 # from a mutable "current profile" pointer.
 _profiles: dict[str, ProfileRuntime] = {}
+_retired_sessions: dict[str, _SessionContinuity] = {}
 _profiles_lock = threading.RLock()
 _registration_locks: dict[str, Any] = {}
 
@@ -725,6 +748,10 @@ def _make_guarded_handler(
             return json.dumps(
                 {"error": "[intaris] Tool belongs to a different or unloaded profile"}
             )
+        if profile.session_start_required:
+            return json.dumps(
+                {"error": "[intaris] Profile changed; start a fresh Hermes session"}
+            )
 
         # Find the active session — use the most recent non-idle session
         state: SessionState | None = None
@@ -997,6 +1024,12 @@ def _register_mcp_tools(profile: ProfileRuntime, ctx: Any) -> None:
                             "error": "[intaris] MCP tool belongs to a different or unloaded profile"
                         }
                     )
+                if profile.session_start_required:
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Profile changed; start a fresh Hermes session"
+                        }
+                    )
 
                 # Find active session
                 intaris_session_id: str | None = None
@@ -1083,7 +1116,8 @@ def _on_session_start(
 ) -> None:
     """on_session_start: Create Intaris session."""
     state = _get_or_create_state(profile, session_id)
-    _ensure_session(profile, session_id, state, platform, model)
+    if _ensure_session(profile, session_id, state, platform, model):
+        profile.session_start_required = False
 
     # Refresh MCP tool cache on session start
     if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
@@ -1136,6 +1170,8 @@ def _on_pre_llm_call(
     Returns ``{"context": "..."}`` to inject behavioral alerts into the
     system prompt when there are cached warnings from recent evaluations.
     """
+    if profile.session_start_required:
+        return None
 
     state = profile.sessions.get(session_id)
     if not state:
@@ -1344,15 +1380,30 @@ def _close_profile(profile: ProfileRuntime) -> None:
             profile.flush_timer.cancel()
             profile.flush_timer = None
         registrations = list(profile.registrations)
-    with profile.sessions_lock:
-        task_ids = list(profile.sessions)
-    for task_id in task_ids:
-        _flush_recording_buffer(profile, task_id)
-    for handle in reversed(registrations):
-        handle.dispose()
-    with _profiles_lock:
-        if _profiles.get(profile.home) is profile:
-            del _profiles[profile.home]
+    try:
+        with profile.sessions_lock:
+            task_ids = list(profile.sessions)
+        for task_id in task_ids:
+            _flush_recording_buffer(profile, task_id)
+        for handle in reversed(registrations):
+            handle.dispose()
+    finally:
+        with _profiles_lock:
+            if _profiles.get(profile.home) is profile:
+                # Keep shared state/locks for already-admitted callbacks, but
+                # never retain the runtime's client, context, tools or timer.
+                _retired_sessions.pop(profile.home, None)
+                _retired_sessions[profile.home] = _SessionContinuity(
+                    _session_fingerprint(profile),
+                    profile.sessions,
+                    profile.sessions_lock,
+                    profile.recording_lock,
+                    profile.session_start_required,
+                )
+                while len(_retired_sessions) > MAX_RETIRED_PROFILES:
+                    _retired_sessions.pop(next(iter(_retired_sessions)))
+                del _profiles[profile.home]
+        profile.closed.set()
 
 
 def _track_registration(profile: ProfileRuntime, handle: Any) -> None:
@@ -1396,6 +1447,7 @@ def register(ctx: Any) -> None:
         "scope" in inspect.signature(registry.register).parameters
     )
     with _profiles_lock:
+        known_home = home in _registration_locks
         registration_lock = _registration_locks.setdefault(home, threading.RLock())
     # Network requests and recording flushes must not hold up another home.
     with registration_lock:
@@ -1408,18 +1460,30 @@ def register(ctx: Any) -> None:
         cfg = _resolve_config(ctx)
         if previous is not None:
             _close_profile(previous)
+            # An external unload may already be flushing/disposing this owner.
+            # Wait here, not in unload: host rollback must remain able to close
+            # an abandoned loader while discovery holds registration_lock.
+            previous.closed.wait()
         profile = ProfileRuntime(
             home=home,
             cfg=cfg,
             context=ctx,
             client=IntarisClient(cfg.url, cfg.api_key, cfg.user_id, cfg.agent_id),
             policy=_build_policy(cfg.allow_paths),
+            session_start_required=known_home,
         )
+        fingerprint = _session_fingerprint(profile)
         with _profiles_lock:
             if not scoped and any(key != home for key in _profiles):
                 raise RuntimeError(
                     "Multiple Intaris profiles require Hermes' profile-scoped tool registry"
                 )
+            retained = _retired_sessions.pop(home, None)
+            if retained is not None and retained.fingerprint == fingerprint:
+                profile.sessions = retained.sessions
+                profile.sessions_lock = retained.sessions_lock
+                profile.recording_lock = retained.recording_lock
+                profile.session_start_required = retained.session_start_required
             _profiles[home] = profile
         try:
             _register_profile(profile, ctx, registry, scoped)
