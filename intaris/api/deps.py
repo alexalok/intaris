@@ -25,6 +25,7 @@ class SessionContext:
     user_id: str
     agent_id: str | None = None
     user_bound: bool = False
+    is_agent: bool = False
 
 
 def get_session_context() -> SessionContext:
@@ -36,7 +37,12 @@ def get_session_context() -> SessionContext:
     Usage in endpoints:
         ctx: SessionContext = Depends(get_session_context)
     """
-    from intaris.server import _session_agent_id, _session_user_bound, _session_user_id
+    from intaris.server import (
+        _session_agent_id,
+        _session_is_agent,
+        _session_user_bound,
+        _session_user_id,
+    )
 
     user_id = _session_user_id.get()
     if not user_id:
@@ -52,4 +58,5 @@ def get_session_context() -> SessionContext:
         user_id=user_id,
         agent_id=_session_agent_id.get(),
         user_bound=_session_user_bound.get(),
+        is_agent=_session_is_agent.get(),
     )

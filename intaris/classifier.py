@@ -374,22 +374,12 @@ def _normalize_unified_diff_path(path_header: str) -> str | None:
 
 
 def extract_bash_paths(command: str) -> list[str]:
-    """Extract absolute paths from a bash command string.
+    """Extract absolute shell paths, preserving quoted filesystem operands.
 
-    Uses a simple regex to find absolute paths. Intentionally
-    conservative — only catches obvious cases like ``cat /etc/shadow``.
-    Does not handle shell variables, tilde expansion, or subshells.
-
-    Args:
-        command: Bash command string.
-
-    Returns:
-        List of absolute path strings found in the command.
+    Known file commands use operand-aware tokenization; quoted search patterns
+    and literal output are not paths. This does not expand shell syntax.
     """
-    # Strip quoted strings first to avoid matching paths inside
-    # string literals that may be data, not filesystem targets.
-    stripped = _strip_quoted_strings(command)
-    return _BASH_ABSOLUTE_PATH_RE.findall(stripped)
+    return _extract_bash_file_paths(command, include_relative=False)
 
 
 def _is_sensitive_path(path: str) -> bool:
@@ -434,19 +424,39 @@ def _is_benign_env_template(basename: str) -> bool:
 
 def extract_sensitive_bash_paths(command: str) -> list[str]:
     """Extract sensitive relative or absolute file operands from shell text."""
+    return [
+        path for path in _extract_bash_file_paths(command) if _is_sensitive_path(path)
+    ]
+
+
+def _extract_bash_file_paths(
+    command: str, *, include_relative: bool = True
+) -> list[str]:
+    """Extract literal operands without discarding quotes or expanding shell text."""
     paths: list[str] = []
     for segment in re.split(r"\|\||&&|[|;&]", command):
+        # Keep existing unquoted-path coverage, including unknown option forms.
+        paths.extend(_BASH_ABSOLUTE_PATH_RE.findall(_strip_quoted_strings(segment)))
         try:
-            tokens = shlex.split(segment)
+            tokens = _unwrap_read_command(shlex.split(segment))
         except ValueError:
-            continue
-        tokens = _unwrap_read_command(tokens)
-        if not tokens or tokens[0] not in _BASH_FILE_OPERAND_COMMANDS:
-            continue
-        for candidate in _file_operands_for_command(tokens):
-            if _is_sensitive_path(candidate):
-                paths.append(candidate)
-    return paths
+            tokens = []
+        if tokens and tokens[0] in _BASH_FILE_OPERAND_COMMANDS:
+            paths.extend(
+                path
+                for path in _file_operands_for_command(tokens)
+                if path and (include_relative or os.path.isabs(path))
+            )
+        elif tokens and tokens[0] not in {"echo", "printf", "tr", "date"}:
+            # Other path-looking arguments are conservative targets; literal
+            # output operands are data, not files.
+            paths.extend(
+                token
+                for token in tokens[1:]
+                if os.path.isabs(token)
+                or (include_relative and token.startswith(("./", "../")))
+            )
+    return list(dict.fromkeys(paths))
 
 
 def _unwrap_read_command(tokens: list[str]) -> list[str]:
@@ -518,16 +528,35 @@ def _file_operands_for_command(tokens: list[str]) -> list[str]:
     command = tokens[0]
     args = tokens[1:]
     if command in {"grep", "rg"}:
-        return _grep_file_operands(args)
+        return _parse_search_arguments(command, args)[0]
     if command == "sed":
         return _sed_file_operands(args)
     if command == "awk":
         return _awk_file_operands(args)
-    return _generic_file_operands(args)
+    return _generic_file_operands(command, args)
 
 
-def _generic_file_operands(args: list[str]) -> list[str]:
-    """Return non-option operands, skipping common option values."""
+def _generic_file_operands(command: str, args: list[str]) -> list[str]:
+    """Return file operands, skipping only command-specific data option values."""
+    # A flag such as cat -n or ls -d takes no value: never discard its file.
+    value_options = {
+        "cut": {
+            "-b",
+            "-c",
+            "-d",
+            "-f",
+            "--bytes",
+            "--characters",
+            "--delimiter",
+            "--fields",
+            "--output-delimiter",
+        },
+        "head": {"-n", "-c", "--lines", "--bytes"},
+        "tail": {"-n", "-c", "--lines", "--bytes"},
+        "diff": {"--label", "-L"},
+        "du": {"-d", "--max-depth"},
+        "stat": {"-c", "--format", "--printf"},
+    }.get(command, set())
     operands: list[str] = []
     skip_next = False
     for index, token in enumerate(args):
@@ -538,46 +567,160 @@ def _generic_file_operands(args: list[str]) -> list[str]:
             operands.extend(arg for arg in args[index + 1 :] if arg)
             break
         if token.startswith("-"):
-            if token in {"-d", "-n", "-c", "-m", "--label", "-L"}:
+            if command == "stat" and not token.startswith("--"):
+                # -c consumes the cluster's remainder or the next argument.
+                # Flags such as -L/-f/-t do not consume file operands.
+                for offset, flag in enumerate(token[1:], start=2):
+                    if flag == "c":
+                        skip_next = offset == len(token)
+                        break
+                continue
+            if token in value_options:
                 skip_next = True
+            option, separator, value = token.partition("=")
+            if (
+                separator
+                and option not in value_options
+                and value.startswith(("/", "./", "../"))
+            ):
+                operands.append(value)
             continue
         operands.append(token)
     return operands
 
 
-def _grep_file_operands(args: list[str]) -> list[str]:
-    """Return grep/rg file operands while skipping the search pattern."""
-    operands: list[str] = []
+# Bounded GNU grep roles: unknown spellings are evaluated, not inferred from
+# arbitrary prefixes. Optional color values are attached-only under getopt_long.
+_GREP_LONG_OPTION_ROLES: dict[str, str] = {
+    "--regexp": "pattern",
+    "--file": "file",
+    "--exclude-from": "auxiliary_file",
+    **dict.fromkeys(
+        (
+            "--after-context",
+            "--before-context",
+            "--context",
+            "--max-count",
+            "--binary-files",
+            "--devices",
+            "--directories",
+            "--exclude",
+            "--exclude-dir",
+            "--include",
+            "--label",
+            "--group-separator",
+        ),
+        "option",
+    ),
+    **dict.fromkeys(("--color", "--colour"), "optional"),
+    **dict.fromkeys(
+        (
+            "--basic-regexp",
+            "--extended-regexp",
+            "--fixed-regexp",
+            "--fixed-strings",
+            "--perl-regexp",
+            "--byte-offset",
+            "--count",
+            "--files-with-matches",
+            "--files-without-match",
+            "--help",
+            "--ignore-case",
+            "--no-ignore-case",
+            "--initial-tab",
+            "--line-buffered",
+            "--line-number",
+            "--line-regexp",
+            "--no-filename",
+            "--no-group-separator",
+            "--no-messages",
+            "--null",
+            "--null-data",
+            "--only-matching",
+            "--quiet",
+            "--recursive",
+            "--dereference-recursive",
+            "--invert-match",
+            "--silent",
+            "--text",
+            "--binary",
+            "--version",
+            "--with-filename",
+            "--word-regexp",
+        ),
+        "flag",
+    ),
+}
+
+
+def _parse_search_arguments(command: str, args: list[str]) -> tuple[list[str], bool]:
+    """Return file operands and whether GNU grep long-option parsing is uncertain."""
+    # Keep the positional slot for a lone "-" until pattern inference. Neither
+    # that pattern nor stdin is a filesystem path, so represent it with None.
+    operands: list[str | None] = []
+    first_positional: int | None = None
     pattern_seen = False
+    patternless = False
     pending_value: str | None = None
+    short_values = {"f": "file", "e": "pattern"}
+    short_values.update(dict.fromkeys("mABC", "option"))
+    short_values.update(dict.fromkeys("gtrTjEM" if command == "rg" else "dD", "option"))
+    unknown_options = False
     for index, token in enumerate(args):
         if pending_value is not None:
-            if pending_value == "file":
-                operands.append(token)
-                pattern_seen = True
-            elif pending_value == "pattern":
+            if pending_value in {"file", "auxiliary_file"}:
+                is_stdin = token == "-" and (
+                    pending_value == "file" or command == "grep"
+                )
+                operands.append(None if is_stdin else token)
+            if pending_value in {"file", "pattern"}:
                 pattern_seen = True
             pending_value = None
             continue
         if token == "--":
             remaining = args[index + 1 :]
-            if not pattern_seen and remaining:
-                remaining = remaining[1:]
-            operands.extend(arg for arg in remaining if arg)
+            if first_positional is None and remaining:
+                first_positional = len(operands)
+            operands.extend(None if arg == "-" else arg for arg in remaining)
             break
-        if token in {"-f", "--file"}:
+        option, separator, value = token.partition("=")
+        if command == "grep" and token.startswith("--"):
+            role = _GREP_LONG_OPTION_ROLES.get(option)
+            if option.startswith("--exclude-f") and "--exclude-from".startswith(option):
+                role = "auxiliary_file"
+            if role is None or (role == "flag" and separator):
+                unknown_options = True
+            elif role == "flag" or (role == "optional" and not separator):
+                pass
+            elif separator:
+                if role in {"file", "auxiliary_file"}:
+                    operands.append(None if value == "-" else value)
+                if role in {"file", "pattern"}:
+                    pattern_seen = True
+            else:
+                pending_value = role
+            continue
+        # Remaining long-option handling is for ripgrep.
+        if command == "rg" and token in {"--files", "--type-list"}:
+            patternless = True
+            continue
+        if option == "--ignore-file":
+            if separator:
+                operands.append(value)
+            else:
+                pending_value = "auxiliary_file"
+            continue
+        if token == "--file":
             pending_value = "file"
             continue
-        attached_file = _attached_option_value(token, "-f", "--file")
-        if attached_file is not None:
-            if attached_file:
-                operands.append(attached_file)
-                pattern_seen = True
+        if token.startswith("--file="):
+            operands.append(None if value == "-" else value)
+            pattern_seen = True
             continue
-        if token in {"-e", "--regexp"}:
+        if token == "--regexp":
             pending_value = "pattern"
             continue
-        if _attached_option_value(token, "-e", "--regexp") is not None:
+        if token.startswith("--regexp="):
             pattern_seen = True
             continue
         if token in {
@@ -589,20 +732,67 @@ def _grep_file_operands(args: list[str]) -> list[str]:
             "--binary-files",
             "--devices",
             "--directories",
-            "-m",
-            "-A",
-            "-B",
-            "-C",
         }:
             pending_value = "option"
             continue
-        if token.startswith("-"):
+        if command == "rg" and token in {
+            "--glob",
+            "--iglob",
+            "--type",
+            "--type-not",
+            "--type-add",
+            "--type-clear",
+            "--encoding",
+            "--threads",
+            "--max-columns",
+            "--replace",
+            "--sort",
+            "--sortr",
+            "--path-separator",
+            "--max-depth",
+            "--max-filesize",
+        }:
+            pending_value = "option"
             continue
-        if not pattern_seen:
-            pattern_seen = True
+        if token != "-" and token.startswith("-") and not token.startswith("--"):
+            # In a short-option cluster, the first value-taking option consumes
+            # the remainder (or the next token): -nf PATH and -nfPATH both read PATH.
+            for offset, option in enumerate(token[1:], start=2):
+                kind = short_values.get(option)
+                if kind is None:
+                    continue
+                value = token[offset:]
+                if not value:
+                    pending_value = kind
+                else:
+                    if kind == "file":
+                        operands.append(None if value == "-" else value)
+                    if kind in {"file", "pattern"}:
+                        pattern_seen = True
+                break
             continue
-        operands.append(token)
-    return operands
+        if token.startswith("--"):
+            continue
+        if first_positional is None:
+            first_positional = len(operands)
+        operands.append(None if token == "-" else token)
+    if command == "grep" and pending_value is not None:
+        unknown_options = True
+    if unknown_options:
+        # Unknown roles invalidate positional-pattern inference, even when the
+        # unknown option appears last. Retain all literals and attached values
+        # as possible paths, including values otherwise parsed as pattern/data.
+        operands.extend(arg for arg in args if arg != "--")
+        operands.extend(
+            arg.partition("=")[2] for arg in args if arg.startswith("--") and "=" in arg
+        )
+    elif not pattern_seen and not patternless and first_positional is not None:
+        # -e/-f may appear after positional operands. Infer a positional pattern
+        # only after all known options have been considered.
+        del operands[first_positional]
+    return list(
+        dict.fromkeys(arg for arg in operands if arg is not None)
+    ), unknown_options
 
 
 def _sed_file_operands(args: list[str]) -> list[str]:
@@ -911,7 +1101,7 @@ def classify(
         return Classification.READ
 
     # Step 6: Check critical patterns (bash only)
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         if command and _is_critical(command):
             return Classification.CRITICAL
@@ -941,8 +1131,8 @@ def resolve_tool_paths(
     """Extract and resolve file paths from tool arguments.
 
     For structured tools (Read, Edit, etc.), extracts paths from known
-    argument keys. For read-only bash commands, also extracts absolute
-    paths from the command string.
+    argument keys. For shell commands, also extracts literal filesystem
+    operands from the command string.
 
     Args:
         tool: Tool name.
@@ -961,12 +1151,11 @@ def resolve_tool_paths(
         if isinstance(patch_text, str) and patch_text:
             raw_paths.extend(extract_apply_patch_paths(patch_text))
 
-    # For bash commands, also extract absolute paths from the command string
-    if tool == "bash":
+    # Shell file operands retain quotes, spaces, and relative path components.
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         if command:
-            raw_paths.extend(extract_bash_paths(command))
-            raw_paths.extend(extract_sensitive_bash_paths(command))
+            raw_paths.extend(_extract_bash_file_paths(command))
 
     if not raw_paths:
         return []
@@ -1041,7 +1230,7 @@ def is_read_only(tool: str, args: dict[str, Any]) -> bool:
 
     Checks the tool name against the built-in read-only allowlist.
     For bash commands, also checks the command string for read-only
-    commands, piped chains, and git subcommands.
+    commands and git subcommands. Compound shell syntax requires evaluation.
 
     This is a pure classification check — it does NOT consider session
     policy, tool preferences, or path policy. Use ``classify()`` for
@@ -1082,7 +1271,7 @@ def is_read_only(tool: str, args: dict[str, Any]) -> bool:
                 return True
 
     # Bash commands (case-sensitive — "bash" is always lowercase)
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         return _is_read_only_bash(args)
 
     return False
@@ -1092,37 +1281,20 @@ def _is_read_only_bash(args: dict[str, Any]) -> bool:
     """Check if a bash command is read-only.
 
     Parses the command to extract the base command and checks against
-    the read-only allowlist. Special handling for git subcommands,
-    sed -i (write), and piped commands.
+    the read-only allowlist. Compound syntax, executable scripts, and
+    state-changing options require evaluation.
     """
     command = _extract_bash_command(args)
     if not command:
         return False
 
-    # Handle piped commands: ALL commands in the pipe must be read-only
-    if "|" in command:
-        parts = command.split("|")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
-
-    # Handle chained commands (&&, ;) and background (&)
-    for sep in ("&&", ";"):
-        if sep in command:
-            parts = command.split(sep)
-            return all(
-                _is_single_command_read_only(part.strip())
-                for part in parts
-                if part.strip()
-            )
-
-    # Background execution: 'cmd1 & cmd2' — both must be read-only.
-    # Check after && to avoid splitting on && first.
-    if " & " in command or command.endswith(" &"):
-        parts = command.split("&")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
+    # Fast paths cover simple commands only. Shell control flow, expansion,
+    # and redirection require evaluation even when the first command is safe.
+    # Brace/pathname expansion can synthesize write/exec options that
+    # shlex misses. Reject glob syntax (including extglob parentheses),
+    # braces, and quoted/escaped forms conservatively.
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
+        return False
 
     return _is_single_command_read_only(command)
 
@@ -1133,6 +1305,10 @@ _REDIRECT_OPS: set[str] = {">", ">>", "2>", "2>>", "&>", "&>>", "<", "<<"}
 
 def _is_single_command_read_only(command: str) -> bool:
     """Check if a single (non-piped, non-chained) command is read-only."""
+    # Mixed/remaining shell control syntax is not a simple command.
+    if any(char in command for char in ";&|\n\r`${}*?[]()"):
+        return False
+
     # Check for shell redirection BEFORE shlex.split, since shlex treats
     # > as a regular token. We scan the raw command for redirect operators.
     if _has_shell_redirect(command):
@@ -1147,19 +1323,65 @@ def _is_single_command_read_only(command: str) -> bool:
     if not tokens:
         return False
 
+    # Tilde prefixes depend on the client shell/user, never the server host.
+    # shlex strips quoting, so quoted/escaped prefixes are conservative too.
+    # Mid-token tildes (HEAD~1, file~suffix) are literal and remain eligible.
+    if any(token.startswith("~") for token in tokens):
+        return False
+
     base_cmd = tokens[0]
+    if base_cmd == "grep" and _parse_search_arguments(base_cmd, tokens[1:])[1]:
+        return False
+
+    # Script interpreters, pagers, and interactive tools can execute programs
+    # or write files. Route them through evaluation instead of a prefix allow.
+    if base_cmd in {"awk", "sed", "yq", "less", "more", "top", "fd"}:
+        return False
+    if base_cmd == "env" and len(tokens) != 1:
+        return False
+    if base_cmd == "find" and any(
+        t.startswith(("-exec", "-ok", "-delete", "-fprint", "-fls")) for t in tokens[1:]
+    ):
+        return False
+    if base_cmd == "rg" and any(
+        t.startswith(("--pre", "--hostname-bin")) for t in tokens[1:]
+    ):
+        return False
+    # These utilities have output-file/command options (including abbreviated
+    # long options). Only plain operands are eligible for the fast path.
+    if base_cmd in {"sort", "tree", "file", "uniq"}:
+        if any(t.startswith("-") and t != "-" for t in tokens[1:]):
+            return False
+        if base_cmd == "uniq" and len(tokens) > 2:
+            return False
+    if base_cmd == "date" and not (
+        len(tokens) == 1 or (len(tokens) == 2 and tokens[1].startswith("+"))
+    ):
+        return False
+    if base_cmd == "hostname" and len(tokens) != 1:
+        return False
 
     # Git: check subcommand
     if base_cmd == "git" and len(tokens) > 1:
         subcommand = tokens[1]
+        unsafe_options = (
+            "--output",
+            "--ext-diff",
+            "--textconv",
+            "--filters",
+            "--open-files-in-pager",
+        )
+        if any(
+            t.startswith("--")
+            and len(t) > 2
+            and any(option.startswith(t.split("=", 1)[0]) for option in unsafe_options)
+            for t in tokens[2:]
+        ):
+            return False
         if subcommand in _READ_ONLY_GIT_SUBCOMMANDS:
             return True
         if subcommand in _GIT_SUBCOMMANDS_WITH_CHECKS:
             return _is_git_subcommand_read_only(subcommand, tokens[2:])
-        return False
-
-    # sed with -i flag is a write operation
-    if base_cmd == "sed" and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
         return False
 
     # python/node are not read-only by default (can execute arbitrary code)
@@ -1171,30 +1393,8 @@ def _is_single_command_read_only(command: str) -> bool:
 
 
 def _has_shell_redirect(command: str) -> bool:
-    """Check if a command contains shell redirection operators.
-
-    Scans the raw command string for output/input redirection that would
-    make an otherwise read-only command into a write operation.
-    Examples: 'ls > file.txt', 'echo data >> log', 'cat < input'.
-
-    Uses regex to avoid false positives inside quoted strings.
-    """
-    # Match redirection operators NOT inside quotes.
-    # This is a simplified check — it won't catch all edge cases with
-    # nested quoting, but covers the common attack vectors.
-    # Pattern: unquoted >, >>, 2>, 2>>, &>, &>>, <, <<
-    return bool(
-        re.search(
-            r"""(?<!['"\\])"""  # Not preceded by quote or escape
-            r"(?:"
-            r"\d*>>?"  # [n]> or [n]>>
-            r"|&>>"  # &>>
-            r"|&>"  # &>
-            r"|<<?(?!<)"  # < or << (but not <<<)
-            r")",
-            command,
-        )
-    )
+    """Conservatively reject redirection, including adjacent quoted operands."""
+    return "<" in command or ">" in command
 
 
 def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
@@ -1218,7 +1418,18 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         config_args = set(remaining)
         read_flags = {"--get", "--get-all", "--list", "-l"}
         if config_args & read_flags:
-            return True
+            safe_flags = read_flags | {
+                "--show-origin",
+                "--show-scope",
+                "--global",
+                "--local",
+                "--system",
+                "--null",
+                "-z",
+            }
+            return all(
+                not arg.startswith("-") or arg in safe_flags for arg in remaining
+            )
         return False
 
     if subcommand == "branch":
@@ -1265,7 +1476,10 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         if not remaining:
             return True
         if remaining[0] in ("-l", "--list"):
-            return True
+            return all(
+                not arg.startswith("-") or arg in {"-l", "--list", "-n"}
+                for arg in remaining
+            )
         return False
 
     if subcommand == "remote":
@@ -1277,7 +1491,7 @@ def _is_git_subcommand_read_only(subcommand: str, remaining: list[str]) -> bool:
         if not remaining:
             return True
         if remaining[0] in ("-v", "--verbose"):
-            return True
+            return len(remaining) == 1
         if remaining[0] in ("show", "get-url"):
             return True
         return False
@@ -1324,7 +1538,7 @@ def _check_session_policy_deny(
     if tool in deny_tools:
         return Classification.CRITICAL
 
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         deny_commands = policy.get("deny_commands", [])
         for pattern in deny_commands:
@@ -1344,7 +1558,7 @@ def _check_session_policy_allow(
     if tool in allow_tools:
         return Classification.READ
 
-    if tool == "bash":
+    if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         allow_commands = policy.get("allow_commands", [])
         for pattern in allow_commands:

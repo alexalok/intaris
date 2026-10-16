@@ -33,7 +33,11 @@ from typing import Any
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
 from intaris.llm import LLMClient, parse_json_response
-from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
+from intaris.policy import (
+    effective_policy_for_evaluator,
+    normalized_policy_clauses,
+    policy_for_session,
+)
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
@@ -1322,6 +1326,7 @@ class JudgeReviewer:
         *,
         llm: LLMClient,
         config: JudgeConfig,
+        agent_policy: dict[str, Any] | None = None,
         audit_store: Any,
         session_store: Any,
         evaluator: Any,
@@ -1334,6 +1339,7 @@ class JudgeReviewer:
     ) -> None:
         self._llm = llm
         self._config = config
+        self._agent_policy = agent_policy
         self._audit = audit_store
         self._sessions = session_store
         self._evaluator = evaluator
@@ -1557,6 +1563,7 @@ class JudgeReviewer:
         session = await asyncio.to_thread(
             self._sessions.get, session_id, user_id=user_id
         )
+        session["policy"] = policy_for_session(session, self._agent_policy)
 
         # Load rich context (30 recent records including reasoning)
         recent_history = await asyncio.to_thread(

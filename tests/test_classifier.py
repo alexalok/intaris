@@ -13,6 +13,7 @@ from intaris.classifier import (
     is_path_within,
     is_read_only,
     resolve_path,
+    resolve_tool_paths,
 )
 
 
@@ -96,7 +97,7 @@ class TestReadOnlyBash:
             "cat README.md",
             "head -n 10 file.txt",
             "tail -f log.txt",
-            "find . -name '*.py'",
+            "find . -name README.md",
             "tree src/",
             "wc -l file.txt",
             "grep -r 'pattern' .",
@@ -179,7 +180,12 @@ class TestReadOnlyBash:
         assert classify("bash", {"command": "git tag"}) == Classification.READ
         assert classify("bash", {"command": "git tag -l"}) == Classification.READ
         assert classify("bash", {"command": "git tag --list"}) == Classification.READ
-        assert classify("bash", {"command": "git tag -l 'v1.*'"}) == Classification.READ
+        assert classify("bash", {"command": "git tag -l 'v1.0'"}) == Classification.READ
+
+    @pytest.mark.parametrize("command", ["find . -name '*.py'", "git tag -l 'v1.*'"])
+    def test_quoted_globs_require_evaluation(self, command: str):
+        """Quoted patterns conservatively follow the same path as shell globs."""
+        assert classify("bash", {"command": command}) == Classification.WRITE
 
     def test_git_tag_write(self):
         """git tag with create/delete args is write."""
@@ -244,10 +250,10 @@ class TestReadOnlyBash:
             == Classification.WRITE
         )
 
-    def test_sed_without_i_is_read(self):
+    def test_sed_scripts_require_evaluation(self):
         assert (
             classify("bash", {"command": "sed 's/a/b/' file.txt"})
-            == Classification.READ
+            == Classification.WRITE
         )
 
     def test_sed_with_i_is_write(self):
@@ -270,10 +276,11 @@ class TestReadOnlyBash:
     def test_piped_commands_all_read(self):
         assert (
             classify("bash", {"command": "cat file.txt | grep pattern"})
-            == Classification.READ
+            == Classification.WRITE
         )
         assert (
-            classify("bash", {"command": "ls -la | sort | head"}) == Classification.READ
+            classify("bash", {"command": "ls -la | sort | head"})
+            == Classification.WRITE
         )
 
     def test_piped_commands_with_write(self):
@@ -283,7 +290,7 @@ class TestReadOnlyBash:
         )
 
     def test_chained_commands_all_read(self):
-        assert classify("bash", {"command": "ls && pwd"}) == Classification.READ
+        assert classify("bash", {"command": "ls && pwd"}) == Classification.WRITE
 
     def test_chained_commands_with_write(self):
         assert (
@@ -292,7 +299,7 @@ class TestReadOnlyBash:
 
     def test_background_commands_all_read(self):
         # Both commands in background execution must be read-only
-        assert classify("bash", {"command": "ls & pwd"}) == Classification.READ
+        assert classify("bash", {"command": "ls & pwd"}) == Classification.WRITE
 
     def test_background_commands_with_write(self):
         # 'rm -rf /' matches critical pattern, so the whole command is CRITICAL
@@ -321,10 +328,11 @@ class TestReadOnlyBash:
         """Input redirection is detected (< operator)."""
         assert classify("bash", {"command": "sort < input.txt"}) == Classification.WRITE
 
-    def test_no_false_positive_redirect(self):
-        """Comparison operators in quoted strings should not trigger redirect."""
-        # grep with > inside quotes should still be read-only
-        assert classify("bash", {"command": "grep '>' file.txt"}) == Classification.READ
+    def test_quoted_redirect_symbols_require_evaluation(self):
+        """Quoted metacharacters also defer to the conservative evaluator."""
+        assert (
+            classify("bash", {"command": "grep '>' file.txt"}) == Classification.WRITE
+        )
 
     def test_empty_command(self):
         assert classify("bash", {"command": ""}) == Classification.WRITE
@@ -571,7 +579,7 @@ class TestBashPathExtraction:
         assert extract_bash_paths("ls -la") == []
 
     def test_ignores_quoted_paths(self):
-        """Paths inside quotes are stripped before extraction."""
+        """Quoted echo operands are literal data, not filesystem targets."""
         paths = extract_bash_paths("echo '/etc/shadow'")
         assert "/etc/shadow" not in paths
 
@@ -848,7 +856,6 @@ class TestPathClassification:
             "cat certs/keycloak.pem",
             "diff --label .env old new",
             "grep needle --exclude .env README.md",
-            "awk '{print}' label=.env README.md",
             "cat path=.env",
         ],
     )
@@ -1092,3 +1099,758 @@ class TestIsReadOnly:
         assert is_read_only("sequentialthinking_sequentialthinking", {})
         assert is_read_only("sequentialthinking:sequentialthinking", {})
         assert is_read_only("mcp__sequentialthinking__sequentialthinking", {})
+
+
+class TestQuotedShellFileOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,target",
+        [
+            ('cat "/etc/passwd"', "/etc/passwd"),
+            ("cat '/etc/passwd'", "/etc/passwd"),
+            ('cat /etc/"passwd"', "/etc/passwd"),
+            ('cat -n "/etc/passwd"', "/etc/passwd"),
+            ('ls -d "/etc/passwd"', "/etc/passwd"),
+            ('head -n 5 "/etc/passwd"', "/etc/passwd"),
+            ('tail -c 5 "/etc/passwd"', "/etc/passwd"),
+            ('grep "root" "/etc/passwd"', "/etc/passwd"),
+            ('rg -f "/etc/passwd" README.md', "/etc/passwd"),
+            ('diff README.md "/etc/passwd"', "/etc/passwd"),
+            ('wc -l "/etc/passwd"', "/etc/passwd"),
+            ('du -L "/etc/passwd"', "/etc/passwd"),
+            ('cut -d ":" -f 1 "/etc/passwd"', "/etc/passwd"),
+            ('sort "/etc/passwd"', "/etc/passwd"),
+            ('stat "/etc/passwd"', "/etc/passwd"),
+            ('file "/etc/passwd"', "/etc/passwd"),
+            ('tree "/etc/passwd"', "/etc/passwd"),
+            ('cat "/etc/config file"', "/etc/config file"),
+            (r"cat /etc/config\ file", "/etc/config file"),
+            ('cat "../../etc/passwd"', "/etc/passwd"),
+            ('du --files0-from="/etc/passwd"', "/etc/passwd"),
+            ("du --files0-from=/etc/passwd", "/etc/passwd"),
+            ('find "/etc/passwd"', "/etc/passwd"),
+            ('df "/etc/passwd"', "/etc/passwd"),
+            ('jq ".key" "/etc/passwd"', "/etc/passwd"),
+            ('git diff --no-index "/etc/passwd" README.md', "/etc/passwd"),
+            ('find "../../etc/passwd"', "/etc/passwd"),
+        ],
+    )
+    def test_quoted_operands_obey_deny_and_boundary(self, tool, command, target):
+        args = {"command": command}
+        directory = "/tmp/project"
+        resolved = resolve_tool_paths(tool, args, directory)
+        assert target in resolved
+        assert classify(tool, args, working_directory=directory) == Classification.WRITE
+        # Explicit denies retain priority over even an operator tool allow.
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory=directory,
+                session_policy={"deny_paths": ["/etc/*"], "allow_tools": [tool]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "/etc/passwd"',
+            'grep "/etc/passwd" README.md',
+            'rg -e "/etc/passwd" README.md',
+            'cut -d "/" -f 1 README.md',
+            'cat "README.md"',
+            'cat "docs/read me.txt"',
+            'ls -d "docs"',
+            'head -n 5 "README.md"',
+            'diff --label "/etc/passwd" README.md other.md',
+            'stat --format "/etc/passwd" README.md',
+            'tr "/etc/passwd" "x"',
+            'date "+/etc/passwd"',
+        ],
+    )
+    def test_quoted_data_and_in_project_files_stay_read(self, tool, command):
+        assert (
+            classify(
+                tool,
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    def test_absolute_extractor_preserves_complete_quoted_operand(self):
+        assert "/etc/config file" in extract_bash_paths('cat "/etc/config file"')
+
+
+class TestSearchFileOptionOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-nf "/etc/passwd" README.md',
+            '-nFf "/etc/passwd" README.md',
+            '-nf"/etc/passwd" README.md',
+            '-nFf"/etc/passwd" README.md',
+            '-nxvf "/etc/passwd" README.md',
+            '"/etc/passwd" -nf patterns.txt',
+            '"/etc/passwd" -ne root',
+            '-n -f "/etc/passwd" README.md',
+            '-n --file "/etc/passwd" README.md',
+            '-n --file="/etc/passwd" README.md',
+            '-nf patterns.txt -- "/etc/passwd"',
+        ],
+    )
+    def test_search_file_flags_keep_every_path(self, tool, command, arguments):
+        args = {"command": f"{command} {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-ne "/etc/passwd" README.md',
+            '-ne"/etc/passwd" README.md',
+            '-n --regexp="/etc/passwd" README.md',
+            '-n --regexp "/etc/passwd" README.md',
+            "-nf patterns.txt README.md",
+        ],
+    )
+    def test_search_pattern_values_remain_data(self, tool, command, arguments):
+        assert (
+            classify(
+                tool,
+                {"command": f"{command} {arguments}"},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'grep -nE "/etc/passwd" README.md',
+            'rg -nE utf-8 "/etc/passwd" README.md',
+            'rg -nrf "/etc/passwd" README.md',
+        ],
+    )
+    def test_search_cluster_stops_at_first_option_value(self, command):
+        assert (
+            classify(
+                "terminal",
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+
+class TestRipgrepPatternlessOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--files "/etc/private"',
+            '--files --hidden "/etc/private"',
+            '--files -uuu "/etc/private"',
+            '--files -g txt "/etc/private"',
+            '--files --glob txt "/etc/private"',
+            '--files --iglob txt "/etc/private"',
+            '--files --type-add custom:txt "/etc/private"',
+            '--files --type-list "/etc/private"',
+            '"/etc/private" --files',
+            '--files -- "/etc/private"',
+            "--files /etc/private",
+        ],
+    )
+    def test_ripgrep_files_keeps_first_directory(self, tool, arguments):
+        args = {"command": f"rg {arguments}"}
+        assert "/etc/private" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--files "docs"',
+            '--files -g "/etc/private" "docs"',
+            '--files --glob "/etc/private" "docs"',
+            '--files --iglob "/etc/private" "docs"',
+            '--files --glob="/etc/private" "docs"',
+            '--files --type-add "custom:/etc/private" "docs"',
+            '--files --path-separator "/" "docs"',
+            "--type-list",
+            '--files-with-matches "/etc/private" README.md',
+            '--files-without-match "/etc/private" README.md',
+            '-e "--files" README.md',
+            '-- "--files" README.md',
+        ],
+    )
+    def test_ripgrep_file_modes_preserve_data_and_search_patterns(
+        self, tool, arguments
+    ):
+        assert (
+            classify(
+                tool,
+                {"command": f"rg {arguments}"},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+
+class TestStatFormatOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-c "/etc/passwd" README.md',
+            '-c"/etc/passwd" README.md',
+            '--format "/etc/passwd" README.md',
+            '--format="/etc/passwd" README.md',
+            '--printf "/etc/passwd" README.md',
+            '-c "/etc/passwd" -- README.md',
+        ],
+    )
+    def test_stat_quoted_formats_are_data(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        ['-c "%n" "/etc/passwd"', '-c "%n" -- "/etc/passwd"', '-f "/etc/passwd"'],
+    )
+    def test_stat_format_flag_does_not_hide_actual_files(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+
+class TestSearchAuxiliaryFiles:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,option,target",
+        [
+            ("grep", "--exclude-f", "README.md"),
+            ("grep", "--exclude-fr", "README.md"),
+            ("grep", "--exclude-fro", "README.md"),
+            ("grep", "--exclude-from", "README.md"),
+            ("rg", "--ignore-file", "."),
+        ],
+    )
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_search_files_obey_path_policy(
+        self, tool, command, option, target, separator
+    ):
+        args = {
+            "command": f'{command} {option}{separator}"/etc/passwd" pattern {target}'
+        }
+        paths = resolve_tool_paths(tool, args, "/tmp/project")
+        assert "/etc/passwd" in paths
+        assert "/tmp/project/pattern" not in paths
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,option",
+        [
+            ("grep", "--exclude-f"),
+            ("grep", "--exclude-fr"),
+            ("grep", "--exclude-fro"),
+            ("grep", "--exclude-from"),
+            ("rg", "--ignore-file"),
+        ],
+    )
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_file_does_not_supply_search_pattern(
+        self, tool, command, option, separator
+    ):
+        args = {
+            "command": f'{command} {option}{separator}"ignore.txt" "/etc/passwd" README.md'
+        }
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/ignore.txt",
+            "/tmp/project/README.md",
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_file_preserves_ripgrep_listing_directory(self, tool, separator):
+        args = {
+            "command": f'rg --files --ignore-file{separator}"ignore.txt" "/etc/private"'
+        }
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/ignore.txt",
+            "/etc/private",
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'grep --exclude="/etc/passwd" root README.md',
+            'grep --exclude "/etc/passwd" root README.md',
+            'grep --exclude-dir="/etc/passwd" root README.md',
+            'grep --exclude-dir "/etc/passwd" root README.md',
+            'grep -e "--exclude-f=/etc/passwd" README.md',
+            'grep -- "--exclude-f=/etc/passwd" README.md',
+        ],
+    )
+    def test_inline_exclusions_and_literal_patterns_remain_data(self, tool, command):
+        args = {"command": command}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+
+class TestTildeShellExpansion:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat ~",
+            "cat ~/notes.txt",
+            "cat ~alex/notes.txt",
+            "cat ~+/notes.txt",
+            "cat ~-/notes.txt",
+            "cat ~1/notes.txt",
+            "cat ~+1/notes.txt",
+            "cat ~-1/notes.txt",
+            'cat "~alex/notes.txt"',
+            r"cat \~alex/notes.txt",
+        ],
+    )
+    def test_tilde_syntax_requires_evaluation(self, tool, command):
+        assert (
+            classify(
+                tool,
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": []},
+            )
+            == Classification.WRITE
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat notes.txt",
+            'cat "notes file.txt"',
+            "pwd",
+            "git diff HEAD~1",
+            "cat path/name~suffix",
+            "cat notes~.txt",
+            "cat ./~alex/notes.txt",
+            'cat "path/name~suffix"',
+        ],
+    )
+    def test_literal_reads_without_expansion_remain_fast(self, tool, command):
+        assert (
+            classify(tool, {"command": command}, working_directory="/tmp/project")
+            == Classification.READ
+        )
+
+
+class TestStatClusterFormats:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-Lc "/etc/passwd" README.md',
+            '-fLc "/etc/passwd" README.md',
+            '-Ltc "/etc/passwd" -- README.md',
+            '-Lc"/etc/passwd" README.md',
+            '-L -c "/etc/passwd" README.md',
+        ],
+    )
+    def test_clustered_stat_formats_remain_data(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-Lc "%n" "/etc/passwd"',
+            '-Lc"%n" -- "/etc/passwd"',
+            '-Lcfoc "/etc/passwd"',
+            '-Lft "/etc/passwd"',
+        ],
+    )
+    def test_stat_cluster_keeps_actual_file_operand(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+
+class TestGrepUnknownLongOptions:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("option", ["--reg", "--rege", "--regex", "--regexp"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_pattern_option_prefixes_never_hide_files(self, tool, option, separator):
+        args = {"command": f'grep {option}{separator}"root" "/etc/passwd"'}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,possible_path",
+        [
+            ('grep --reg="root" README.md', "/tmp/project/README.md"),
+            ("grep --rec root README.md", "/tmp/project/root"),
+            ("grep --line-n root README.md", "/tmp/project/root"),
+            ('grep --fil="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --lab "/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --excl="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future "/etc/passwd" README.md', "/etc/passwd"),
+            ('grep "/etc/passwd" README.md --future', "/etc/passwd"),
+            ('grep --future --regexp="/etc/passwd" README.md', "/etc/passwd"),
+            ('grep --future -e "/etc/passwd" README.md', "/etc/passwd"),
+            ('grep --recursive="/etc/passwd" root README.md', "/etc/passwd"),
+            ('grep --future="../outside.txt" root README.md', "/tmp/outside.txt"),
+            ('grep --future "../outside.txt" README.md', "/tmp/outside.txt"),
+            ("grep --color=auto --future", "/tmp/project/auto"),
+        ],
+    )
+    def test_unparsed_long_options_evaluate_and_keep_possible_operands(
+        self, tool, command, possible_path
+    ):
+        args = {"command": command}
+        assert possible_path in resolve_tool_paths(tool, args, "/tmp/project")
+        assert classify(tool, args) == Classification.WRITE
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": [possible_path]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '--regexp "root" README.md',
+            '--regexp="/etc/passwd" README.md',
+            "--file patterns.txt README.md",
+            '--exclude-from ignore.txt "/etc/passwd" README.md',
+            '--label "/etc/passwd" root README.md',
+            '--group-separator="/etc/passwd" root README.md',
+            '--exclude "/etc/passwd" root README.md',
+            '--include="/etc/passwd" root README.md',
+            '--directories skip "/etc/passwd" README.md',
+            '--binary-files text "/etc/passwd" README.md',
+            '--max-count 2 "/etc/passwd" README.md',
+            '--after-context 1 "/etc/passwd" README.md',
+            '--before-context=1 "/etc/passwd" README.md',
+            '--context 2 "/etc/passwd" README.md',
+            '--color "/etc/passwd" README.md',
+            '--colour=always "/etc/passwd" README.md',
+            '--line-number --ignore-case --fixed-strings "/etc/passwd" README.md',
+            '--recursive --with-filename "/etc/passwd" README.md',
+        ],
+    )
+    def test_supported_full_option_roles_remain_fast(self, tool, arguments):
+        args = {"command": f"grep {arguments}"}
+        assert "/etc/passwd" not in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-ne "--future=/etc/passwd" README.md',
+            '--regexp "--future=/etc/passwd" README.md',
+            '--label "--future=/etc/passwd" root README.md',
+            '-- "--future=/etc/passwd" README.md',
+        ],
+    )
+    def test_option_shaped_data_does_not_trigger_fallback(self, tool, arguments):
+        args = {"command": f"grep {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("option", ["--regexp", "--file", "--label"])
+    def test_missing_long_option_value_requires_evaluation(self, tool, option):
+        assert classify(tool, {"command": f"grep {option}"}) == Classification.WRITE
+
+
+class TestSearchHyphenOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "pattern", ["-", "'-'", '"-"', r"\-", "-n -", "-- -", "-e -"]
+    )
+    def test_lone_hyphen_pattern_preserves_target_file(self, tool, command, pattern):
+        args = {"command": f'{command} {pattern} "/etc/passwd"'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == ["/etc/passwd"]
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize("arguments", ["root -", "-e root -", "-f -", "--file=-"])
+    def test_stdin_operand_does_not_hide_following_file(self, tool, command, arguments):
+        args = {"command": f'{command} {arguments} "/etc/passwd"'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == ["/etc/passwd"]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments,paths",
+        [
+            ("root -", []),
+            ("root -- -", []),
+            ("- -", []),
+            ("-- - -", []),
+            ("-e - -", []),
+            ("-f - README.md", ["/tmp/project/README.md"]),
+            ("-f- README.md", ["/tmp/project/README.md"]),
+            ("--file=- README.md", ["/tmp/project/README.md"]),
+        ],
+    )
+    def test_stdin_is_not_a_filesystem_operand(self, tool, command, arguments, paths):
+        args = {"command": f"{command} {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == paths
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize("arguments", ["root ./-", "-f ./- README.md"])
+    def test_hyphen_filename_is_not_stdin(self, tool, command, arguments):
+        args = {"command": f"{command} {arguments}"}
+        assert "/tmp/project/-" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    @pytest.mark.parametrize(
+        "command,option,paths,expected",
+        [
+            ("grep", "--exclude-from", ["/tmp/project/README.md"], Classification.READ),
+            (
+                "rg",
+                "--ignore-file",
+                ["/tmp/project/-", "/tmp/project/README.md"],
+                Classification.CRITICAL,
+            ),
+        ],
+    )
+    def test_auxiliary_hyphen_uses_command_contract(
+        self, tool, separator, command, option, paths, expected
+    ):
+        args = {"command": f'{command} {option}{separator}"-" root README.md'}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == paths
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/tmp/project/-"]},
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        ['grep --future - "/etc/passwd"', 'grep - "/etc/passwd" --future'],
+    )
+    def test_hyphen_keeps_unknown_option_fallback(self, tool, command):
+        args = {"command": command}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert classify(tool, args) == Classification.WRITE
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )

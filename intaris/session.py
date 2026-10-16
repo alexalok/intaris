@@ -37,6 +37,7 @@ class SessionStore:
         parent_session_id: str | None = None,
         agent_id: str | None = None,
         title: str | None = None,
+        agent_restricted: bool = False,
     ) -> dict[str, Any]:
         """Create a new session.
 
@@ -69,8 +70,8 @@ class SessionStore:
                     INSERT INTO sessions
                         (session_id, user_id, intention, details, policy,
                          last_activity_at, parent_session_id, agent_id,
-                         title, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         title, created_at, updated_at, agent_restricted)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -84,6 +85,7 @@ class SessionStore:
                         title,
                         now,
                         now,
+                        agent_restricted,
                     ),
                 )
             except Exception as e:
@@ -121,6 +123,16 @@ class SessionStore:
 
         return _row_to_dict(row)
 
+    def restrict_agent_session(self, session_id: str, *, user_id: str) -> None:
+        """Permanently require server policy once an agent evaluates this session."""
+        with self._db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET agent_restricted = TRUE WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"Session {session_id} not found")
+
     def update_status(
         self,
         session_id: str,
@@ -128,6 +140,7 @@ class SessionStore:
         *,
         user_id: str,
         status_reason: str | None = None,
+        agent_request: bool = False,
     ) -> None:
         """Update session status.
 
@@ -148,6 +161,11 @@ class SessionStore:
                 f"Invalid status '{status}'. Must be one of: {valid_statuses}"
             )
 
+        if agent_request and status not in {"active", "idle", "completed"}:
+            raise PermissionError(
+                "Agent credentials cannot suspend or terminate sessions"
+            )
+
         # Clear status_reason on reactivation (user override)
         if status == "active":
             status_reason = None
@@ -159,10 +177,19 @@ class SessionStore:
                 UPDATE sessions
                 SET status = ?, status_reason = ?, updated_at = ?
                 WHERE session_id = ? AND user_id = ?
-                """,
+                """
+                + (
+                    " AND status IN ('active', 'idle', 'completed')"
+                    if agent_request
+                    else ""
+                ),
                 (status, status_reason, now, session_id, user_id),
             )
             if cur.rowcount == 0:
+                if agent_request:
+                    raise PermissionError(
+                        "Agent lifecycle cannot change a stopped or missing session"
+                    )
                 raise ValueError(f"Session {session_id} not found")
 
     def update_session(

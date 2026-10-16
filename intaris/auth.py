@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import jwt
@@ -33,6 +35,7 @@ class AuthResolution:
     agent_id: str | None
     user_bound: bool
     method: str
+    role: str = "admin"
 
 
 class CognisJWTValidator:
@@ -179,6 +182,42 @@ def match_api_key(token: str, api_keys: dict[str, str]) -> str | None:
     return matched_user
 
 
+# Native adapter surfaces only. New routes remain denied until explicitly reviewed.
+_AGENT_ROUTES = {
+    "POST": re.compile(
+        r"/api/v1/(?:evaluate|intention|reasoning|checkpoint|session/[^/]+/(?:agent-summary|events|events/flush))"
+    ),
+    "GET": re.compile(r"/api/v1/(?:session/[^/]+(?:/summary)?|audit/[^/]+|profile)"),
+    "PATCH": re.compile(r"/api/v1/session/[^/]+(?:/status)?"),
+}
+
+
+def agent_route_allowed(method: str, path: str) -> bool:
+    """Return whether a restricted credential can call this exact REST route."""
+    pattern = _AGENT_ROUTES.get(method)
+    return bool(pattern and pattern.fullmatch(path))
+
+
+def agent_user_from_credentials(
+    headers: Mapping[str, str], cookies: Mapping[str, str], api_keys: dict[str, str]
+) -> str | None:
+    """Find restricted credentials before cookie/JWT precedence can elevate them."""
+    auth = headers.get("authorization", "")
+    parts = auth.split()
+    tokens = (
+        parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else auth.strip(),
+        headers.get("x-api-key", "").strip(),
+        cookies.get("cognis_session", ""),
+        cookies.get("intaris_exchange_session", ""),
+    )
+    users = {
+        user for token in tokens if (user := match_api_key(token, api_keys)) is not None
+    }
+    if len(users) > 1:
+        raise ValueError("Conflicting agent credentials")
+    return next(iter(users), None)
+
+
 def resolve_auth(
     *,
     token: str,
@@ -189,8 +228,14 @@ def resolve_auth(
     jwt_public_key: str,
     jwks_url: str,
     allow_no_auth: bool,
+    agent_api_keys: dict[str, str] | None = None,
 ) -> AuthResolution | None:
     """Resolve request identity from JWT, API key, or no-auth headers."""
+    agent_user = match_api_key(token, agent_api_keys or {})
+    if agent_user is not None:
+        return AuthResolution(
+            agent_user, header_agent_id, True, "api_key", role="agent"
+        )
     validator = get_jwt_validator(jwt_public_key, jwks_url)
 
     if allow_no_auth and not token:

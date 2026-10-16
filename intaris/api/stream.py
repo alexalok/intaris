@@ -291,12 +291,20 @@ def _authenticate_token(
     Returns:
         The resolved user_id, or None if authentication fails.
     """
-    from intaris.auth import resolve_auth
+    from intaris.auth import agent_user_from_credentials, resolve_auth
     from intaris.server import _get_config
 
     cfg = _get_config()
+    try:
+        if agent_user_from_credentials(
+            websocket.headers, websocket.cookies, cfg.server.agent_api_keys
+        ):
+            return None
+    except ValueError:
+        return None
     has_auth = bool(
-        cfg.server.api_keys
+        cfg.server.agent_api_keys
+        or cfg.server.api_keys
         or cfg.server.api_key
         or cfg.server.jwt_public_key
         or cfg.server.jwks_url
@@ -307,7 +315,7 @@ def _authenticate_token(
         # use user_id from auth message
         return fallback_user_id
 
-    if not token:
+    if not isinstance(token, str) or not token:
         return None
 
     resolution = resolve_auth(
@@ -316,10 +324,11 @@ def _authenticate_token(
         header_agent_id=None,
         api_key=cfg.server.api_key,
         api_keys=cfg.server.api_keys,
+        agent_api_keys=cfg.server.agent_api_keys,
         jwt_public_key=cfg.server.jwt_public_key,
         jwks_url=cfg.server.jwks_url,
         allow_no_auth=False,
     )
-    if resolution is None:
+    if resolution is None or resolution.role == "agent":
         return None
     return resolution.user_id

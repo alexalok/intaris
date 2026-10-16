@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
+
+
+def policy_for_session(
+    session: dict[str, Any], agent_policy: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Use server policy for restricted sessions regardless of stored policy."""
+    if not session.get("agent_restricted"):
+        return session.get("policy")
+    if agent_policy is None:
+        raise ValueError("INTARIS_AGENT_POLICY is required for restricted sessions")
+    return deepcopy(agent_policy)
 
 
 def normalized_policy_clauses(

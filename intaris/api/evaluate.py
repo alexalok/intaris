@@ -153,6 +153,7 @@ async def evaluate(
                 context=request.context,
                 minimum_outcome=request.minimum_outcome,
                 approval_call_id=request.approval_call_id,
+                restricted_agent=ctx.is_agent,
                 judge_unattended=(
                     judge_reviewer is not None
                     and judge_reviewer.is_enabled
