@@ -2422,21 +2422,28 @@ def test_completion_owner_serializes_idle_before_terminal_effects(runtime):
     with runtime.profile("a"):
         ctx.emit("on_session_start", session_id="same-id")
     entered, release = threading.Event(), threading.Event()
-    failures = []
+    failures, applied = [], []
+    terminal_started, terminal_done = threading.Event(), threading.Event()
 
     def hold_idle(req):
-        if (
-            req.full_url.endswith("/status")
-            and json.loads(req.data)["status"] == "idle"
-        ):
-            entered.set()
-            assert release.wait(5)
+        if req.full_url.endswith("/status"):
+            status = json.loads(req.data)["status"]
+            if status == "idle":
+                entered.set()
+                assert release.wait(5)
+            # Model the server applying the status after the held request.
+            applied.append(status)
 
     def end(completed):
         try:
+            if completed:
+                terminal_started.set()
             ctx.emit("on_session_end", session_id="same-id", completed=completed)
         except BaseException as exc:
             failures.append(exc)
+        finally:
+            if completed:
+                terminal_done.set()
 
     runtime.request_hook.append(hold_idle)
     idle = threading.Thread(target=end, args=(False,))
@@ -2445,6 +2452,10 @@ def test_completion_owner_serializes_idle_before_terminal_effects(runtime):
     try:
         assert entered.wait(5)
         terminal.start()
+        assert terminal_started.wait(5)
+        # An unserialized implementation completes while idle is still held.
+        # The fixed implementation waits until this owner can emit in order.
+        terminal_done.wait(0.2)
     finally:
         release.set()
         idle.join(5)
@@ -2458,6 +2469,8 @@ def test_completion_owner_serializes_idle_before_terminal_effects(runtime):
         "completed",
     ]
     assert len(requests_for(runtime, "/agent-summary")) == 1
+
+    assert applied == ["idle", "completed"], "late idle must not overwrite completed"
 
 
 def test_completion_owner_allows_one_idle_per_active_interval(runtime):
