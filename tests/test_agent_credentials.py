@@ -884,3 +884,59 @@ def test_agent_write_cannot_reuse_old_judge_approval(client, history_session):
     assert result["decision"] == "deny", result
     assert result["path"] == "llm", result
     inference.assert_called_once()
+
+
+@pytest.mark.parametrize("stopped_status", ["suspended", "terminated"])
+@pytest.mark.parametrize(
+    "headers", [AGENT, ADMIN], ids=["agent", "admin-on-restricted"]
+)
+def test_idle_resume_race_returns_inactive_denial(client, stopped_status, headers):
+    from intaris.session import SessionStore
+
+    create(client)
+    client.patch(
+        "/api/v1/session/s/status", headers=ADMIN, json={"status": "idle"}
+    ).raise_for_status()
+    original = SessionStore.update_status
+
+    def stop_before_resume(store, session_id, status, **kwargs):
+        if status == "active" and kwargs.get("agent_request"):
+            original(
+                store,
+                session_id,
+                stopped_status,
+                user_id=kwargs["user_id"],
+                status_reason="Operator stopped session during idle resume",
+            )
+        return original(store, session_id, status, **kwargs)
+
+    with patch.object(SessionStore, "update_status", stop_before_resume):
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={"session_id": "s", "tool": "terminal", "args": {"command": "pwd"}},
+        )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["decision"] == "deny", result
+    assert result["session_status"] == stopped_status
+    assert result["status_reason"] == "Operator stopped session during idle resume"
+    assert result["outcome_override"] == "hard_stop.session_lifecycle"
+    assert result["path"] == "fast"
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["decision"] == "deny"
+    assert audit["outcome_override"] == "hard_stop.session_lifecycle"
+    session = client.get("/api/v1/session/s", headers=ADMIN).json()
+    assert session["status"] == stopped_status
+    assert session["status_reason"] == result["status_reason"]
+
+
+def test_restricted_idle_resume_without_race_stays_fast(client):
+    create(client)
+    client.patch(
+        "/api/v1/session/s/status", headers=ADMIN, json={"status": "idle"}
+    ).raise_for_status()
+    result = evaluate(client)
+    assert result["decision"] == "approve"
+    assert result["path"] == "fast"
+    assert client.get("/api/v1/session/s", headers=ADMIN).json()["status"] == "active"

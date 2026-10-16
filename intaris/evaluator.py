@@ -366,6 +366,13 @@ class Evaluator:
                 )
                 session_status = "active"
                 logger.debug("Auto-resumed idle session %s", session_id)
+            except PermissionError:
+                # A concurrent operator stop won the conditional update.
+                # Reload lifecycle fields only, preserving mandatory policy.
+                current_session = self._sessions.get(session_id, user_id=user_id)
+                session_status = current_session["status"]
+                session["status"] = session_status
+                session["status_reason"] = current_session.get("status_reason")
             except ValueError:
                 pass
 
