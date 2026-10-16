@@ -154,6 +154,8 @@ def adapter(monkeypatch, host):
         profile=profile, handler=handler, calls=calls, state=state
     )
     profile.sessions.clear()
+    if state._completion is not None:
+        plugin._forget_completion_owner(state._completion)
 
 
 @contextmanager

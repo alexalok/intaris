@@ -73,7 +73,8 @@ sessions. Loading another profile cannot redirect existing callbacks. Unloading
 or reloading a profile cancels its timer and releases its registrations; an
 already-running flush retains its original client. Final recording uploads share
 a five-second HTTP timeout budget across all sessions. Buffers not attempted
-within that budget remain available to a compatible reload.
+within that budget remain available to a compatible reload or to the original
+session's later idle/completion event, even after an identity-changing reload.
 
 Non-secret options can be set under `plugins.entries.intaris.settings`, using
 the environment variable name below without `INTARIS_`, in lowercase (for
@@ -101,11 +102,17 @@ callbacks remain bound to their originating manager.
 With the pip entry-point installation, reloading a profile preserves active
 Intaris sessions, intention context, and counters when the backend URL,
 credentials, user/agent identity, and effective path policy are unchanged.
-Runtime callbacks, tools, MCP cache, and timers are
-replaced. Session state for the 100 most recently unloaded profiles is retained
-in memory without retaining their clients, managers, or timers. Changing identity
-or policy, or reloading after that state was evicted, requires a fresh Hermes
-session start; tools remain blocked even with fail-open enabled until then.
+Runtime callbacks, tools, MCP cache, and timers are replaced. Admission
+continuity is cached for the 100 most recently unloaded profiles, without
+retaining managers or timers. Outstanding sessions keep their original client
+and state solely for lifecycle completion until their terminal end event. These
+records preserve final recording/status/summary routing across identity changes
+and cannot authorize new tool calls. Duplicate end callbacks produce one local
+completion transition; HTTP delivery retains its existing best-effort behavior.
+Changing identity or policy, or reloading after admission continuity was evicted,
+requires each Hermes session to receive its own fresh session-start event. One
+session's start cannot unlock another; tools remain blocked even with fail-open
+enabled until that session starts.
 If replacement registration fails, the last successful profile's retained
 sessions remain available when retrying with that profile's configuration.
 Direct in-process replacement keeps old guards blocking until the new guards

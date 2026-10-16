@@ -210,6 +210,7 @@ class SessionState:
     _ended: threading.Event = field(default_factory=threading.Event, repr=False)
     # Lock for session creation dedup
     _creating: bool = False
+    _completion: _CompletionOwner | None = field(default=None, repr=False)
 
 
 # ============================================================================
@@ -257,13 +258,31 @@ class _GuardAdmission:
 
 @dataclass
 class _SessionContinuity:
-    """Session data retained across unload, without runtime resources or secrets."""
+    """Session bindings retained across unload, without registration resources."""
 
     fingerprint: str
     sessions: dict[str, SessionState]
     sessions_lock: Any
     recording_lock: Any
     session_start_required: threading.Event
+
+
+@dataclass
+class _CompletionOwner:
+    """Original authority for one remote session's lifecycle effects only."""
+
+    home: str
+    session_id: str
+    state: SessionState = field(repr=False)
+    client: IntarisClient = field(repr=False)
+    sessions: dict[str, SessionState] = field(repr=False)
+    sessions_lock: Any = field(repr=False)
+    recording_lock: Any = field(repr=False)
+    token: object = field(default_factory=object, repr=False)
+    lock: Any = field(default_factory=threading.RLock, repr=False)
+    effects_lock: Any = field(default_factory=threading.Lock, repr=False)
+    status: str = "active"
+    emitted_status: str = "active"
 
 
 def _session_fingerprint(profile: ProfileRuntime) -> str:
@@ -284,6 +303,9 @@ _registered_homes: set[str] = set()
 # Only live cancellation events cross generations; no client/config authority.
 _active_invocations: dict[tuple[str, str], dict[object, threading.Event]] = {}
 _invocations_lock = threading.Lock()
+# Completion records retain no registration, timer, or new-call authority.
+_completion_owners: dict[tuple[str, str], dict[object, _CompletionOwner]] = {}
+_completion_owners_lock = threading.Lock()
 # A later plugin may retain an older guard in its closure. Route that exact
 # guard to a fresh guard while executing the preserved wrapper chain.
 _guard_replacements: contextvars.ContextVar[dict[Callable, Callable] | None] = (
@@ -476,14 +498,15 @@ def _ensure_session(
 ) -> str | None:
     """Ensure an Intaris session exists.  Returns the session ID or None."""
 
-    if state.intaris_session_id:
-        return state.intaris_session_id
-
-    # Simple dedup — only one creation at a time per state
-    if state._creating:
-        return state.intaris_session_id
-
-    state._creating = True
+    # Publish lifecycle ownership before creation HTTP can block. An end hook
+    # may detach this state while creation finishes, without losing its outcome.
+    owner = _get_completion_owner(profile, task_id, state)
+    with owner.lock:
+        if owner.status == "completed":
+            return None
+        if state.intaris_session_id or state._creating:
+            return state.intaris_session_id
+        state._creating = True
     try:
         intaris_id = f"hm-{uuid.uuid4()}"
         state.intention = _build_intention(platform, model, state.working_directory)
@@ -512,7 +535,9 @@ def _ensure_session(
 
         return state.intaris_session_id
     finally:
-        state._creating = False
+        with owner.lock:
+            state._creating = False
+        _emit_lifecycle(owner)
 
 
 # ============================================================================
@@ -520,11 +545,17 @@ def _ensure_session(
 # ============================================================================
 
 
-def _record_event(profile: ProfileRuntime, task_id: str, event: dict[str, Any]) -> None:
-    """Buffer a recording event."""
+def _record_event(
+    profile: ProfileRuntime,
+    task_id: str,
+    event: dict[str, Any],
+    *,
+    _state: SessionState | None = None,
+) -> None:
+    """Buffer an event on the state captured by its admitted producer."""
     if not profile.cfg.recording:
         return
-    state = profile.sessions.get(task_id)
+    state = _state if _state is not None else profile.sessions.get(task_id)
     if not state or not state.intaris_session_id:
         return
     with profile.recording_lock:
@@ -534,17 +565,22 @@ def _record_event(profile: ProfileRuntime, task_id: str, event: dict[str, Any]) 
         # timer remains to drain an inactive generation's buffer.
         should_flush = (
             not profile.ready
+            or state._ended.is_set()
             or len(state.recording_buffer) >= profile.cfg.recording_flush_size
         )
     if should_flush:
-        _flush_recording_buffer(profile, task_id)
+        _flush_recording_buffer(profile, task_id, _state=state)
 
 
 def _flush_recording_buffer(
-    profile: ProfileRuntime, task_id: str, *, timeout_s: float = 5.0
+    profile: ProfileRuntime | _CompletionOwner,
+    task_id: str,
+    *,
+    timeout_s: float = 5.0,
+    _state: SessionState | None = None,
 ) -> None:
-    """Flush buffered recording events to Intaris."""
-    state = profile.sessions.get(task_id)
+    """Flush buffered events through their captured original authority."""
+    state = _state if _state is not None else profile.sessions.get(task_id)
     if not state or not state.intaris_session_id:
         return
     with profile.recording_lock:
@@ -596,14 +632,108 @@ def _schedule_flush(profile: ProfileRuntime) -> None:
 # ============================================================================
 
 
+def _get_completion_owner(
+    profile: ProfileRuntime, session_id: str, state: SessionState
+) -> _CompletionOwner:
+    """Share one lifecycle record across compatible registration generations."""
+    with _completion_owners_lock:
+        if state._completion is None:
+            owner = _CompletionOwner(
+                profile.home,
+                session_id,
+                state,
+                profile.client,
+                profile.sessions,
+                profile.sessions_lock,
+                profile.recording_lock,
+            )
+            state._completion = owner
+            _completion_owners.setdefault((profile.home, session_id), {})[
+                owner.token
+            ] = owner
+        return state._completion
+
+
+def _forget_completion_owner(owner: _CompletionOwner) -> None:
+    with _completion_owners_lock:
+        key = (owner.home, owner.session_id)
+        owners = _completion_owners.get(key)
+        if owners is not None and owners.get(owner.token) is owner:
+            del owners[owner.token]
+            if not owners:
+                del _completion_owners[key]
+
+
+def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
+    """Cancel and claim a transition before waiting for any network effects."""
+    with owner.lock:
+        state = owner.state
+        state._ended.set()
+        if owner.status == "completed":
+            return
+        owner.status = "completed" if terminal else "idle"
+        state.is_idle = not terminal
+        if terminal:
+            state.start_confirmed = False
+    if terminal:
+        # Detach before HTTP so a fresh start can reuse the Hermes SID. A later
+        # cleanup must never remove a replacement state under that same key.
+        with owner.sessions_lock:
+            if owner.sessions.get(owner.session_id) is state:
+                del owner.sessions[owner.session_id]
+
+
+def _emit_lifecycle(owner: _CompletionOwner) -> None:
+    """Serialize local claims/emissions; HTTP retains best-effort semantics."""
+    with owner.effects_lock:
+        while True:
+            with owner.lock:
+                if owner.state._creating or owner.status == owner.emitted_status:
+                    return
+                status = owner.status
+                if not owner.state.intaris_session_id:
+                    if status == "completed":
+                        _forget_completion_owner(owner)
+                    return
+                owner.emitted_status = status
+            # Only this per-owner effect lock spans I/O. Other sessions/homes
+            # and cancellation signals never wait for global network locks.
+            if status == "completed":
+                try:
+                    _signal_completion(owner, owner.session_id, owner.state)
+                finally:
+                    _forget_completion_owner(owner)
+                return
+            if status == "idle":
+                _flush_recording_buffer(owner, owner.session_id, _state=owner.state)
+            try:
+                owner.client.update_status(owner.state.intaris_session_id, status)
+            except Exception:
+                pass
+
+
+def _resume_session(
+    profile: ProfileRuntime, session_id: str, state: SessionState
+) -> bool:
+    owner = _get_completion_owner(profile, session_id, state)
+    with owner.lock:
+        if owner.status == "completed":
+            return False
+        state._ended = threading.Event()
+        state.is_idle = False
+        owner.status = "active"
+    _emit_lifecycle(owner)
+    return not state._ended.is_set()
+
+
 def _signal_completion(
-    profile: ProfileRuntime, task_id: str, state: SessionState
+    profile: ProfileRuntime | _CompletionOwner, task_id: str, state: SessionState
 ) -> None:
     """Signal session completion to Intaris."""
     if not state.intaris_session_id:
         return
 
-    _flush_recording_buffer(profile, task_id)
+    _flush_recording_buffer(profile, task_id, _state=state)
 
     sid = state.intaris_session_id
     try:
@@ -1369,11 +1499,15 @@ def _on_session_start(
 ) -> None:
     """on_session_start: Create Intaris session."""
     state = _get_or_create_state(profile, session_id)
-    if state._ended.is_set():
-        state._ended = threading.Event()
+    if state.is_idle:
+        if not _resume_session(profile, session_id, state):
+            return
+    elif state._ended.is_set():
+        return
     if _ensure_session(profile, session_id, state, platform, model):
         with profile.sessions_lock:
-            state.start_confirmed = True
+            if profile.sessions.get(session_id) is state and not state._ended.is_set():
+                state.start_confirmed = True
 
     # Refresh MCP tool cache on session start
     if profile.cfg and profile.cfg.mcp_tools and _is_mcp_cache_stale(profile):
@@ -1393,8 +1527,7 @@ def _on_session_end(
     **kwargs: Any,
 ) -> None:
     """on_session_end: Signal completion or idle."""
-    # A new identity may have no matching state, but older admitted workers
-    # still belong to this Hermes home/session and must observe its end.
+    # Cancel every admitted invocation before claiming or waiting for effects.
     with profile.lifecycle_lock:
         with _invocations_lock:
             for ended in _active_invocations.get(
@@ -1404,22 +1537,15 @@ def _on_session_end(
         state = profile.sessions.get(session_id)
         if state is not None:
             state._ended.set()
-        if not profile.active or state is None:
-            return
-
-    # Cancellation above precedes any completion/recording HTTP, including idle.
-    if completed or interrupted:
-        _signal_completion(profile, session_id, state)
-        with profile.sessions_lock:
-            profile.sessions.pop(session_id, None)
-    else:
-        # Not completed — transition to idle
-        if not state.is_idle and state.intaris_session_id and profile.client:
-            state.is_idle = True
-            try:
-                profile.client.update_status(state.intaris_session_id, "idle")
-            except Exception:
-                pass
+            _get_completion_owner(profile, session_id, state)
+    with _completion_owners_lock:
+        owners = tuple(_completion_owners.get((profile.home, session_id), {}).values())
+    # Snapshot exact owners once. A new state created during a blocked flush
+    # belongs to another lifetime and must not be claimed by this event.
+    for owner in owners:
+        _claim_session_end(owner, completed or interrupted)
+    for owner in owners:
+        _emit_lifecycle(owner)
 
 
 def _on_pre_llm_call(
@@ -1450,12 +1576,10 @@ def _on_pre_llm_call(
 
     # Resume from idle when user provides new input
     if state.is_idle and user_message:
-        state._ended = threading.Event()
-        state.is_idle = False
-        try:
-            profile.client.update_status(state.intaris_session_id, "active")
-        except Exception:
-            pass
+        if not _resume_session(profile, session_id, state):
+            return None
+    if state._ended.is_set():
+        return None
 
     # Forward user message as reasoning context
     if user_message and user_message.strip():
@@ -1478,8 +1602,9 @@ def _on_pre_llm_call(
                         "session_key": session_id,
                     },
                 },
+                _state=state,
             )
-            _flush_recording_buffer(profile, session_id)
+            _flush_recording_buffer(profile, session_id, _state=state)
             try:
                 profile.client.submit_reasoning(
                     state.intaris_session_id, "", from_events=True
@@ -1512,7 +1637,7 @@ def _on_pre_tool_call(
 ) -> None:
     """pre_tool_call: Record tool call event (evaluation happens in wrapper)."""
     try:
-        _resolve_invocation_session(profile, session_id)
+        state = _resolve_invocation_session(profile, session_id)
     except ValueError:
         return
     _record_event(
@@ -1533,6 +1658,7 @@ def _on_pre_tool_call(
                 "session_key": session_id,
             },
         },
+        _state=state,
     )
 
 
@@ -1590,6 +1716,7 @@ def _on_post_tool_call(
                 "session_key": session_id,
             },
         },
+        _state=state,
     )
 
 
@@ -1623,6 +1750,7 @@ def _on_post_llm_call(
                     "session_key": session_id,
                 },
             },
+            _state=state,
         )
 
 
@@ -1696,7 +1824,8 @@ def _close_profile(profile: ProfileRuntime) -> None:
         with _profiles_lock:
             if _profiles.get(profile.home) is profile:
                 # Keep shared state/locks for already-admitted callbacks, but
-                # never retain the runtime's client, context, tools or timer.
+                # do not retain registration context, tools, or timers.
+                # Outstanding lifecycle records own their original client.
                 # A failed provisional load must not replace the last
                 # successful owner's continuity with another identity.
                 if profile.registered:

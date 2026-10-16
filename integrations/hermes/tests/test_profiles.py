@@ -223,6 +223,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._retired_sessions.clear()
         plugin._registration_locks.clear()
         plugin._registered_homes.clear()
+        plugin._completion_owners.clear()
     if hasattr(plugin, "_sessions"):
         plugin._sessions.clear()
         plugin._mcp_tool_cache = None
@@ -299,6 +300,7 @@ def runtime(monkeypatch, tmp_path):
         plugin._retired_sessions.clear()
         plugin._registration_locks.clear()
         plugin._registered_homes.clear()
+        plugin._completion_owners.clear()
 
 
 def requests_for(runtime, suffix):
@@ -2091,3 +2093,387 @@ def test_unload_during_discovery_disposes_late_tools_and_timer(runtime):
             )
         ) == {"result": "recovered"}
     assert len(requests_for(runtime, "/evaluate")) == 1
+
+
+@pytest.mark.parametrize("delivery", ["replacement", "captured"])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("unload_first", [False, True])
+def test_changed_reload_finishes_predecessor_with_original_owner(
+    runtime, delivery, completed, unload_first
+):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        captured_end = old.hooks["on_session_end"][0]
+        old.emit(
+            "post_llm_call", session_id="same-id", assistant_response="old private text"
+        )
+        runtime.registry.get_entry("read_file").handler(
+            {"path": "old"}, session_id="same-id"
+        )
+        original_id = requests_for(runtime, "/intention")[-1]["body"]["session_id"]
+        if unload_first:
+            for callback in old.unload:
+                callback()
+        runtime.secrets["a"] = {"INTARIS_API_KEY": "new-key"}
+        new = runtime.register(
+            "a",
+            {
+                "url": "https://new.invalid",
+                "user_id": "new-user",
+                "agent_id": "new-agent",
+            },
+        )
+    other = runtime.register("b")
+    with runtime.profile("b"):
+        other.emit("on_session_start", session_id="same-id")
+    with runtime.profile("a"):
+        selected = (
+            captured_end if delivery == "captured" else new.hooks["on_session_end"][0]
+        )
+        selected(session_id="same-id", completed=completed)
+        # Duplicate deliveries through either generation must be idempotent.
+        new.emit("on_session_end", session_id="same-id", completed=completed)
+        captured_end(session_id="same-id", completed=completed)
+    statuses = requests_for(runtime, "/status")
+    assert len(statuses) == 1, "predecessor lifecycle must be delivered exactly once"
+    assert (
+        statuses[0]["url"] == f"https://a.invalid/api/v1/session/{original_id}/status"
+    )
+    assert statuses[0]["body"] == {"status": "completed" if completed else "idle"}
+    assert statuses[0]["headers"]["Authorization"] == "Bearer key-a"
+    assert statuses[0]["headers"]["X-user-id"] == "a"
+    summaries = requests_for(runtime, "/agent-summary")
+    assert len(summaries) == int(completed)
+    if not completed:
+        with runtime.profile("a"):
+            new.emit("on_session_end", session_id="same-id", completed=True)
+            captured_end(session_id="same-id", completed=True)
+        summaries = requests_for(runtime, "/agent-summary")
+        assert [r["body"]["status"] for r in requests_for(runtime, "/status")] == [
+            "idle",
+            "completed",
+        ]
+    assert len(summaries) == 1
+    assert (
+        summaries[0]["url"]
+        == f"https://a.invalid/api/v1/session/{original_id}/agent-summary"
+    )
+    assert summaries[0]["headers"]["Authorization"] == "Bearer key-a"
+    assert "1 tool calls (1 approved" in summaries[0]["body"]["summary"]
+    events = requests_for(runtime, "/events")
+    assert len(events) == 1
+    assert events[0]["url"] == f"https://a.invalid/api/v1/session/{original_id}/events"
+    assert "old private text" in json.dumps(events[0]["body"])
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_changed_reload_end_flushes_predecessor_recording_left_by_budget(
+    runtime, monkeypatch, completed
+):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        for index in range(3):
+            old.emit("on_session_start", session_id=f"session-{index}")
+            old.emit(
+                "post_llm_call",
+                session_id=f"session-{index}",
+                assistant_response=f"old-{index}",
+            )
+        original_id = requests_for(runtime, "/intention")[-1]["body"]["session_id"]
+    clock = [0.0]
+
+    def timeout(req, *, timeout):
+        assert req.full_url.endswith("/events")
+        clock[0] += min(3.0, timeout)
+        raise TimeoutError("synthetic recording timeout")
+
+    with monkeypatch.context() as slow:
+        slow.setattr(plugin.time, "monotonic", lambda: clock[0])
+        slow.setattr("urllib.request.urlopen", timeout)
+        for callback in old.unload:
+            callback()
+    assert clock[0] <= 5.0
+    with runtime.profile("a"):
+        runtime.register(
+            "a", {"url": "https://middle.invalid", "user_id": "middle-user"}
+        )
+        new = runtime.register(
+            "a", {"url": "https://new.invalid", "user_id": "new-user"}
+        )
+        new.emit("on_session_end", session_id="session-2", completed=completed)
+        new.emit("on_session_end", session_id="session-2", completed=completed)
+    events = requests_for(runtime, "/events")
+    assert len(events) == 1, "end must flush predecessor buffer not attempted at unload"
+    assert events[0]["url"] == f"https://a.invalid/api/v1/session/{original_id}/events"
+    assert events[0]["headers"]["Authorization"] == "Bearer key-a"
+    assert "old-2" in json.dumps(events[0]["body"])
+    assert len(requests_for(runtime, "/agent-summary")) == int(completed)
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_completion_owner_deduplicates_concurrent_generation_hooks(runtime, compatible):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        old.emit("post_llm_call", session_id="same-id", assistant_response="one event")
+        captured_end = old.hooks["on_session_end"][0]
+        sid = requests_for(runtime, "/intention")[-1]["body"]["session_id"]
+        new = runtime.register(
+            "a", {} if compatible else {"url": "https://new.invalid"}
+        )
+    entered, release = threading.Event(), threading.Event()
+    gate = threading.Barrier(3)
+
+    def hold_status(req):
+        if req.full_url.endswith(f"/{sid}/status"):
+            entered.set()
+            assert release.wait(5)
+
+    def end(callback):
+        gate.wait(5)
+        callback(session_id="same-id")
+
+    runtime.request_hook.append(hold_status)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(end, callback)
+            for callback in (captured_end, new.hooks["on_session_end"][0])
+        ]
+        try:
+            gate.wait(5)
+            assert entered.wait(5)
+            # Another home must remain usable while this owner's HTTP is blocked.
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="same-id")
+                assert json.loads(
+                    runtime.registry.get_entry("read_file").handler(
+                        {"path": "other"}, session_id="same-id"
+                    )
+                ) == {"result": "other"}
+        finally:
+            release.set()
+        for future in futures:
+            future.result(5)
+    assert len(requests_for(runtime, "/status")) == 1
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+    assert len(requests_for(runtime, "/events")) == 1
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_completion_owner_settles_end_during_creation_without_deleting_reused_id(
+    runtime, compatible
+):
+    old = runtime.register("a")
+    entered, release = threading.Event(), threading.Event()
+    first = [True]
+    failures = []
+
+    def hold_creation(req):
+        if req.full_url.endswith("/intention") and first[0]:
+            first[0] = False
+            entered.set()
+            assert release.wait(5)
+
+    def start():
+        try:
+            with runtime.profile("a"):
+                old.emit("on_session_start", session_id="same-id")
+        except BaseException as exc:
+            failures.append(exc)
+
+    runtime.request_hook.append(hold_creation)
+    thread = threading.Thread(target=start)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a") as home:
+            original_state = plugin._profiles[str(home)].sessions["same-id"]
+            current = runtime.register("a", {} if compatible else {"agent_id": "new"})
+            current.emit("on_session_end", session_id="same-id")
+            assert original_state._ended.is_set()
+            current.emit("on_session_start", session_id="same-id")
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and not failures
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 2, "fresh SID reuse must create a distinct Intaris session"
+    original_id, new_id = [r["body"]["session_id"] for r in created]
+    assert original_id != new_id
+    statuses = requests_for(runtime, "/status")
+    assert len(statuses) == 1 and statuses[0]["url"].endswith(f"/{original_id}/status")
+    assert statuses[0]["body"] == {"status": "completed"}
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+    assert original_state._ended.is_set() and not original_state.start_confirmed
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "new lifetime"}, session_id="same-id"
+            )
+        ) == {"result": "new lifetime"}
+    assert requests_for(runtime, "/evaluate")[-1]["body"]["session_id"] == new_id
+
+
+def test_completion_owner_preserves_new_state_during_blocked_final_flush(runtime):
+    ctx = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        ctx.emit("on_session_start", session_id="same-id")
+        ctx.emit("post_llm_call", session_id="same-id", assistant_response="old event")
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+
+    def hold_flush(req):
+        if req.full_url.endswith("/events") and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    def end():
+        try:
+            ctx.emit("on_session_end", session_id="same-id")
+        except BaseException as exc:
+            failures.append(exc)
+
+    runtime.request_hook.append(hold_flush)
+    thread = threading.Thread(target=end)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a"):
+            ctx.emit("on_session_start", session_id="same-id")
+            ctx.emit(
+                "post_llm_call", session_id="same-id", assistant_response="new event"
+            )
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and not failures
+    created = requests_for(runtime, "/intention")
+    assert len(created) == 2
+    original_id, new_id = [r["body"]["session_id"] for r in created]
+    with runtime.profile("a"):
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler(
+                {"path": "new lifetime"}, session_id="same-id"
+            )
+        ) == {"result": "new lifetime"}
+        ctx.emit("on_session_end", session_id="same-id")
+    events = requests_for(runtime, "/events")
+    assert [r["url"].split("/")[-2] for r in events] == [original_id, new_id]
+    assert "old event" in json.dumps(events[0]["body"])
+    assert "new event" not in json.dumps(events[0]["body"])
+    assert "new event" in json.dumps(events[1]["body"])
+
+
+@pytest.mark.parametrize("change_identity", [False, True])
+def test_completion_owner_keeps_late_recording_on_original_state(
+    runtime, monkeypatch, change_identity
+):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+    sid = requests_for(runtime, "/intention")[0]["body"]["session_id"]
+    entered, release = threading.Event(), threading.Event()
+    record = plugin._record_event
+    failures = []
+
+    def paused_record(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return record(*args, **kwargs)
+
+    def produce():
+        try:
+            old.emit(
+                "post_llm_call",
+                session_id="same-id",
+                assistant_response="late old event",
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(plugin, "_record_event", paused_record)
+    thread = threading.Thread(target=produce)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with runtime.profile("a"):
+            current = (
+                runtime.register("a", {"url": "https://new.invalid"})
+                if change_identity
+                else old
+            )
+            current.emit("on_session_end", session_id="same-id")
+            current.emit("on_session_start", session_id="same-id")
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and not failures
+    events = requests_for(runtime, "/events")
+    assert len(events) == 1
+    assert events[0]["url"] == f"https://a.invalid/api/v1/session/{sid}/events"
+    assert events[0]["headers"]["Authorization"] == "Bearer key-a"
+    assert "late old event" in json.dumps(events[0]["body"])
+
+
+def test_completion_owner_serializes_idle_before_terminal_effects(runtime):
+    ctx = runtime.register("a")
+    with runtime.profile("a"):
+        ctx.emit("on_session_start", session_id="same-id")
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+
+    def hold_idle(req):
+        if (
+            req.full_url.endswith("/status")
+            and json.loads(req.data)["status"] == "idle"
+        ):
+            entered.set()
+            assert release.wait(5)
+
+    def end(completed):
+        try:
+            ctx.emit("on_session_end", session_id="same-id", completed=completed)
+        except BaseException as exc:
+            failures.append(exc)
+
+    runtime.request_hook.append(hold_idle)
+    idle = threading.Thread(target=end, args=(False,))
+    terminal = threading.Thread(target=end, args=(True,))
+    idle.start()
+    try:
+        assert entered.wait(5)
+        terminal.start()
+    finally:
+        release.set()
+        idle.join(5)
+        if terminal.ident is not None:
+            terminal.join(5)
+    assert not idle.is_alive() and not terminal.is_alive() and not failures
+    ctx.emit("on_session_end", session_id="same-id", completed=False)
+    ctx.emit("on_session_end", session_id="same-id", completed=True)
+    assert [r["body"]["status"] for r in requests_for(runtime, "/status")] == [
+        "idle",
+        "completed",
+    ]
+    assert len(requests_for(runtime, "/agent-summary")) == 1
+
+
+def test_completion_owner_allows_one_idle_per_active_interval(runtime):
+    ctx = runtime.register("a")
+    with runtime.profile("a"):
+        ctx.emit("on_session_start", session_id="same-id")
+        for _ in range(2):
+            ctx.emit("on_session_end", session_id="same-id", completed=False)
+        ctx.emit("pre_llm_call", session_id="same-id", user_message="Continue")
+        for _ in range(2):
+            ctx.emit("on_session_end", session_id="same-id", completed=False)
+        ctx.emit("on_session_end", session_id="same-id", completed=True)
+    assert [r["body"]["status"] for r in requests_for(runtime, "/status")] == [
+        "idle",
+        "active",
+        "idle",
+        "completed",
+    ]
+    assert len(requests_for(runtime, "/agent-summary")) == 1
