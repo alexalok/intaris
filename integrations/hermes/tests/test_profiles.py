@@ -57,7 +57,7 @@ class ScopedRegistry:
         return asyncio.run(result) if entry.is_async else result
 
     def restore_registration(self, name, current, previous, scope=None):
-        target = self.scoped[scope]
+        target = self._tools if scope is None else self.scoped[scope]
         if target.get(name) is current:
             if previous is None:
                 target.pop(name)
@@ -703,6 +703,47 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
     assert Timer.instances[0].cancelled
     with runtime.profile("b"):
         managers["b"].unload()
+
+
+@pytest.mark.parametrize("public_restore", [False, True])
+def test_legacy_unload_restores_original_tool(runtime, monkeypatch, public_restore):
+    monkeypatch.setattr(runtime.registry, "get_all_entries", None)
+    if not public_restore:
+        monkeypatch.setattr(runtime.registry, "restore_registration", None)
+    original = runtime.registry._tools["read_file"]
+    ctx = runtime.register("a")
+    with runtime.profile("a"):
+        ctx.emit("on_session_start", session_id="same-id")
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "guarded"})
+        ) == {"result": "guarded"}
+        for callback in ctx.unload:
+            callback()
+            callback()  # Host cleanup may be repeated after a failed reload.
+        assert json.loads(
+            runtime.registry.get_entry("read_file").handler({"path": "restored"})
+        ) == {"result": "restored"}
+    assert runtime.registry._tools["read_file"] is original
+    assert len(requests_for(runtime, "/evaluate")) == 1
+
+
+@pytest.mark.parametrize("public_restore", [False, True])
+def test_legacy_unload_keeps_later_registration(runtime, monkeypatch, public_restore):
+    monkeypatch.setattr(runtime.registry, "get_all_entries", None)
+    if not public_restore:
+        monkeypatch.setattr(runtime.registry, "restore_registration", None)
+    ctx = runtime.register("a")
+    runtime.registry.register(
+        name="read_file",
+        toolset="files",
+        schema={"name": "read_file", "parameters": {}},
+        handler=lambda args, **kw: json.dumps({"result": "later plugin"}),
+    )
+    later = runtime.registry._tools["read_file"]
+    for callback in ctx.unload:
+        callback()
+    assert runtime.registry._tools["read_file"] is later
+    assert json.loads(later.handler({})) == {"result": "later plugin"}
 
 
 def test_legacy_registry_refuses_second_profile_without_redirecting_first(

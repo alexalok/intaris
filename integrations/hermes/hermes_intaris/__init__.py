@@ -1365,6 +1365,24 @@ def _track_registration(profile: ProfileRuntime, handle: Any) -> None:
                 handle.dispose()
 
 
+@dataclass
+class _LegacyToolRegistration:
+    """Restore only the global registration installed by this generation."""
+
+    registry: Any
+    previous: Any
+    current: Any
+
+    def dispose(self) -> None:
+        """Leave later registrations untouched, including repeated cleanup."""
+        restore = getattr(self.registry, "restore_registration", None)
+        if callable(restore):
+            restore(self.previous.name, self.current, self.previous)
+        elif self.registry._tools.get(self.previous.name) is self.current:
+            # Older global-only registries expose no restoration API.
+            self.registry._tools[self.previous.name] = self.previous
+
+
 def register(ctx: Any) -> None:
     """Register guards and hooks in the active Hermes profile's namespace.
 
@@ -1460,6 +1478,10 @@ def _register_profile(
             _track_registration(profile, ctx.register_tool(**options, override=True))
         else:
             registry.register(**options)
+            _track_registration(
+                profile,
+                _LegacyToolRegistration(registry, entry, registry._tools[entry.name]),
+            )
 
     if profile.cfg.mcp_tools:
         try:
