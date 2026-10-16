@@ -96,15 +96,20 @@ of sharing guards or authenticated MCP tools. A handler called with a foreign
 or unloaded profile is blocked even when fail-open is enabled. Hooks and timer
 callbacks remain bound to their originating manager.
 
-Reloading a profile preserves active Intaris sessions, intention context, and
-counters when the backend URL, credentials, user/agent identity, and effective
-path policy are unchanged. Runtime callbacks, tools, MCP cache, and timers are
+With the pip entry-point installation, reloading a profile preserves active
+Intaris sessions, intention context, and counters when the backend URL,
+credentials, user/agent identity, and effective path policy are unchanged.
+Runtime callbacks, tools, MCP cache, and timers are
 replaced. Session state for the 100 most recently unloaded profiles is retained
 in memory without retaining their clients, managers, or timers. Changing identity
 or policy, or reloading after that state was evicted, requires a fresh Hermes
 session start; tools remain blocked even with fail-open enabled until then.
 Legacy global-only tool registrations are restored on unload, provided another
 plugin has not replaced them in the meantime.
+
+Directory installations re-import the plugin module during force reload,
+resetting its in-memory state. Start a new Hermes session after a directory
+reload; use the pip entry-point installation for active-session continuity.
 
 ### Configuration Options
 
