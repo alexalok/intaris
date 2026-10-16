@@ -1275,3 +1275,17 @@ def test_agent_unresolved_tilde_requires_evaluation(client, tool, command):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "write"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+def test_agent_stat_cluster_format_is_data(client, tool):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": ["/etc/*"]}
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command='stat -Lc "/etc/passwd" README.md')
+    assert result["decision"] == "approve", result
+    assert result["path"] == "fast", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "read"
+    assert audit["tool"] == tool

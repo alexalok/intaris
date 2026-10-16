@@ -567,6 +567,14 @@ def _generic_file_operands(command: str, args: list[str]) -> list[str]:
             operands.extend(arg for arg in args[index + 1 :] if arg)
             break
         if token.startswith("-"):
+            if command == "stat" and not token.startswith("--"):
+                # -c consumes the cluster's remainder or the next argument.
+                # Flags such as -L/-f/-t do not consume file operands.
+                for offset, flag in enumerate(token[1:], start=2):
+                    if flag == "c":
+                        skip_next = offset == len(token)
+                        break
+                continue
             if token in value_options:
                 skip_next = True
             option, separator, value = token.partition("=")

@@ -1494,3 +1494,54 @@ class TestTildeShellExpansion:
             classify(tool, {"command": command}, working_directory="/tmp/project")
             == Classification.READ
         )
+
+
+class TestStatClusterFormats:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-Lc "/etc/passwd" README.md',
+            '-fLc "/etc/passwd" README.md',
+            '-Ltc "/etc/passwd" -- README.md',
+            '-Lc"/etc/passwd" README.md',
+            '-L -c "/etc/passwd" README.md',
+        ],
+    )
+    def test_clustered_stat_formats_remain_data(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/README.md"
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-Lc "%n" "/etc/passwd"',
+            '-Lc"%n" -- "/etc/passwd"',
+            '-Lcfoc "/etc/passwd"',
+            '-Lft "/etc/passwd"',
+        ],
+    )
+    def test_stat_cluster_keeps_actual_file_operand(self, tool, arguments):
+        args = {"command": f"stat {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
