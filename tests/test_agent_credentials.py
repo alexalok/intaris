@@ -1120,3 +1120,36 @@ def test_restricted_path_approval_reuses_only_exact_human_call(client, resolved_
     assert sibling["path"] == "llm"
     assert inference.call_count == (1 if resolved_by == "user" else 2)
     assert not evaluator._approved_paths.get(("owner", "s"))
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "deny_paths", [[], ["/etc/*"]], ids=["boundary", "explicit-deny"]
+)
+def test_agent_quoted_shell_paths_obey_mandatory_policy(client, tool, deny_paths):
+    import intaris.server as srv
+
+    evaluator = srv._get_evaluator()
+    evaluator._agent_policy = {**POLICY, "deny_paths": deny_paths}
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Outside-project read requires authorization",
+                "decision": "deny",
+            }
+        ),
+    ) as inference:
+        result = evaluate(client, tool=tool, command='cat "/etc/passwd"')
+    assert result["decision"] == "deny", result
+    assert result["path"] == ("critical" if deny_paths else "llm"), result
+    assert inference.call_count == (0 if deny_paths else 1)
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == ("critical" if deny_paths else "write")
+    assert audit["tool"] == tool
+    if not deny_paths:
+        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        assert context["target_paths"] == ["/etc/passwd"]

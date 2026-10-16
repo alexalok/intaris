@@ -13,6 +13,7 @@ from intaris.classifier import (
     is_path_within,
     is_read_only,
     resolve_path,
+    resolve_tool_paths,
 )
 
 
@@ -578,7 +579,7 @@ class TestBashPathExtraction:
         assert extract_bash_paths("ls -la") == []
 
     def test_ignores_quoted_paths(self):
-        """Paths inside quotes are stripped before extraction."""
+        """Quoted echo operands are literal data, not filesystem targets."""
         paths = extract_bash_paths("echo '/etc/shadow'")
         assert "/etc/shadow" not in paths
 
@@ -1098,3 +1099,87 @@ class TestIsReadOnly:
         assert is_read_only("sequentialthinking_sequentialthinking", {})
         assert is_read_only("sequentialthinking:sequentialthinking", {})
         assert is_read_only("mcp__sequentialthinking__sequentialthinking", {})
+
+
+class TestQuotedShellFileOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,target",
+        [
+            ('cat "/etc/passwd"', "/etc/passwd"),
+            ("cat '/etc/passwd'", "/etc/passwd"),
+            ('cat /etc/"passwd"', "/etc/passwd"),
+            ('cat -n "/etc/passwd"', "/etc/passwd"),
+            ('ls -d "/etc/passwd"', "/etc/passwd"),
+            ('head -n 5 "/etc/passwd"', "/etc/passwd"),
+            ('tail -c 5 "/etc/passwd"', "/etc/passwd"),
+            ('grep "root" "/etc/passwd"', "/etc/passwd"),
+            ('rg -f "/etc/passwd" README.md', "/etc/passwd"),
+            ('diff README.md "/etc/passwd"', "/etc/passwd"),
+            ('wc -l "/etc/passwd"', "/etc/passwd"),
+            ('du -L "/etc/passwd"', "/etc/passwd"),
+            ('cut -d ":" -f 1 "/etc/passwd"', "/etc/passwd"),
+            ('sort "/etc/passwd"', "/etc/passwd"),
+            ('stat "/etc/passwd"', "/etc/passwd"),
+            ('file "/etc/passwd"', "/etc/passwd"),
+            ('tree "/etc/passwd"', "/etc/passwd"),
+            ('cat "/etc/config file"', "/etc/config file"),
+            (r"cat /etc/config\ file", "/etc/config file"),
+            ('cat "../../etc/passwd"', "/etc/passwd"),
+            ('du --files0-from="/etc/passwd"', "/etc/passwd"),
+            ("du --files0-from=/etc/passwd", "/etc/passwd"),
+            ('find "/etc/passwd"', "/etc/passwd"),
+            ('df "/etc/passwd"', "/etc/passwd"),
+            ('jq ".key" "/etc/passwd"', "/etc/passwd"),
+            ('git diff --no-index "/etc/passwd" README.md', "/etc/passwd"),
+            ('find "../../etc/passwd"', "/etc/passwd"),
+        ],
+    )
+    def test_quoted_operands_obey_deny_and_boundary(self, tool, command, target):
+        args = {"command": command}
+        directory = "/tmp/project"
+        resolved = resolve_tool_paths(tool, args, directory)
+        assert target in resolved
+        assert classify(tool, args, working_directory=directory) == Classification.WRITE
+        # Explicit denies retain priority over even an operator tool allow.
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory=directory,
+                session_policy={"deny_paths": ["/etc/*"], "allow_tools": [tool]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "/etc/passwd"',
+            'grep "/etc/passwd" README.md',
+            'rg -e "/etc/passwd" README.md',
+            'cut -d "/" -f 1 README.md',
+            'cat "README.md"',
+            'cat "docs/read me.txt"',
+            'ls -d "docs"',
+            'head -n 5 "README.md"',
+            'diff --label "/etc/passwd" README.md other.md',
+            'stat --format "/etc/passwd" README.md',
+            'tr "/etc/passwd" "x"',
+            'date "+/etc/passwd"',
+        ],
+    )
+    def test_quoted_data_and_in_project_files_stay_read(self, tool, command):
+        assert (
+            classify(
+                tool,
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    def test_absolute_extractor_preserves_complete_quoted_operand(self):
+        assert "/etc/config file" in extract_bash_paths('cat "/etc/config file"')

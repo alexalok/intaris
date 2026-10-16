@@ -374,22 +374,12 @@ def _normalize_unified_diff_path(path_header: str) -> str | None:
 
 
 def extract_bash_paths(command: str) -> list[str]:
-    """Extract absolute paths from a bash command string.
+    """Extract absolute shell paths, preserving quoted filesystem operands.
 
-    Uses a simple regex to find absolute paths. Intentionally
-    conservative — only catches obvious cases like ``cat /etc/shadow``.
-    Does not handle shell variables, tilde expansion, or subshells.
-
-    Args:
-        command: Bash command string.
-
-    Returns:
-        List of absolute path strings found in the command.
+    Known file commands use operand-aware tokenization; quoted search patterns
+    and literal output are not paths. This does not expand shell syntax.
     """
-    # Strip quoted strings first to avoid matching paths inside
-    # string literals that may be data, not filesystem targets.
-    stripped = _strip_quoted_strings(command)
-    return _BASH_ABSOLUTE_PATH_RE.findall(stripped)
+    return _extract_bash_file_paths(command, include_relative=False)
 
 
 def _is_sensitive_path(path: str) -> bool:
@@ -434,19 +424,39 @@ def _is_benign_env_template(basename: str) -> bool:
 
 def extract_sensitive_bash_paths(command: str) -> list[str]:
     """Extract sensitive relative or absolute file operands from shell text."""
+    return [
+        path for path in _extract_bash_file_paths(command) if _is_sensitive_path(path)
+    ]
+
+
+def _extract_bash_file_paths(
+    command: str, *, include_relative: bool = True
+) -> list[str]:
+    """Extract literal operands without discarding quotes or expanding shell text."""
     paths: list[str] = []
     for segment in re.split(r"\|\||&&|[|;&]", command):
+        # Keep existing unquoted-path coverage, including unknown option forms.
+        paths.extend(_BASH_ABSOLUTE_PATH_RE.findall(_strip_quoted_strings(segment)))
         try:
-            tokens = shlex.split(segment)
+            tokens = _unwrap_read_command(shlex.split(segment))
         except ValueError:
-            continue
-        tokens = _unwrap_read_command(tokens)
-        if not tokens or tokens[0] not in _BASH_FILE_OPERAND_COMMANDS:
-            continue
-        for candidate in _file_operands_for_command(tokens):
-            if _is_sensitive_path(candidate):
-                paths.append(candidate)
-    return paths
+            tokens = []
+        if tokens and tokens[0] in _BASH_FILE_OPERAND_COMMANDS:
+            paths.extend(
+                path
+                for path in _file_operands_for_command(tokens)
+                if path and (include_relative or os.path.isabs(path))
+            )
+        elif tokens and tokens[0] not in {"echo", "printf", "tr", "date"}:
+            # Other path-looking arguments are conservative targets; literal
+            # output operands are data, not files.
+            paths.extend(
+                token
+                for token in tokens[1:]
+                if os.path.isabs(token)
+                or (include_relative and token.startswith(("./", "../")))
+            )
+    return list(dict.fromkeys(paths))
 
 
 def _unwrap_read_command(tokens: list[str]) -> list[str]:
@@ -523,11 +533,30 @@ def _file_operands_for_command(tokens: list[str]) -> list[str]:
         return _sed_file_operands(args)
     if command == "awk":
         return _awk_file_operands(args)
-    return _generic_file_operands(args)
+    return _generic_file_operands(command, args)
 
 
-def _generic_file_operands(args: list[str]) -> list[str]:
-    """Return non-option operands, skipping common option values."""
+def _generic_file_operands(command: str, args: list[str]) -> list[str]:
+    """Return file operands, skipping only command-specific data option values."""
+    # A flag such as cat -n or ls -d takes no value: never discard its file.
+    value_options = {
+        "cut": {
+            "-b",
+            "-c",
+            "-d",
+            "-f",
+            "--bytes",
+            "--characters",
+            "--delimiter",
+            "--fields",
+            "--output-delimiter",
+        },
+        "head": {"-n", "-c", "--lines", "--bytes"},
+        "tail": {"-n", "-c", "--lines", "--bytes"},
+        "diff": {"--label", "-L"},
+        "du": {"-d", "--max-depth"},
+        "stat": {"--format", "--printf"},
+    }.get(command, set())
     operands: list[str] = []
     skip_next = False
     for index, token in enumerate(args):
@@ -538,8 +567,15 @@ def _generic_file_operands(args: list[str]) -> list[str]:
             operands.extend(arg for arg in args[index + 1 :] if arg)
             break
         if token.startswith("-"):
-            if token in {"-d", "-n", "-c", "-m", "--label", "-L"}:
+            if token in value_options:
                 skip_next = True
+            option, separator, value = token.partition("=")
+            if (
+                separator
+                and option not in value_options
+                and value.startswith(("/", "./", "../"))
+            ):
+                operands.append(value)
             continue
         operands.append(token)
     return operands
@@ -941,8 +977,8 @@ def resolve_tool_paths(
     """Extract and resolve file paths from tool arguments.
 
     For structured tools (Read, Edit, etc.), extracts paths from known
-    argument keys. For read-only bash commands, also extracts absolute
-    paths from the command string.
+    argument keys. For shell commands, also extracts literal filesystem
+    operands from the command string.
 
     Args:
         tool: Tool name.
@@ -961,12 +997,11 @@ def resolve_tool_paths(
         if isinstance(patch_text, str) and patch_text:
             raw_paths.extend(extract_apply_patch_paths(patch_text))
 
-    # For bash commands, also extract absolute paths from the command string
+    # Shell file operands retain quotes, spaces, and relative path components.
     if tool in {"bash", "terminal"}:
         command = _extract_bash_command(args)
         if command:
-            raw_paths.extend(extract_bash_paths(command))
-            raw_paths.extend(extract_sensitive_bash_paths(command))
+            raw_paths.extend(_extract_bash_file_paths(command))
 
     if not raw_paths:
         return []
