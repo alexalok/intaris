@@ -162,12 +162,12 @@ _cfg: Config | None = None
 _client: IntarisClient | None = None
 
 
-def _get_or_create_state(task_id: str) -> SessionState:
+def _get_or_create_state(session_id: str) -> SessionState:
     with _sessions_lock:
-        state = _sessions.get(task_id)
+        state = _sessions.get(session_id)
         if state is None:
             state = SessionState()
-            _sessions[task_id] = state
+            _sessions[session_id] = state
             # Evict oldest entries if over limit
             if len(_sessions) > MAX_SESSIONS:
                 excess = len(_sessions) - MAX_SESSIONS
@@ -176,6 +176,23 @@ def _get_or_create_state(task_id: str) -> SessionState:
                     evicted = _sessions.pop(k, None)
                     if evicted is not None:
                         evicted._ended.set()
+        return state
+
+
+def _resolve_invocation_session(session_id: Any) -> SessionState:
+    """Resolve only the authoritative Hermes invocation session identity.
+
+    Hermes passes session_id and task_id separately to handlers and hooks.
+    task_id identifies tool resources, not the session used by lifecycle hooks.
+    Missing or unknown identity must never borrow another session, even when
+    fail-open is enabled. Idle state and insertion order are not identity.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("Missing or invalid Hermes session_id.")
+    with _sessions_lock:
+        state = _sessions.get(session_id)
+        if state is None or not state.intaris_session_id:
+            raise ValueError("No active Intaris session for this Hermes session_id.")
         return state
 
 
@@ -482,6 +499,26 @@ def _get_mcp_tool_names() -> set[str]:
 # ============================================================================
 
 
+def _decision_response_error(result: ApiResult) -> str | None:
+    """Reject invalid decision replies without conflating them with outages."""
+    if result.protocol_error:
+        return result.error or "Invalid API response"
+    if result.data is None and (result.status is None or result.status >= 400):
+        return None  # Transport/HTTP failure, handled by the caller.
+    if not isinstance(result.data, dict):
+        return "Invalid API response: expected a JSON object"
+    decision = result.data.get("decision")
+    if not isinstance(decision, str) or decision not in ("approve", "deny", "escalate"):
+        return (
+            "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
+        )
+    if decision == "escalate":
+        call_id = result.data.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return "Invalid API response: escalation requires a non-empty call_id"
+    return None
+
+
 def _poll_human(
     invocation: Invocation,
     label: str,
@@ -514,11 +551,21 @@ def _poll_human(
                     heartbeat()
             attempt += 1
             result = invocation.request(fetch)
-            if result.data:
-                value = result.data.get(field_name)
-                if value in terminal_values:
-                    logger.info("[intaris] %s: %s", label, value)
-                    return value
+            if result.protocol_error:
+                return "invalid_response"
+            if result.data is None:
+                continue  # Server unreachable; remain within the wait budget.
+            if not isinstance(result.data, dict):
+                return "invalid_response"
+            value = result.data.get(field_name)
+            if field_name == "user_decision":
+                if field_name not in result.data:
+                    return "invalid_response"
+                if value is not None and value not in terminal_values:
+                    return "invalid_response"
+            if value in terminal_values:
+                logger.info("[intaris] %s: %s", label, value)
+                return value
 
 
 def _poll_escalation(call_id: str, tool_name: str, invocation: Invocation) -> str:
@@ -562,39 +609,16 @@ def _make_guarded_handler(
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
 
-    def evaluate_and_dispatch(args: dict, invocation: Invocation, **kwargs: Any) -> str:
+    def evaluate_and_dispatch(
+        args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
+    ) -> str:
         assert _cfg is not None and _client is not None
 
         def dispatch(call_id: str = "") -> str:
             invocation.check()
-            if state is not None:
-                _queue_pending_tool_result(state, tool_name, args, call_id)
+            _queue_pending_tool_result(state, tool_name, args, call_id)
             invocation.check()
             return original_handler(args, **kwargs)
-
-        # Find the active session — use the most recent non-idle session
-        task_id: str | None = None
-        state: SessionState | None = None
-        with _sessions_lock:
-            for tid, s in reversed(list(_sessions.items())):
-                if s.intaris_session_id:
-                    task_id = tid
-                    state = s
-                    if not s.is_idle:
-                        break
-
-        if not state or not state.intaris_session_id:
-            if _cfg.fail_open:
-                logger.warning(
-                    "[intaris] No active session for %s — allowing (fail-open)",
-                    tool_name,
-                )
-                return dispatch()
-            return json.dumps(
-                {
-                    "error": f"[intaris] No active Intaris session. Cannot evaluate {tool_name}."
-                }
-            )
 
         # Evaluate the tool call
         intention_pending = state.intention_pending
@@ -611,6 +635,10 @@ def _make_guarded_handler(
         # Clear intention_pending after first evaluate
         if intention_pending:
             state.intention_pending = False
+
+        response_error = _decision_response_error(result)
+        if response_error:
+            return json.dumps({"error": f"[intaris] {tool_name}: {response_error}"})
 
         if not result.data:
             # Distinguish config errors (4xx) from transient failures
@@ -635,7 +663,7 @@ def _make_guarded_handler(
             )
 
         data = result.data
-        decision = data.get("decision", "deny")
+        decision = data["decision"]
         reasoning = data.get("reasoning", "")
         call_id = data.get("call_id", "")
         risk = data.get("risk", "")
@@ -675,7 +703,7 @@ def _make_guarded_handler(
                     lambda: client.update_session(
                         state.intaris_session_id,
                         _build_intention(),
-                        _build_details(session_id=task_id or ""),
+                        _build_details(session_id=kwargs["session_id"]),
                     )
                 )
             except WaitStopped:
@@ -694,6 +722,8 @@ def _make_guarded_handler(
                 poll_result = _poll_session_status(
                     state.intaris_session_id, tool_name, invocation
                 )
+                if poll_result == "invalid_response":
+                    return json.dumps({"error": "[intaris] Invalid session response"})
                 if poll_result == "active":
                     # Re-evaluate after reactivation
                     logger.info(
@@ -705,6 +735,11 @@ def _make_guarded_handler(
                             state.intaris_session_id, tool_name, args
                         )
                     )
+                    response_error = _decision_response_error(re_result)
+                    if response_error:
+                        return json.dumps(
+                            {"error": f"[intaris] {tool_name}: {response_error}"}
+                        )
                     if re_result.data and re_result.data.get("decision") == "approve":
                         return dispatch(str(re_result.data.get("call_id") or ""))
                     if re_result.data and re_result.data.get("decision") == "escalate":
@@ -717,6 +752,12 @@ def _make_guarded_handler(
                         poll_result = _poll_escalation(
                             re_call_id, tool_name, invocation
                         )
+                        if poll_result == "invalid_response":
+                            return json.dumps(
+                                {
+                                    "error": f"[intaris] Invalid escalation response ({re_call_id})"
+                                }
+                            )
                         if poll_result == "approve":
                             return dispatch(re_call_id)
                         return json.dumps(
@@ -760,6 +801,10 @@ def _make_guarded_handler(
                 reasoning,
             )
             poll_result = _poll_escalation(call_id, tool_name, invocation)
+            if poll_result == "invalid_response":
+                return json.dumps(
+                    {"error": f"[intaris] Invalid escalation response ({call_id})"}
+                )
             if poll_result == "approve":
                 return dispatch(call_id)
             return json.dumps(
@@ -767,25 +812,23 @@ def _make_guarded_handler(
             )
 
         # -- APPROVE -----------------------------------------------------------
-        return dispatch(call_id)
+        if decision == "approve":
+            return dispatch(call_id)
+        return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
     def guarded_handler(args: dict, **kwargs: Any) -> str:
         assert _cfg is not None
-        # Cancellation follows the supplied invocation identity, independently of
-        # evaluation session selection. Never borrow another session's lifetime.
-        identity = kwargs.get("session_id") or kwargs.get("task_id")
-        with _sessions_lock:
-            if identity:
-                origin = _sessions.get(identity)
-            elif len(_sessions) == 1:
-                origin = next(iter(_sessions.values()))
-            else:
-                origin = None
-            ended = origin._ended if origin is not None else None
-        invocation = Invocation(ended, _cfg.escalation_timeout_s)
+        try:
+            state = _resolve_invocation_session(kwargs.get("session_id"))
+        except ValueError as exc:
+            return json.dumps(
+                {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
+            )
+        # Evaluation and cancellation use the same authoritative session state.
+        invocation = Invocation(state._ended, _cfg.escalation_timeout_s)
         try:
             invocation.check()
-            return evaluate_and_dispatch(args, invocation, **kwargs)
+            return evaluate_and_dispatch(args, state, invocation, **kwargs)
         except WaitStopped as exc:
             return json.dumps(
                 {
@@ -829,21 +872,22 @@ def _register_mcp_tools(ctx: Any) -> None:
             def mcp_handler(args: dict, **kwargs: Any) -> str:
                 assert _client is not None
 
-                # Find active session
-                intaris_session_id: str | None = None
-                with _sessions_lock:
-                    for s in reversed(list(_sessions.values())):
-                        if s.intaris_session_id:
-                            intaris_session_id = s.intaris_session_id
-                            if not s.is_idle:
-                                break
-
-                if not intaris_session_id:
+                try:
+                    state = _resolve_invocation_session(kwargs.get("session_id"))
+                except ValueError as exc:
                     return json.dumps(
-                        {"error": "[intaris] No active session for MCP tool call"}
+                        {"error": f"[intaris] {exc} Cannot call MCP tool {srv}:{tn}."}
                     )
 
-                result = _client.call_mcp_tool(intaris_session_id, srv, tn, args)
+                result = _client.call_mcp_tool(state.intaris_session_id, srv, tn, args)
+
+                response_error = _decision_response_error(result)
+                if response_error:
+                    # The server may already have executed the tool. Report the
+                    # invalid reply; do not claim success or retry it here.
+                    return json.dumps(
+                        {"error": f"[intaris] MCP tool call: {response_error}"}
+                    )
 
                 if not result.data:
                     return json.dumps(
@@ -854,7 +898,7 @@ def _register_mcp_tools(ctx: Any) -> None:
 
                 data = result.data
                 decision = data.get("decision")
-                content = data.get("content", [])
+                content = data.get("content")
 
                 if decision == "deny":
                     reason = data.get(
@@ -871,6 +915,23 @@ def _register_mcp_tools(ctx: Any) -> None:
                                 f"[intaris] ESCALATED ({call_id}): {reason}\n"
                                 f"Approve or deny in the Intaris UI, then retry."
                             )
+                        }
+                    )
+
+                # The REST proxy normalizes MCP results to text blocks.
+                if (
+                    not isinstance(content, list)
+                    or any(
+                        not isinstance(c, dict)
+                        or c.get("type") != "text"
+                        or not isinstance(c.get("text"), str)
+                        for c in content
+                    )
+                    or not isinstance(data.get("isError", False), bool)
+                ):
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Invalid MCP response: malformed tool result"
                         }
                     )
 
@@ -1025,13 +1086,19 @@ def _on_pre_llm_call(
 
 
 def _on_pre_tool_call(
-    tool_name: str = "", args: dict | None = None, task_id: str = "", **kwargs: Any
+    tool_name: str = "",
+    args: dict | None = None,
+    task_id: str = "",
+    session_id: str = "",
+    **kwargs: Any,
 ) -> None:
     """pre_tool_call: Record tool call event (evaluation happens in wrapper)."""
-    if not task_id:
+    try:
+        _resolve_invocation_session(session_id)
+    except ValueError:
         return
     _record_event(
-        task_id,
+        session_id,
         {
             "type": "tool_call",
             "data": {
@@ -1044,7 +1111,7 @@ def _on_pre_tool_call(
                     or ""
                 )
                 or None,
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )
@@ -1055,12 +1122,14 @@ def _on_post_tool_call(
     args: dict | None = None,
     result: Any = "",
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     """post_tool_call: Record tool result."""
-    if not task_id:
+    try:
+        state = _resolve_invocation_session(session_id)
+    except ValueError:
         return
-    state = _sessions.get(task_id)
     args_key = _args_fingerprint(args)
     mapped_call_id: str | None = None
     if state:
@@ -1071,7 +1140,7 @@ def _on_post_tool_call(
                 del state.pending_tool_results[i]
                 break
     _record_event(
-        task_id,
+        session_id,
         {
             "type": "tool_result",
             "data": {
@@ -1097,7 +1166,7 @@ def _on_post_tool_call(
                     or kwargs.get("error")
                 ),
                 "error": kwargs.get("error"),
-                "session_key": task_id,
+                "session_key": session_id,
             },
         },
     )

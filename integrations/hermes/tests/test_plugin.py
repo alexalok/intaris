@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 import types
-from pathlib import Path
+import urllib.error
 from unittest import mock
 
 import pytest
@@ -70,6 +71,9 @@ from hermes_intaris import (  # noqa: E402
 )
 from hermes_intaris.client import ApiResult, IntarisClient  # noqa: E402
 
+from . import test_waits  # noqa: E402
+
+host = test_waits.host
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -98,6 +102,113 @@ def env_vars(monkeypatch):
     monkeypatch.setenv("INTARIS_URL", "http://test:8060")
     monkeypatch.setenv("INTARIS_API_KEY", "test-key")
     monkeypatch.setenv("INTARIS_USER_ID", "test-user")
+
+
+@pytest.fixture
+def scripted_http(monkeypatch, host):
+    """Control only transport and time; keep adapter/client/polling real."""
+    clock = types.SimpleNamespace(now=0.0)
+
+    def sleep(seconds):
+        clock.now += seconds
+
+    monkeypatch.setattr("time.sleep", sleep)
+    monkeypatch.setattr("time.monotonic", lambda: clock.now)
+    monkeypatch.setattr(
+        "hermes_intaris.waits.Invocation._wait_slice",
+        lambda _self, seconds: sleep(seconds),
+    )
+
+    def script(*replies):
+        responses = []
+        for reply in replies:
+            if isinstance(reply, Exception):
+                responses.append(reply)
+                continue
+            body = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
+            response = io.BytesIO(body)
+            response.status = 200
+            responses.append(response)
+        transport = mock.Mock(side_effect=responses)
+        monkeypatch.setattr("urllib.request.urlopen", transport)
+        return transport
+
+    return script
+
+
+@pytest.fixture
+def guarded_native():
+    """Create a real guard with valid Hermes context and observable execution."""
+    import hermes_intaris as mod
+
+    mod._cfg = Config(checkpoint_interval=0, escalation_timeout_s=10)
+    mod._client = IntarisClient("http://test:8060", "test-key", "test-user")
+    state = _get_or_create_state("task-1")
+    state.intaris_session_id = "hm-test-session"
+    state.session_created = True
+    executed = []
+
+    def original(args, **kwargs):
+        executed.append((args, kwargs))
+        return json.dumps({"result": "executed"})
+
+    handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
+
+    def invoke():
+        return json.loads(
+            handler({"command": "pwd"}, task_id="task-1", session_id="task-1")
+        )
+
+    return invoke, executed, state
+
+
+INVALID_DECISION_RESPONSES = [
+    pytest.param({"decision": "unexpected"}, id="unknown"),
+    pytest.param({"decision": "APPROVE"}, id="uppercase"),
+    pytest.param({"decision": " approve "}, id="whitespace"),
+    pytest.param({"decision": None}, id="null-decision"),
+    pytest.param({"decision": False}, id="false-decision"),
+    pytest.param({"decision": True}, id="true-decision"),
+    pytest.param({"decision": 1}, id="number-decision"),
+    pytest.param({"decision": []}, id="array-decision"),
+    pytest.param({"decision": {"approve": True}}, id="object-decision"),
+    pytest.param({"reasoning": "missing decision"}, id="missing-decision"),
+    pytest.param({"decision": "escalate"}, id="missing-escalation-id"),
+    pytest.param({}, id="empty-object"),
+    pytest.param(None, id="null-response"),
+    pytest.param(False, id="false-response"),
+    pytest.param(True, id="true-response"),
+    pytest.param(1, id="number-response"),
+    pytest.param("approve", id="string-response"),
+    pytest.param([], id="empty-array"),
+    pytest.param([{"decision": "approve"}], id="array-response"),
+    pytest.param(b'{"decision":', id="malformed-json"),
+    pytest.param(b"", id="empty-body"),
+    pytest.param(b"\xff", id="invalid-utf8"),
+    pytest.param(
+        b'{"decision":"approve","content":[],"metadata":NaN}', id="non-json-nan"
+    ),
+    pytest.param(
+        b'{"decision":"approve","content":[],"metadata":Infinity}',
+        id="non-json-infinity",
+    ),
+    pytest.param(
+        b'{"decision":"approve","content":[],"metadata":-Infinity}',
+        id="non-json-negative-infinity",
+    ),
+]
+
+
+def _evaluation(decision, **fields):
+    return {
+        "call_id": "call-1",
+        "decision": decision,
+        "reasoning": "Safety evaluation",
+        "risk": "low",
+        "path": "llm",
+        "latency_ms": 1,
+        **fields,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +293,8 @@ class TestHelpers:
         assert "8 approved" in summary
 
     def test_get_or_create_state(self):
-        state1 = _get_or_create_state("task-1")
-        state2 = _get_or_create_state("task-1")
+        state1 = _get_or_create_state("session-1")
+        state2 = _get_or_create_state("session-1")
         assert state1 is state2
         assert state1.call_count == 0
 
@@ -260,12 +371,12 @@ class TestToolWrapper:
         mod._client = IntarisClient("http://test:8060", "test-key")
 
         # Create a session
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test-session"
         return state
 
     def test_approve_calls_original(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "read_file", "file-tools", False)
@@ -282,13 +393,17 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            result = handler({"path": "/tmp/test.txt"})
+            result = handler(
+                {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+            )
 
         assert result == '{"result": "ok"}'
-        original.assert_called_once_with({"path": "/tmp/test.txt"})
+        original.assert_called_once_with(
+            {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+        )
 
     def test_deny_blocks_execution(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
@@ -305,7 +420,9 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            result = handler({"command": "rm -rf /"})
+            result = handler(
+                {"command": "rm -rf /"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -317,7 +434,7 @@ class TestToolWrapper:
         import hermes_intaris as mod
 
         monkeypatch.setenv("INTARIS_FAIL_OPEN", "true")
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         mod._cfg = _resolve_config()  # Re-resolve with fail_open=true
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
@@ -325,20 +442,24 @@ class TestToolWrapper:
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Connection refused")
-            result = handler({"path": "/tmp/test.txt"})
+            result = handler(
+                {"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1"
+            )
 
         assert result == '{"result": "ok"}'
         original.assert_called_once()
 
     def test_fail_closed_on_network_error(self, monkeypatch):
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Connection refused")
-            result = handler({"command": "ls"})
+            result = handler(
+                {"command": "ls"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -350,7 +471,7 @@ class TestToolWrapper:
         import hermes_intaris as mod
 
         monkeypatch.setenv("INTARIS_FAIL_OPEN", "true")
-        state = self._setup_plugin(monkeypatch)
+        self._setup_plugin(monkeypatch)
         mod._cfg = _resolve_config()
         original = mock.MagicMock(return_value='{"result": "ok"}')
 
@@ -358,7 +479,9 @@ class TestToolWrapper:
 
         with mock.patch.object(IntarisClient, "evaluate") as mock_eval:
             mock_eval.return_value = ApiResult(error="Unauthorized", status=401)
-            result = handler({"command": "ls"})
+            result = handler(
+                {"command": "ls"}, session_id="session-1", task_id="task-1"
+            )
 
         parsed = json.loads(result)
         assert "error" in parsed
@@ -383,7 +506,7 @@ class TestToolWrapper:
                 },
                 status=200,
             )
-            handler({"path": "/tmp/test.txt"})
+            handler({"path": "/tmp/test.txt"}, session_id="session-1", task_id="task-1")
 
         assert state.call_count == 1
         assert state.approved_count == 1
@@ -402,11 +525,308 @@ class TestToolWrapper:
         original = mock.MagicMock(return_value='{"result": "ok"}')
         handler = _make_guarded_handler(original, "terminal", "terminal-tools", False)
 
-        result = handler({"command": "ls"})
+        result = handler({"command": "ls"}, session_id="session-1", task_id="task-1")
         parsed = json.loads(result)
         assert "error" in parsed
         assert "No active Intaris session" in parsed["error"]
         original.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Decision protocol tests
+# ---------------------------------------------------------------------------
+
+
+class TestDecisionProtocol:
+    def test_non_json_constant_names_are_allowed_in_strings(
+        self, guarded_native, scripted_http
+    ):
+        invoke, executed, _ = guarded_native
+        scripted_http(_evaluation("approve", reasoning="NaN Infinity -Infinity"))
+
+        assert invoke() == {"result": "executed"}
+        assert len(executed) == 1
+
+    @pytest.mark.parametrize("fail_open", [False, True])
+    @pytest.mark.parametrize("reactivated", [False, True])
+    @pytest.mark.parametrize("body", INVALID_DECISION_RESPONSES)
+    def test_invalid_evaluation_never_executes(
+        self, guarded_native, scripted_http, body, fail_open, reactivated
+    ):
+        import hermes_intaris as mod
+
+        invoke, executed, state = guarded_native
+        mod._cfg.fail_open = fail_open
+        prefix = []
+        if reactivated:
+            prefix = [
+                _evaluation("deny", session_status="suspended"),
+                {"session_id": "hm-test-session", "status": "active"},
+            ]
+        transport = scripted_http(*prefix, body)
+
+        result = invoke()
+
+        assert executed == []
+        assert "invalid" in result["error"].lower()
+        assert "response" in result["error"].lower()
+        assert state.pending_tool_results == []
+        assert transport.call_count == len(prefix) + 1
+
+    @pytest.mark.parametrize("reactivated", [False, True])
+    @pytest.mark.parametrize("decision,expected_calls", [("approve", 1), ("deny", 0)])
+    def test_recognized_decision_controls_execution(
+        self, guarded_native, scripted_http, decision, expected_calls, reactivated
+    ):
+        invoke, executed, state = guarded_native
+        prefix = []
+        if reactivated:
+            prefix = [
+                _evaluation("deny", session_status="suspended"),
+                {"session_id": "hm-test-session", "status": "active"},
+            ]
+        transport = scripted_http(*prefix, _evaluation(decision))
+
+        result = invoke()
+
+        assert len(executed) == expected_calls
+        if expected_calls:
+            assert result == {"result": "executed"}
+            assert executed == [
+                ({"command": "pwd"}, {"task_id": "task-1", "session_id": "task-1"})
+            ]
+            assert state.pending_tool_results[0]["call_id"] == "call-1"
+        else:
+            assert "DENIED" in result["error"]
+        assert transport.call_count == len(prefix) + 1
+        request = transport.call_args.args[0]
+        assert json.loads(request.data)["session_id"] == "hm-test-session"
+
+    @pytest.mark.parametrize("reactivated", [False, True])
+    @pytest.mark.parametrize("resolution,expected_calls", [("approve", 1), ("deny", 0)])
+    def test_escalation_waits_for_explicit_resolution(
+        self, guarded_native, scripted_http, resolution, expected_calls, reactivated
+    ):
+        invoke, executed, state = guarded_native
+        prefix = []
+        if reactivated:
+            prefix = [
+                _evaluation("deny", session_status="suspended"),
+                {"session_id": "hm-test-session", "status": "active"},
+            ]
+        transport = scripted_http(
+            *prefix,
+            _evaluation("escalate"),
+            {"call_id": "call-1", "user_decision": None},
+            {"call_id": "call-1", "user_decision": resolution},
+        )
+        # No native execution is allowed before the audit returns approval.
+        respond = transport.side_effect
+
+        def respond_before_execution(*args, **kwargs):
+            assert executed == []
+            return next(respond)
+
+        transport.side_effect = respond_before_execution
+
+        result = invoke()
+
+        assert len(executed) == expected_calls
+        assert transport.call_count == len(prefix) + 3
+        if expected_calls:
+            assert result == {"result": "executed"}
+            assert state.pending_tool_results[0]["call_id"] == "call-1"
+        else:
+            assert "DENIED by user" in result["error"]
+
+    @pytest.mark.parametrize("reactivated", [False, True])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"user_decision": "unexpected"},
+            {"user_decision": False},
+            {"user_decision": True},
+            {"user_decision": []},
+            {"user_decision": {"approve": True}},
+            {},
+            [],
+            None,
+            b'{"user_decision":',
+            b'{"user_decision":"approve","metadata":NaN}',
+            b'{"user_decision":"approve","metadata":Infinity}',
+            b'{"user_decision":"approve","metadata":-Infinity}',
+        ],
+    )
+    def test_invalid_escalation_resolution_blocks(
+        self, guarded_native, scripted_http, body, reactivated
+    ):
+        import hermes_intaris as mod
+
+        invoke, executed, state = guarded_native
+        mod._cfg.fail_open = True
+        prefix = []
+        if reactivated:
+            prefix = [
+                _evaluation("deny", session_status="suspended"),
+                {"session_id": "hm-test-session", "status": "active"},
+            ]
+        transport = scripted_http(*prefix, _evaluation("escalate"), body)
+
+        result = invoke()
+
+        assert executed == []
+        assert "invalid" in result["error"].lower()
+        assert "response" in result["error"].lower()
+        assert state.pending_tool_results == []
+        assert transport.call_count == len(prefix) + 2
+
+    @pytest.mark.parametrize("call_id", [None, "", False, [], {}])
+    def test_escalation_requires_valid_call_id(
+        self, guarded_native, scripted_http, call_id
+    ):
+        invoke, executed, _ = guarded_native
+        transport = scripted_http(_evaluation("escalate", call_id=call_id))
+
+        result = invoke()
+
+        assert executed == []
+        assert "invalid" in result["error"].lower()
+        assert transport.call_count == 1
+
+    @pytest.mark.parametrize("reactivated", [False, True])
+    @pytest.mark.parametrize("fail_open", [False, True])
+    @pytest.mark.parametrize("status", [None, 401, 403, 404, 429, 503])
+    def test_availability_fail_open_does_not_override_http_rejections(
+        self, guarded_native, scripted_http, fail_open, status, reactivated
+    ):
+        import hermes_intaris as mod
+
+        invoke, executed, _ = guarded_native
+        mod._cfg.fail_open = fail_open
+        error = (
+            urllib.error.URLError("unreachable")
+            if status is None
+            else urllib.error.HTTPError(
+                "http://test:8060/api/v1/evaluate",
+                status,
+                "failure",
+                {},
+                io.BytesIO(b'{"decision":"approve"}'),
+            )
+        )
+        prefix = []
+        if reactivated:
+            prefix = [
+                _evaluation("deny", session_status="suspended"),
+                {"session_id": "hm-test-session", "status": "active"},
+            ]
+        transport = scripted_http(*prefix, error)
+
+        result = invoke()
+
+        # Preserve the existing stricter reactivation path: fresh approval is
+        # required after a known suspension, even during an availability fault.
+        allowed = not reactivated and fail_open and status in (None, 503)
+        assert len(executed) == int(allowed)
+        assert ("result" if allowed else "error") in result
+        assert transport.call_count == len(prefix) + 1
+
+    @pytest.mark.parametrize("body", [None, [], False, "approve", b"not json", b"\xff"])
+    def test_client_does_not_retry_invalid_protocol_responses(
+        self, scripted_http, body
+    ):
+        transport = scripted_http(body, _evaluation("approve"))
+        client = IntarisClient("http://test:8060", "key", "user")
+
+        result = client.call_api_with_retry("POST", "/api/v1/mcp/call", {})
+
+        assert result.data is None
+        assert result.status == 200
+        assert "invalid" in result.error.lower()
+        assert transport.call_count == 1
+
+
+class TestMCPDecisionProtocol:
+    def _invoke(self, scripted_http, body):
+        import hermes_intaris as mod
+
+        transport = scripted_http(
+            {
+                "tools": [
+                    {
+                        "server": "test",
+                        "name": "tool",
+                        "inputSchema": {"type": "object"},
+                    }
+                ]
+            },
+            body,
+        )
+        ctx = mock.Mock()
+        mod._register_mcp_tools(ctx)
+        handler = ctx.register_tool.call_args.kwargs["handler"]
+        result = json.loads(handler({}, task_id="task-1", session_id="task-1"))
+        # The server may already have executed the MCP call. Do not retry an
+        # invalid reply or present it as a successful result.
+        assert transport.call_count == 2
+        request = transport.call_args.args[0]
+        assert json.loads(request.data)["session_id"] == "hm-test-session"
+        return result
+
+    @pytest.mark.parametrize("fail_open", [False, True])
+    @pytest.mark.parametrize("body", INVALID_DECISION_RESPONSES)
+    def test_invalid_response_is_reported_as_error(
+        self, guarded_native, scripted_http, body, fail_open
+    ):
+        import hermes_intaris as mod
+
+        mod._cfg.fail_open = fail_open
+        result = self._invoke(scripted_http, body)
+
+        assert "invalid" in result["error"].lower()
+        assert "response" in result["error"].lower()
+        assert "result" not in result
+
+    @pytest.mark.parametrize("decision", ["approve", "deny", "escalate"])
+    def test_recognized_response(self, guarded_native, scripted_http, decision):
+        result = self._invoke(
+            scripted_http,
+            {
+                **_evaluation(decision),
+                "content": [{"type": "text", "text": "server result"}],
+                "isError": False,
+            },
+        )
+
+        if decision == "approve":
+            assert result == {"result": "server result"}
+        else:
+            assert ("DENIED" if decision == "deny" else "ESCALATED") in result["error"]
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {},
+            {"content": None},
+            {"content": "text"},
+            {"content": {}},
+            {"content": [None]},
+            {"content": ["text"]},
+            {"content": [{"text": None}]},
+            {"content": [{}]},
+            {"content": [{"type": "text"}]},
+            {"content": [{"type": 1, "text": "value"}]},
+            {"content": [{"text": "value"}]},
+            {"content": [], "isError": "false"},
+        ],
+    )
+    def test_malformed_approved_content_is_reported_as_error(
+        self, guarded_native, scripted_http, fields
+    ):
+        result = self._invoke(scripted_http, {**_evaluation("approve"), **fields})
+
+        assert "invalid" in result["error"].lower()
+        assert "response" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -429,9 +849,9 @@ class TestHooks:
                 data={"session_id": "hm-123"}, status=200
             )
             _on_session_start = mod._on_session_start
-            _on_session_start(session_id="task-1", model="gpt-5", platform="cli")
+            _on_session_start(session_id="session-1", model="gpt-5", platform="cli")
 
-        state = _sessions.get("task-1")
+        state = _sessions.get("session-1")
         assert state is not None
         assert state.intaris_session_id is not None
         assert state.intaris_session_id.startswith("hm-")
@@ -445,7 +865,7 @@ class TestHooks:
         mod._cfg = _resolve_config()
         mod._client = IntarisClient("http://test:8060", "test-key")
 
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test"
         state.call_count = 5
         state.approved_count = 4
@@ -458,7 +878,7 @@ class TestHooks:
             mock_status.return_value = ApiResult(data={}, status=200)
             mock_summary.return_value = ApiResult(data={}, status=200)
 
-            mod._on_session_end(session_id="task-1", completed=True)
+            mod._on_session_end(session_id="session-1", completed=True)
 
         mock_status.assert_called_once_with("hm-test", "completed")
         mock_summary.assert_called_once()
@@ -466,7 +886,7 @@ class TestHooks:
         assert "5 tool calls" in summary_text
 
         # Session should be removed
-        assert "task-1" not in _sessions
+        assert "session-1" not in _sessions
 
     def test_pre_llm_call_forwards_reasoning(self, monkeypatch):
         import hermes_intaris as mod
@@ -478,14 +898,14 @@ class TestHooks:
         mod._cfg = _resolve_config()
         mod._client = IntarisClient("http://test:8060", "test-key")
 
-        state = _get_or_create_state("task-1")
+        state = _get_or_create_state("session-1")
         state.intaris_session_id = "hm-test"
 
         with mock.patch.object(IntarisClient, "submit_reasoning") as mock_reason:
             mock_reason.return_value = ApiResult(data={}, status=200)
 
             mod._on_pre_llm_call(
-                session_id="task-1",
+                session_id="session-1",
                 user_message="Fix the bug in main.py",
             )
 
