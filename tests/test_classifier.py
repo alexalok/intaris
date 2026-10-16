@@ -1376,3 +1376,79 @@ class TestStatFormatOperands:
             )
             == Classification.CRITICAL
         )
+
+
+class TestSearchAuxiliaryFiles:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,option,target",
+        [("grep", "--exclude-from", "README.md"), ("rg", "--ignore-file", ".")],
+    )
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_search_files_obey_path_policy(
+        self, tool, command, option, target, separator
+    ):
+        args = {
+            "command": f'{command} {option}{separator}"/etc/passwd" pattern {target}'
+        }
+        paths = resolve_tool_paths(tool, args, "/tmp/project")
+        assert "/etc/passwd" in paths
+        assert "/tmp/project/pattern" not in paths
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize(
+        "command,option", [("grep", "--exclude-from"), ("rg", "--ignore-file")]
+    )
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_file_does_not_supply_search_pattern(
+        self, tool, command, option, separator
+    ):
+        args = {
+            "command": f'{command} {option}{separator}"ignore.txt" "/etc/passwd" README.md'
+        }
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/ignore.txt",
+            "/tmp/project/README.md",
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("separator", ["=", " "])
+    def test_auxiliary_file_preserves_ripgrep_listing_directory(self, tool, separator):
+        args = {
+            "command": f'rg --files --ignore-file{separator}"ignore.txt" "/etc/private"'
+        }
+        assert resolve_tool_paths(tool, args, "/tmp/project") == [
+            "/tmp/project/ignore.txt",
+            "/etc/private",
+        ]
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )

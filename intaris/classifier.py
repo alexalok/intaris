@@ -591,12 +591,12 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
     short_values = {"f": "file", "e": "pattern"}
     short_values.update(dict.fromkeys("mABC", "option"))
     short_values.update(dict.fromkeys("gtrTjEM" if command == "rg" else "dD", "option"))
+    auxiliary_file_option = "--ignore-file" if command == "rg" else "--exclude-from"
     for index, token in enumerate(args):
         if pending_value is not None:
-            if pending_value == "file":
+            if pending_value in {"file", "auxiliary_file"}:
                 operands.append(token)
-                pattern_seen = True
-            elif pending_value == "pattern":
+            if pending_value in {"file", "pattern"}:
                 pattern_seen = True
             pending_value = None
             continue
@@ -608,6 +608,14 @@ def _grep_file_operands(command: str, args: list[str]) -> list[str]:
             break
         if command == "rg" and token in {"--files", "--type-list"}:
             patternless = True
+            continue
+        # Exclusion/ignore files are read too, but do not supply search patterns.
+        option, separator, value = token.partition("=")
+        if option == auxiliary_file_option:
+            if separator:
+                operands.append(value)
+            else:
+                pending_value = "auxiliary_file"
             continue
         if token == "--file":
             pending_value = "file"

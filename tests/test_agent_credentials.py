@@ -1213,3 +1213,42 @@ def test_agent_stat_format_is_not_a_denied_path(client, tool):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "read"
     assert audit["tool"] == tool
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "command,option,target",
+    [("grep", "--exclude-from", "README.md"), ("rg", "--ignore-file", ".")],
+)
+@pytest.mark.parametrize("separator", ["=", " "])
+@pytest.mark.parametrize(
+    "deny_paths", [[], ["/etc/*"]], ids=["boundary", "explicit-deny"]
+)
+def test_agent_auxiliary_search_files_obey_policy(
+    client, tool, command, option, target, separator, deny_paths
+):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": deny_paths}
+    create(client, details={"working_directory": "/tmp/project"})
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "reasoning": "Unapproved auxiliary file",
+                "decision": "deny",
+            }
+        ),
+    ):
+        result = evaluate(
+            client,
+            tool=tool,
+            command=f'{command} {option}{separator}"/etc/passwd" pattern {target}',
+        )
+    assert result["decision"] == "deny", result
+    assert result["path"] == ("critical" if deny_paths else "llm"), result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == ("critical" if deny_paths else "write")
+    assert audit["tool"] == tool
