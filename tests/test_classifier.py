@@ -1183,3 +1183,82 @@ class TestQuotedShellFileOperands:
 
     def test_absolute_extractor_preserves_complete_quoted_operand(self):
         assert "/etc/config file" in extract_bash_paths('cat "/etc/config file"')
+
+
+class TestSearchFileOptionOperands:
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-nf "/etc/passwd" README.md',
+            '-nFf "/etc/passwd" README.md',
+            '-nf"/etc/passwd" README.md',
+            '-nFf"/etc/passwd" README.md',
+            '-nxvf "/etc/passwd" README.md',
+            '"/etc/passwd" -nf patterns.txt',
+            '"/etc/passwd" -ne root',
+            '-n -f "/etc/passwd" README.md',
+            '-n --file "/etc/passwd" README.md',
+            '-n --file="/etc/passwd" README.md',
+            '-nf patterns.txt -- "/etc/passwd"',
+        ],
+    )
+    def test_search_file_flags_keep_every_path(self, tool, command, arguments):
+        args = {"command": f"{command} {arguments}"}
+        assert "/etc/passwd" in resolve_tool_paths(tool, args, "/tmp/project")
+        assert (
+            classify(tool, args, working_directory="/tmp/project")
+            == Classification.WRITE
+        )
+        assert (
+            classify(
+                tool,
+                args,
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.CRITICAL
+        )
+
+    @pytest.mark.parametrize("tool", ["terminal", "bash"])
+    @pytest.mark.parametrize("command", ["grep", "rg"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-ne "/etc/passwd" README.md',
+            '-ne"/etc/passwd" README.md',
+            '-n --regexp="/etc/passwd" README.md',
+            '-n --regexp "/etc/passwd" README.md',
+            "-nf patterns.txt README.md",
+        ],
+    )
+    def test_search_pattern_values_remain_data(self, tool, command, arguments):
+        assert (
+            classify(
+                tool,
+                {"command": f"{command} {arguments}"},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'grep -nE "/etc/passwd" README.md',
+            'rg -nE utf-8 "/etc/passwd" README.md',
+            'rg -nrf "/etc/passwd" README.md',
+        ],
+    )
+    def test_search_cluster_stops_at_first_option_value(self, command):
+        assert (
+            classify(
+                "terminal",
+                {"command": command},
+                working_directory="/tmp/project",
+                session_policy={"deny_paths": ["/etc/*"]},
+            )
+            == Classification.READ
+        )

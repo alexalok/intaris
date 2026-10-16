@@ -528,7 +528,7 @@ def _file_operands_for_command(tokens: list[str]) -> list[str]:
     command = tokens[0]
     args = tokens[1:]
     if command in {"grep", "rg"}:
-        return _grep_file_operands(args)
+        return _grep_file_operands(command, args)
     if command == "sed":
         return _sed_file_operands(args)
     if command == "awk":
@@ -581,11 +581,15 @@ def _generic_file_operands(command: str, args: list[str]) -> list[str]:
     return operands
 
 
-def _grep_file_operands(args: list[str]) -> list[str]:
-    """Return grep/rg file operands while skipping the search pattern."""
+def _grep_file_operands(command: str, args: list[str]) -> list[str]:
+    """Return grep/rg file operands while keeping option values out of patterns."""
     operands: list[str] = []
+    first_positional: int | None = None
     pattern_seen = False
     pending_value: str | None = None
+    short_values = {"f": "file", "e": "pattern"}
+    short_values.update(dict.fromkeys("mABC", "option"))
+    short_values.update(dict.fromkeys("gtrTjEM" if command == "rg" else "dD", "option"))
     for index, token in enumerate(args):
         if pending_value is not None:
             if pending_value == "file":
@@ -597,23 +601,21 @@ def _grep_file_operands(args: list[str]) -> list[str]:
             continue
         if token == "--":
             remaining = args[index + 1 :]
-            if not pattern_seen and remaining:
-                remaining = remaining[1:]
-            operands.extend(arg for arg in remaining if arg)
+            if first_positional is None and remaining:
+                first_positional = len(operands)
+            operands.extend(remaining)
             break
-        if token in {"-f", "--file"}:
+        if token == "--file":
             pending_value = "file"
             continue
-        attached_file = _attached_option_value(token, "-f", "--file")
-        if attached_file is not None:
-            if attached_file:
-                operands.append(attached_file)
-                pattern_seen = True
+        if token.startswith("--file="):
+            operands.append(token.split("=", 1)[1])
+            pattern_seen = True
             continue
-        if token in {"-e", "--regexp"}:
+        if token == "--regexp":
             pending_value = "pattern"
             continue
-        if _attached_option_value(token, "-e", "--regexp") is not None:
+        if token.startswith("--regexp="):
             pattern_seen = True
             continue
         if token in {
@@ -625,19 +627,35 @@ def _grep_file_operands(args: list[str]) -> list[str]:
             "--binary-files",
             "--devices",
             "--directories",
-            "-m",
-            "-A",
-            "-B",
-            "-C",
         }:
             pending_value = "option"
             continue
+        if token.startswith("-") and not token.startswith("--"):
+            # In a short-option cluster, the first value-taking option consumes
+            # the remainder (or the next token): -nf PATH and -nfPATH both read PATH.
+            for offset, option in enumerate(token[1:], start=2):
+                kind = short_values.get(option)
+                if kind is None:
+                    continue
+                value = token[offset:]
+                if not value:
+                    pending_value = kind
+                else:
+                    if kind == "file":
+                        operands.append(value)
+                    if kind in {"file", "pattern"}:
+                        pattern_seen = True
+                break
+            continue
         if token.startswith("-"):
             continue
-        if not pattern_seen:
-            pattern_seen = True
-            continue
+        if first_positional is None:
+            first_positional = len(operands)
         operands.append(token)
+    # -e/-f may appear after positional operands. Only infer a positional
+    # pattern after all options have been considered.
+    if not pattern_seen and first_positional is not None:
+        del operands[first_positional]
     return operands
 
 

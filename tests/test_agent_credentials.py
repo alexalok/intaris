@@ -1153,3 +1153,20 @@ def test_agent_quoted_shell_paths_obey_mandatory_policy(client, tool, deny_paths
     if not deny_paths:
         context = audit["args_redacted"]["__intaris_context"]["path_policy"]
         assert context["target_paths"] == ["/etc/passwd"]
+
+
+@pytest.mark.parametrize("tool", ["terminal", "bash"])
+@pytest.mark.parametrize(
+    "command", ['grep -nf "/etc/passwd" README.md', 'rg -nf "/etc/passwd" README.md']
+)
+def test_agent_search_file_flags_enforce_path_denies(client, tool, command):
+    import intaris.server as srv
+
+    srv._get_evaluator()._agent_policy = {**POLICY, "deny_paths": ["/etc/*"]}
+    create(client, details={"working_directory": "/tmp/project"})
+    result = evaluate(client, tool=tool, command=command)
+    assert result["decision"] == "deny", result
+    assert result["path"] == "critical", result
+    audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
+    assert audit["classification"] == "critical"
+    assert audit["tool"] == tool
