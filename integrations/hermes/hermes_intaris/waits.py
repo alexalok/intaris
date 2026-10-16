@@ -60,6 +60,7 @@ class Invocation:
 
     def __init__(self, ended: threading.Event | None, timeout_s: float) -> None:
         self._ended = ended
+        self._closed = threading.Event()
         self._timeout_s = timeout_s
         self._deadline: float | None = None
         self._stopped: str | None = None
@@ -70,10 +71,16 @@ class Invocation:
             is_interrupted = None
         self._is_interrupted = is_interrupted
 
+    def close(self) -> None:
+        """Retire this invocation without cancelling its whole Hermes session."""
+        self._closed.set()
+
     def check(self) -> None:
         """Latch cancellation before accepting a result or dispatching a tool."""
         if self._stopped is None:
-            if self._ended is not None and self._ended.is_set():
+            if self._closed.is_set():
+                self._stopped = "CANCELLED: Intaris invocation already completed"
+            elif self._ended is not None and self._ended.is_set():
                 self._stopped = "CANCELLED: Hermes session ended"
             elif self._is_interrupted is not None and self._is_interrupted():
                 self._stopped = (

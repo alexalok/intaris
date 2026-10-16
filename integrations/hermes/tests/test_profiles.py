@@ -935,7 +935,7 @@ def test_session_end_cancels_admitted_call_across_reload(
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("same_identity", [True, False])
 def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity):
-    calls, validations = [], []
+    calls, validations, captured_contexts = [], [], []
 
     def original(args, *, session_id=""):
         calls.append((args, session_id))
@@ -965,6 +965,12 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
             validations.append(args["path"])
             if args["path"] == "blocked":
                 return json.dumps({"error": "other plugin policy"})
+            if args["path"] == "retarget":
+                kwargs["session_id"] = "other-session"
+            if args["path"] == "foreign":
+                with runtime.profile("b"):
+                    return predecessor({"path": "transformed"}, **kwargs)
+            captured_contexts.append(contextvars.copy_context())
             return predecessor({"path": "transformed"}, **kwargs)
 
         @wraps(predecessor)
@@ -972,6 +978,12 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
             validations.append(args["path"])
             if args["path"] == "blocked":
                 return json.dumps({"error": "other plugin policy"})
+            if args["path"] == "retarget":
+                kwargs["session_id"] = "other-session"
+            if args["path"] == "foreign":
+                with runtime.profile("b"):
+                    return await predecessor({"path": "transformed"}, **kwargs)
+            captured_contexts.append(contextvars.copy_context())
             return await predecessor({"path": "transformed"}, **kwargs)
 
         later = Context(runtime.registry, home)
@@ -990,19 +1002,32 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
             )
             if not same_identity:
                 ctx.emit("on_session_start", session_id="same-id")
+            ctx.emit("on_session_start", session_id="other-session")
             handler = runtime.registry.get_entry("decorated_tool").handler
-            for path in ("blocked", "allowed"):
+            for path in ("blocked", "retarget", "foreign", "allowed"):
                 value = handler({"path": path}, session_id="same-id", task_id="worker")
                 result = json.loads(asyncio.run(value) if is_async else value)
-                assert result == (
-                    {"error": "other plugin policy"}
-                    if path == "blocked"
-                    else {"result": "transformed"}
-                )
+                if path in ("retarget", "foreign"):
+                    assert "originating home/session" in result.get("error", "")
+                else:
+                    assert result == (
+                        {"error": "other plugin policy"}
+                        if path == "blocked"
+                        else {"result": "transformed"}
+                    )
                 assert plugin._guard_replacements.get() is None
+        if is_async:
+            late = captured_contexts[-1].run(
+                asyncio.run, predecessor({"path": "late"}, session_id="same-id")
+            )
+        else:
+            late = captured_contexts[-1].run(
+                predecessor, {"path": "late"}, session_id="same-id"
+            )
+        assert "CANCELLED" in json.loads(late).get("error", "")
         stale = predecessor({"path": "stale"}, session_id="same-id")
         assert "error" in json.loads(asyncio.run(stale) if is_async else stale)
-    assert validations == ["blocked", "allowed", "blocked", "allowed"]
+    assert validations == ["blocked", "retarget", "foreign", "allowed"] * 2
     assert calls == [({"path": "transformed"}, "same-id")] * 2
     evaluations = [
         r
@@ -1016,6 +1041,97 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
             "generation-0",
             "generation-1",
         ]
+    assert not plugin._active_invocations
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("change_identity", [False, True])
+def test_composed_wrapper_cannot_resume_cancelled_invocation(
+    runtime, is_async, completed, change_identity
+):
+    entered, release = threading.Event(), threading.Event()
+    calls, results = [], []
+
+    def original(args, **kwargs):
+        calls.append(args)
+        return json.dumps({"result": "RAW_EXECUTED"})
+
+    async def async_original(args, **kwargs):
+        return original(args, **kwargs)
+
+    with runtime.profile("a") as home:
+        runtime.registry.register(
+            name="paused_tool",
+            toolset="test",
+            schema={"name": "paused_tool"},
+            handler=async_original if is_async else original,
+            is_async=is_async,
+            check_fn=None,
+            requires_env=[],
+            description="Paused tool",
+            emoji="",
+        )
+        old = runtime.register("a")
+        old.emit("on_session_start", session_id="same-id")
+        predecessor = runtime.registry.get_entry("paused_tool").handler
+
+        @wraps(predecessor)
+        def pause(args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return predecessor({"path": "transformed"}, **kwargs)
+
+        @wraps(predecessor)
+        async def async_pause(args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return await predecessor({"path": "transformed"}, **kwargs)
+
+        later = Context(runtime.registry, home)
+        later.register_tool(
+            name="paused_tool",
+            toolset="test",
+            schema={"name": "paused_tool"},
+            handler=async_pause if is_async else pause,
+            is_async=is_async,
+            description="Paused external wrapper",
+            override=True,
+        )
+        current = runtime.register("a")
+        handler = runtime.registry.get_entry("paused_tool").handler
+
+    def invoke():
+        with runtime.profile("a"):
+            result = handler({"path": "original"}, session_id="same-id")
+            results.append(json.loads(asyncio.run(result) if is_async else result))
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with plugin._invocations_lock:
+            admissions_while_paused = len(
+                plugin._active_invocations.get((str(home), "same-id"), {})
+            )
+        with runtime.profile("a"):
+            if change_identity:
+                current = runtime.register("a", {"agent_id": "replacement"})
+            current.emit("on_session_end", session_id="same-id", completed=completed)
+            if completed or change_identity:
+                current.emit("on_session_start", session_id="same-id")
+            else:
+                current.emit(
+                    "pre_llm_call", session_id="same-id", user_message="Resume"
+                )
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert admissions_while_paused == 1, "async composition must retain outer admission"
+    assert len(results) == 1 and "CANCELLED" in results[0].get("error", "")
+    assert not requests_for(runtime, "/evaluate"), "cancel before resumed evaluation"
+    assert not calls, "resuming a session must not revive the abandoned invocation"
     assert not plugin._active_invocations
 
 

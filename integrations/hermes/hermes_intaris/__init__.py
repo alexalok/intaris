@@ -243,6 +243,16 @@ class ProfileRuntime:
     predecessor: ProfileRuntime | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class _GuardAdmission:
+    """Authority and lifetime captured before entering a foreign wrapper."""
+
+    profile: ProfileRuntime
+    session_id: str
+    state: SessionState
+    invocation: Invocation
+
+
 @dataclass
 class _SessionContinuity:
     """Session data retained across unload, without runtime resources or secrets."""
@@ -775,24 +785,18 @@ def _make_guarded_handler(
     tool_name: str,
     toolset: str,
     is_async: bool,
+    *,
+    _admission: _GuardAdmission | None = None,
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
     wrapped = original_handler
     seen: set[int] = set()
     replacement_target = None
-    replacement = None
     while wrapped is not None and id(wrapped) not in seen:
         seen.add(id(wrapped))
         metadata = getattr(wrapped, "__dict__", {})
         if metadata.get("_intaris_guard") is wrapped:
             replacement_target = wrapped
-            replacement = _make_guarded_handler(
-                profile,
-                metadata["_intaris_original_handler"],
-                tool_name,
-                toolset,
-                is_async,
-            )
             break
         wrapped = getattr(wrapped, "__wrapped__", None)
 
@@ -824,9 +828,17 @@ def _make_guarded_handler(
             }
         return original_handler(args, **kwargs)
 
-    def invoke_composed(args: dict, **kwargs: Any) -> Any:
-        # Preserve foreign validation and argument transformations before the
-        # fresh inner guard evaluates. Never mutate another plugin's closure.
+    def invoke_composed(args: dict, admission: _GuardAdmission, **kwargs: Any) -> Any:
+        # Preserve foreign validation/argument transformations, but never let
+        # the inner guard resolve a resumed session or create a new lifetime.
+        replacement = _make_guarded_handler(
+            profile,
+            replacement_target._intaris_original_handler,
+            tool_name,
+            toolset,
+            is_async,
+            _admission=admission,
+        )
         replacements = dict(_guard_replacements.get() or {})
         replacements[replacement_target] = replacement
         if is_async:
@@ -834,6 +846,7 @@ def _make_guarded_handler(
             async def run() -> Any:
                 token = _guard_replacements.set(replacements)
                 try:
+                    admission.invocation.check()
                     result = invoke_original(args, **kwargs)
                     return await result if inspect.isawaitable(result) else result
                 finally:
@@ -842,6 +855,7 @@ def _make_guarded_handler(
             return run()
         token = _guard_replacements.set(replacements)
         try:
+            admission.invocation.check()
             return invoke_original(args, **kwargs)
         finally:
             _guard_replacements.reset(token)
@@ -1063,63 +1077,114 @@ def _make_guarded_handler(
             return dispatch(call_id)
         return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
+    def stopped_result(exc: WaitStopped) -> str:
+        return json.dumps(
+            {
+                "error": (
+                    f"[intaris] {exc}. Tool was not executed. "
+                    "Review approval in the Intaris UI, then retry in a new invocation."
+                )
+            }
+        )
+
     def guarded_handler(args: dict, **kwargs: Any) -> Any:
         redirects = _guard_replacements.get() or {}
         redirect = redirects.get(public_handler)
         if redirect is not None:
             return redirect(args, **kwargs)
 
-        # Admission and quiescing serialize before the cancellation event is
-        # published, so a retired generation cannot admit an untracked call.
-        with profile.lifecycle_lock:
+        admission_token = None
+        if _admission is not None:
+            # Private continuation of an admitted call: keep its exact state,
+            # runtime and Invocation even if the session has since resumed.
             if (
-                not profile.active
-                or not profile.ready
+                _admission.profile is not profile
                 or _profile_key() != profile.home
+                or kwargs.get("session_id") != _admission.session_id
             ):
                 return json.dumps(
                     {
-                        "error": "[intaris] Tool belongs to a different or unloaded profile"
+                        "error": "[intaris] Composed tool changed its originating home/session"
                     }
                 )
-            if profile.session_start_required.is_set():
-                return json.dumps(
-                    {"error": "[intaris] Profile changed; start a fresh Hermes session"}
+            admission = _admission
+        else:
+            # Admission and quiescing serialize before publishing cancellation.
+            with profile.lifecycle_lock:
+                if (
+                    not profile.active
+                    or not profile.ready
+                    or _profile_key() != profile.home
+                ):
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Tool belongs to a different or unloaded profile"
+                        }
+                    )
+                if profile.session_start_required.is_set():
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Profile changed; start a fresh Hermes session"
+                        }
+                    )
+                session_id = kwargs.get("session_id")
+                try:
+                    state = _resolve_invocation_session(profile, session_id)
+                except ValueError as exc:
+                    return json.dumps(
+                        {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
+                    )
+                ended = state._ended
+                admission = _GuardAdmission(
+                    profile,
+                    session_id,
+                    state,
+                    Invocation(ended, profile.cfg.escalation_timeout_s),
                 )
-            session_id = kwargs.get("session_id")
-            try:
-                state = _resolve_invocation_session(profile, session_id)
-            except ValueError as exc:
-                return json.dumps(
-                    {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
-                )
-            # Evaluation and cancellation use the same originating lifetime.
-            ended = state._ended
-            invocation = Invocation(ended, profile.cfg.escalation_timeout_s)
-            key = (profile.home, session_id)
-            admission = object()
+                admission_token = object()
+                with _invocations_lock:
+                    key = (profile.home, session_id)
+                    _active_invocations.setdefault(key, {})[admission_token] = ended
+
+        invocation = admission.invocation
+
+        def release_admission() -> None:
+            if admission_token is None:
+                return  # Only the outer call owns this lifetime.
+            invocation.close()
             with _invocations_lock:
-                _active_invocations.setdefault(key, {})[admission] = ended
+                key = (profile.home, admission.session_id)
+                pending = _active_invocations[key]
+                del pending[admission_token]
+                if not pending:
+                    del _active_invocations[key]
+
         try:
             invocation.check()
             if replacement_target is not None:
-                return invoke_composed(args, **kwargs)
-            return evaluate_and_dispatch(args, state, invocation, **kwargs)
-        except WaitStopped as exc:
-            return json.dumps(
-                {
-                    "error": (
-                        f"[intaris] {exc}. Tool was not executed. "
-                        "Review approval in the Intaris UI, then retry in a new invocation."
-                    )
-                }
-            )
-        finally:
-            with _invocations_lock:
-                pending = _active_invocations[key]
-                del pending[admission]
-                if not pending:
-                    del _active_invocations[key]
+                result = invoke_composed(args, admission, **kwargs)
+            else:
+                result = evaluate_and_dispatch(
+                    args, admission.state, invocation, **kwargs
+                )
+        except BaseException as exc:
+            release_admission()
+            if isinstance(exc, WaitStopped):
+                return stopped_result(exc)
+            raise
+        if inspect.isawaitable(result):
+
+            async def finish() -> Any:
+                try:
+                    return await result
+                except WaitStopped as exc:
+                    return stopped_result(exc)
+                finally:
+                    release_admission()
+
+            return finish()
+        release_admission()
+        return result
 
     public_handler = guarded_handler
     if is_async:
