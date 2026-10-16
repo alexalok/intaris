@@ -4295,8 +4295,9 @@ def test_pending_duplicate_starts_coalesce_without_intervening_end(
 
 @pytest.mark.parametrize("admission", ["native", "mcp"])
 @pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("resume_before_release", [False, True])
 def test_materializing_idle_start_cannot_clear_a_later_end(
-    runtime, monkeypatch, admission, terminal
+    runtime, monkeypatch, admission, terminal, resume_before_release
 ):
     runtime.tools["a.invalid"] = [{"server": "docs", "name": "read", "inputSchema": {}}]
     settings = {"mcp_tools": True, "fail_open": True}
@@ -4338,14 +4339,244 @@ def test_materializing_idle_start_cannot_clear_a_later_end(
             with runtime.profile("a"):
                 current.emit("on_session_end", session_id="same", completed=terminal)
             cancelled = state._ended
+            if resume_before_release:
+                with runtime.profile("a"):
+                    if terminal:
+                        current.emit("on_session_start", session_id="same")
+                    else:
+                        current.emit(
+                            "pre_llm_call",
+                            session_id="same",
+                            user_message="New user input",
+                        )
         finally:
             release.set()
         assert "error" in pending.result(5)
-    assert "error" in invoke(), "later tool must not consume an idle-invalidated start"
-    assert state._ended is cancelled and cancelled.is_set()
-    assert state.is_idle is (not terminal)
+    assert cancelled.is_set()
     assert not requests_for(runtime, "/evaluate")
     assert not requests_for(runtime, "/mcp/call")
-    with runtime.profile("a"):
-        current.emit("on_session_start", session_id="same")
+    if not resume_before_release:
+        assert "error" in invoke(), (
+            "later tool must not consume an idle-invalidated start"
+        )
+        assert state._ended is cancelled
+        assert state.is_idle is (not terminal)
+        with runtime.profile("a"):
+            current.emit("on_session_start", session_id="same")
     assert invoke() == {"result": "live" if admission == "native" else "a.invalid"}
+
+
+def _host_materialization_dispatch(runtime, monkeypatch):
+    if not os.environ.get("HERMES_SOURCE"):
+        pytest.skip("Set HERMES_SOURCE to exercise parallel real Hermes dispatch")
+    import tools.registry as registry_module
+    from hermes_cli import lifecycle, plugins
+
+    monkeypatch.setattr(registry_module, "discover_builtin_tools", lambda: None)
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_observe", lambda *a, **k: None)
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
+    model_tools = importlib.import_module("model_tools")
+    monkeypatch.setattr(model_tools, "registry", runtime.registry)
+    with runtime.profile("a") as home:
+        manager = plugins.PluginManager(scope_key=str(home))
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+
+    def invoke(admission, label):
+        with runtime.profile("a"):
+            return json.loads(
+                model_tools.handle_function_call(
+                    "read_file" if admission == "native" else "docs_read",
+                    {"path": label},
+                    task_id=f"task-{label}",
+                    session_id="same",
+                    tool_call_id=f"call-{label}",
+                    skip_tool_request_middleware=True,
+                    skip_tool_execution_middleware=True,
+                )
+            )
+
+    return invoke
+
+
+def _pending_handoff_for_parallel_calls(
+    runtime, monkeypatch, replay_start=False, idle=False
+):
+    runtime.tools["a.invalid"] = [{"server": "docs", "name": "read", "inputSchema": {}}]
+    settings = {"mcp_tools": True, "fail_open": True}
+    old = runtime.register("a", settings)
+    if idle:
+        with runtime.profile("a"):
+            old.emit("on_session_start", session_id="same")
+            old.emit("on_session_end", session_id="same", completed=False)
+    register = plugin._register_profile
+
+    def receive_start(profile, ctx, *args):
+        old.emit("on_session_start", session_id="same")
+        return register(profile, ctx, *args)
+
+    with monkeypatch.context() as replacement:
+        replacement.setattr(plugin, "_register_profile", receive_start)
+        current = runtime.register("a", settings)
+    if replay_start:
+        with runtime.profile("a"):
+            current.emit("on_session_start", session_id="same")
+    return current
+
+
+@pytest.mark.parametrize("admission", ["native", "mcp"])
+@pytest.mark.parametrize(
+    "schedule", ["creating", "confirming", "resuming", "already_started"]
+)
+def test_real_hermes_parallel_first_calls_share_materialization(
+    runtime, monkeypatch, admission, schedule
+):
+    invoke = _host_materialization_dispatch(runtime, monkeypatch)
+    _pending_handoff_for_parallel_calls(
+        runtime,
+        monkeypatch,
+        replay_start=schedule == "already_started",
+        idle=schedule == "resuming",
+    )
+    entered, release, follower_entered = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    both_returned = threading.Barrier(2)
+    ensure = plugin._ensure_session
+
+    resume = plugin._resume_session
+
+    def overlap_resume(*args, **kwargs):
+        if schedule == "resuming":
+            entered.set()
+            both_returned.wait(5)
+        return resume(*args, **kwargs)
+
+    monkeypatch.setattr(plugin, "_resume_session", overlap_resume)
+
+    def pause_creation(req):
+        if req.full_url.endswith("/intention") and schedule == "creating":
+            entered.set()
+            assert release.wait(5)
+
+    def overlap_ensure(*args, **kwargs):
+        if entered.is_set():
+            follower_entered.set()
+        result = ensure(*args, **kwargs)
+        if schedule == "confirming":
+            assert result is not None
+            entered.set()
+            both_returned.wait(5)
+        return result
+
+    runtime.request_hook.append(pause_creation)
+    monkeypatch.setattr(plugin, "_ensure_session", overlap_ensure)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(invoke, admission, "one")
+        try:
+            if schedule != "already_started":
+                assert entered.wait(5), (
+                    first.result() if first.done() else "no creation"
+                )
+            second = workers.submit(invoke, admission, "two")
+            if schedule == "creating":
+                assert follower_entered.wait(5)
+        finally:
+            release.set()
+        results = [first.result(5), second.result(5)]
+    assert results == [
+        {"result": "one" if admission == "native" else "a.invalid"},
+        {"result": "two" if admission == "native" else "a.invalid"},
+    ]
+    assert len(requests_for(runtime, "/intention")) == 1
+    calls = requests_for(runtime, "/evaluate" if admission == "native" else "/mcp/call")
+    assert len(calls) == 2 and len({req["body"]["session_id"] for req in calls}) == 1
+
+
+@pytest.mark.parametrize("admission", ["native", "mcp"])
+@pytest.mark.parametrize("stop", ["idle", "terminal_recreate", "interrupt"])
+def test_parallel_materialization_waiter_stops_before_creation_returns(
+    runtime, monkeypatch, admission, stop
+):
+    invoke = _host_materialization_dispatch(runtime, monkeypatch)
+    from tools import interrupt
+
+    current = _pending_handoff_for_parallel_calls(runtime, monkeypatch)
+    entered, release, following, follower_done = (threading.Event() for _ in range(4))
+    follower_thread = []
+    ensure = plugin._ensure_session
+
+    def block_creation(req):
+        if req.full_url.endswith("/intention") and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    def capture_follower(*args, **kwargs):
+        if follower_thread and threading.get_ident() == follower_thread[0]:
+            following.set()
+        return ensure(*args, **kwargs)
+
+    def follow():
+        follower_thread.append(threading.get_ident())
+        try:
+            return invoke(admission, "follower")
+        finally:
+            follower_done.set()
+
+    runtime.request_hook.append(block_creation)
+    monkeypatch.setattr(plugin, "_ensure_session", capture_follower)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(invoke, admission, "creator")
+        try:
+            assert entered.wait(5)
+            second = workers.submit(follow)
+            assert following.wait(5)
+            assert not follower_done.wait(0.2), (
+                "uncancelled follower must await shared creation"
+            )
+            with runtime.profile("a") as home:
+                profile = plugin._profiles[str(home)]
+                original = profile.sessions["same"]
+                # Creation/waiting must not hold map/global/home registration locks.
+                for lock in (
+                    plugin._profiles_lock,
+                    profile.sessions_lock,
+                    plugin._registration_locks[str(home)],
+                ):
+                    assert lock.acquire(blocking=False)
+                    lock.release()
+                if stop == "interrupt":
+                    interrupt.set_interrupt(True, follower_thread[0])
+                else:
+                    current.emit(
+                        "on_session_end", session_id="same", completed=stop != "idle"
+                    )
+                    if stop == "terminal_recreate":
+                        current.emit("on_session_start", session_id="same")
+                        fresh = profile.sessions["same"]
+                        assert fresh is not original
+            other = runtime.register("b")
+            with runtime.profile("b"):
+                other.emit("on_session_start", session_id="other")
+            assert follower_done.wait(1), (
+                "cancellation must release follower while HTTP remains blocked"
+            )
+            assert "error" in second.result(1)
+            assert not requests_for(runtime, "/evaluate")
+            assert not requests_for(runtime, "/mcp/call")
+        finally:
+            release.set()
+            if follower_thread:
+                interrupt.set_interrupt(False, follower_thread[0])
+        first_result = first.result(5)
+    if stop == "interrupt":
+        assert first_result == {
+            "result": "creator" if admission == "native" else "a.invalid"
+        }
+    else:
+        assert "error" in first_result
+        assert original._ended.is_set()
+        if stop == "terminal_recreate":
+            assert profile.sessions["same"] is fresh and fresh.start_confirmed

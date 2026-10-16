@@ -211,6 +211,7 @@ class SessionState:
     # Only this Hermes session's successful start proves post-reload freshness.
     start_confirmed: bool = False
     _pending_start: _PendingStart | None = field(default=None, repr=False)
+    _confirmed_start: object | None = field(default=None, repr=False)
     call_count: int = 0
     approved_count: int = 0
     denied_count: int = 0
@@ -227,6 +228,7 @@ class SessionState:
     _ended: threading.Event = field(default_factory=threading.Event, repr=False)
     # Lock for session creation dedup
     _creating: bool = False
+    _creation_done: threading.Event = field(default_factory=threading.Event, repr=False)
     _completion: _CompletionOwner | None = field(default=None, repr=False)
 
 
@@ -477,7 +479,7 @@ def _materialize_pending_start(
         ):
             return state, False
         # Publish the owner before creation or a wrapped helper can block.
-        _get_completion_owner(profile, session_id, state)
+        owner = _get_completion_owner(profile, session_id, state)
         must_resume = state.is_idle
         ended = state._ended
     if must_resume:
@@ -486,21 +488,61 @@ def _materialize_pending_start(
         ):
             return state, False
         ended = state._ended
-    remote_id = _ensure_session(
-        profile, session_id, state, pending.platform, pending.model
-    )
-    with profile.lifecycle_lock, profile.sessions_lock:
+    waiter = Invocation(ended, 0)
+    try:
+        waiter.check()
+        remote_id = _ensure_session(
+            profile, session_id, state, pending.platform, pending.model
+        )
+        while remote_id is None:
+            waiter.check()
+            with profile.lifecycle_lock, profile.sessions_lock, owner.lock:
+                if (
+                    not profile.active
+                    or not profile.ready
+                    or profile.sessions.get(session_id) is not state
+                    or state._ended is not ended
+                    or (
+                        state._pending_start is not pending
+                        and not (
+                            state._pending_start is None
+                            and state._confirmed_start is pending.token
+                        )
+                    )
+                ):
+                    return state, False
+                remote_id = state.intaris_session_id
+                creating = state._creating
+            if remote_id or not creating:
+                break
+            # Only this exact captured receipt waits for its shared creation.
+            # No bookkeeping lock spans waiting; end and host interrupt remain
+            # observable even while another worker's HTTP request is blocked.
+            state._creation_done.wait(0.1)
+        waiter.check()
+    except WaitStopped:
+        return state, False
+    finally:
+        waiter.close()
+    with profile.lifecycle_lock, profile.sessions_lock, owner.lock:
         valid = bool(
             remote_id
             and profile.active
             and profile.ready
             and profile.sessions.get(session_id) is state
-            and state._pending_start is pending
+            and (
+                state._pending_start is pending
+                or (
+                    state._pending_start is None
+                    and state._confirmed_start is pending.token
+                )
+            )
             and state._ended is ended
             and not ended.is_set()
         )
         if valid:
             state.start_confirmed = True
+            state._confirmed_start = pending.token
             state._pending_start = None
     return state, valid
 
@@ -709,6 +751,7 @@ def _ensure_session(
         if state.intaris_session_id or state._creating:
             return state.intaris_session_id
         state._creating = True
+        state._creation_done.clear()
     try:
         intaris_id = f"hm-{uuid.uuid4()}"
         state.intention = _build_intention(platform, model, state.working_directory)
@@ -739,6 +782,7 @@ def _ensure_session(
     finally:
         with owner.lock:
             state._creating = False
+            state._creation_done.set()
         _emit_lifecycle(owner)
 
 
@@ -878,6 +922,7 @@ def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
     with owner.lock:
         state = owner.state
         state._ended.set()
+        state._confirmed_start = None
         if owner.status == "completed":
             return
         owner.status = "completed" if terminal else "idle"
@@ -886,7 +931,9 @@ def _claim_session_end(owner: _CompletionOwner, terminal: bool) -> None:
             state.start_confirmed = False
             state._pending_start = None
         elif state._pending_start is not None:
-            state._pending_start = replace(state._pending_start, resume_idle=False)
+            state._pending_start = replace(
+                state._pending_start, resume_idle=False, token=object()
+            )
     if terminal:
         # Detach before HTTP so a fresh start can reuse the Hermes SID. A later
         # cleanup must never remove a replacement state under that same key.
@@ -967,10 +1014,23 @@ def _resume_session(
                 not profile.active
                 or not profile.ready
                 or profile.sessions.get(session_id) is not state
-                or state._pending_start is not pending_start
-                or state._ended is not ended
+                or (
+                    state._pending_start is not pending_start
+                    and not (
+                        state._pending_start is None
+                        and state._confirmed_start is pending_start.token
+                    )
+                )
             ):
                 return False
+            if pending_start is not None and state._ended is not ended:
+                # Another materializer may have resumed this exact receipt.
+                # A later idle/end replaces the receipt and is rejected above.
+                return (
+                    owner.status == "active"
+                    and not state.is_idle
+                    and not state._ended.is_set()
+                )
             state._ended = threading.Event()
             state.is_idle = False
             owner.status = "active"
@@ -1893,7 +1953,9 @@ def _on_session_end(
                             if target.sessions.get(session_id) is state:
                                 del target.sessions[session_id]
                         else:
-                            state._pending_start = replace(receipt, resume_idle=False)
+                            state._pending_start = replace(
+                                receipt, resume_idle=False, token=object()
+                            )
                 elif state._completion is None:
                     _get_completion_owner(target, session_id, state)
         with _completion_owners_lock:
