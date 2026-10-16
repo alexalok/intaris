@@ -40,6 +40,7 @@ Configuration via profile-scoped Hermes env/credentials and plugin settings:
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import inspect
 import json
@@ -267,6 +268,15 @@ _retired_sessions: dict[str, _SessionContinuity] = {}
 _profiles_lock = threading.RLock()
 _registration_locks: dict[str, Any] = {}
 _registered_homes: set[str] = set()
+
+# Only live cancellation events cross generations; no client/config authority.
+_active_invocations: dict[tuple[str, str], dict[object, threading.Event]] = {}
+_invocations_lock = threading.Lock()
+# A later plugin may retain an older guard in its closure. Route that exact
+# guard to a fresh guard while executing the preserved wrapper chain.
+_guard_replacements: contextvars.ContextVar[dict[Callable, Callable] | None] = (
+    contextvars.ContextVar("intaris_guard_replacements", default=None)
+)
 
 
 def _profile_key() -> str:
@@ -767,6 +777,25 @@ def _make_guarded_handler(
     is_async: bool,
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
+    wrapped = original_handler
+    seen: set[int] = set()
+    replacement_target = None
+    replacement = None
+    while wrapped is not None and id(wrapped) not in seen:
+        seen.add(id(wrapped))
+        metadata = getattr(wrapped, "__dict__", {})
+        if metadata.get("_intaris_guard") is wrapped:
+            replacement_target = wrapped
+            replacement = _make_guarded_handler(
+                profile,
+                metadata["_intaris_original_handler"],
+                tool_name,
+                toolset,
+                is_async,
+            )
+            break
+        wrapped = getattr(wrapped, "__wrapped__", None)
+
     try:
         parameters = inspect.signature(original_handler).parameters
     except (TypeError, ValueError):
@@ -794,6 +823,28 @@ def _make_guarded_handler(
                 name: value for name, value in kwargs.items() if name in accepted_kwargs
             }
         return original_handler(args, **kwargs)
+
+    def invoke_composed(args: dict, **kwargs: Any) -> Any:
+        # Preserve foreign validation and argument transformations before the
+        # fresh inner guard evaluates. Never mutate another plugin's closure.
+        replacements = dict(_guard_replacements.get() or {})
+        replacements[replacement_target] = replacement
+        if is_async:
+
+            async def run() -> Any:
+                token = _guard_replacements.set(replacements)
+                try:
+                    result = invoke_original(args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+                finally:
+                    _guard_replacements.reset(token)
+
+            return run()
+        token = _guard_replacements.set(replacements)
+        try:
+            return invoke_original(args, **kwargs)
+        finally:
+            _guard_replacements.reset(token)
 
     def evaluate_and_dispatch(
         args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
@@ -1013,25 +1064,46 @@ def _make_guarded_handler(
         return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
     def guarded_handler(args: dict, **kwargs: Any) -> Any:
-        if not profile.active or not profile.ready or _profile_key() != profile.home:
-            return json.dumps(
-                {"error": "[intaris] Tool belongs to a different or unloaded profile"}
-            )
-        if profile.session_start_required.is_set():
-            return json.dumps(
-                {"error": "[intaris] Profile changed; start a fresh Hermes session"}
-            )
+        redirects = _guard_replacements.get() or {}
+        redirect = redirects.get(public_handler)
+        if redirect is not None:
+            return redirect(args, **kwargs)
 
-        try:
-            state = _resolve_invocation_session(profile, kwargs.get("session_id"))
-        except ValueError as exc:
-            return json.dumps(
-                {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
-            )
-        # Evaluation and cancellation use the same authoritative session state.
-        invocation = Invocation(state._ended, profile.cfg.escalation_timeout_s)
+        # Admission and quiescing serialize before the cancellation event is
+        # published, so a retired generation cannot admit an untracked call.
+        with profile.lifecycle_lock:
+            if (
+                not profile.active
+                or not profile.ready
+                or _profile_key() != profile.home
+            ):
+                return json.dumps(
+                    {
+                        "error": "[intaris] Tool belongs to a different or unloaded profile"
+                    }
+                )
+            if profile.session_start_required.is_set():
+                return json.dumps(
+                    {"error": "[intaris] Profile changed; start a fresh Hermes session"}
+                )
+            session_id = kwargs.get("session_id")
+            try:
+                state = _resolve_invocation_session(profile, session_id)
+            except ValueError as exc:
+                return json.dumps(
+                    {"error": f"[intaris] {exc} Cannot evaluate {tool_name}."}
+                )
+            # Evaluation and cancellation use the same originating lifetime.
+            ended = state._ended
+            invocation = Invocation(ended, profile.cfg.escalation_timeout_s)
+            key = (profile.home, session_id)
+            admission = object()
+            with _invocations_lock:
+                _active_invocations.setdefault(key, {})[admission] = ended
         try:
             invocation.check()
+            if replacement_target is not None:
+                return invoke_composed(args, **kwargs)
             return evaluate_and_dispatch(args, state, invocation, **kwargs)
         except WaitStopped as exc:
             return json.dumps(
@@ -1042,8 +1114,14 @@ def _make_guarded_handler(
                     )
                 }
             )
+        finally:
+            with _invocations_lock:
+                pending = _active_invocations[key]
+                del pending[admission]
+                if not pending:
+                    del _active_invocations[key]
 
-    guarded_handler._intaris_original_handler = original_handler
+    public_handler = guarded_handler
     if is_async:
 
         @wraps(guarded_handler)
@@ -1051,8 +1129,11 @@ def _make_guarded_handler(
             result = guarded_handler(args, **kwargs)
             return await result if inspect.isawaitable(result) else result
 
-        return async_guarded_handler
-    return guarded_handler
+        public_handler = async_guarded_handler
+    public_handler._intaris_original_handler = original_handler
+    # wraps() copies __dict__; a copied marker must not identify a foreign guard.
+    public_handler._intaris_guard = public_handler
+    return public_handler
 
 
 # ============================================================================
@@ -1231,12 +1312,21 @@ def _on_session_end(
     **kwargs: Any,
 ) -> None:
     """on_session_end: Signal completion or idle."""
-    state = profile.sessions.get(session_id)
-    if not state:
-        return
+    # A new identity may have no matching state, but older admitted workers
+    # still belong to this Hermes home/session and must observe its end.
+    with profile.lifecycle_lock:
+        with _invocations_lock:
+            for ended in _active_invocations.get(
+                (profile.home, session_id), {}
+            ).values():
+                ended.set()
+        state = profile.sessions.get(session_id)
+        if state is not None:
+            state._ended.set()
+        if not profile.active or state is None:
+            return
 
-    # Cancel before any completion/recording HTTP can block, including reset/idle.
-    state._ended.set()
+    # Cancellation above precedes any completion/recording HTTP, including idle.
     if completed or interrupted:
         _signal_completion(profile, session_id, state)
         with profile.sessions_lock:
@@ -1465,7 +1555,9 @@ def _bind_hook(profile: ProfileRuntime, callback: Callable) -> Callable:
 
     @wraps(callback)
     def bound(*args: Any, **kwargs: Any) -> Any:
-        if profile.active and profile.ready:
+        # Session end remains authoritative through replacement and for a
+        # callback already captured before old hook registrations were disposed.
+        if callback is _on_session_end or (profile.active and profile.ready):
             return callback(profile, *args, **kwargs)
         return None
 
@@ -1695,7 +1787,8 @@ def _register_profile(
         metadata = getattr(original, "__dict__", {})
         if metadata.get("_intaris_mcp_owner") is not None:
             continue  # These handlers evaluate through /mcp/call themselves.
-        original = metadata.get("_intaris_original_handler", original)
+        if metadata.get("_intaris_guard") is original:
+            original = metadata["_intaris_original_handler"]
         guarded = _make_guarded_handler(
             profile, original, entry.name, entry.toolset, entry.is_async
         )

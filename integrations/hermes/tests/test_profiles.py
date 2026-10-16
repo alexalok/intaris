@@ -18,7 +18,7 @@ import sys
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 import hermes_intaris as plugin
@@ -864,6 +864,159 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
         "2 tool calls (2 approved"
         in requests_for(runtime, "/agent-summary")[-1]["body"]["summary"]
     )
+
+
+@pytest.mark.parametrize("same_identity", [True, False])
+@pytest.mark.parametrize("stop_at", ["quiescing", "replaced", "captured"])
+@pytest.mark.parametrize("completed", [True, False])
+def test_session_end_cancels_admitted_call_across_reload(
+    runtime, monkeypatch, same_identity, stop_at, completed
+):
+    old = runtime.register("a")
+    with runtime.profile("a"):
+        old.emit("on_session_start", session_id="same-id")
+        handler = runtime.registry.get_entry("read_file").handler
+        captured_end = old.hooks["on_session_end"][0]
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    results = []
+
+    def hold_evaluation():
+        entered.set()
+        assert release.wait(5)
+
+    def invoke():
+        try:
+            with runtime.profile("a"):
+                results.append(
+                    json.loads(handler({"path": "must not run"}, session_id="same-id"))
+                )
+        finally:
+            done.set()
+
+    register = plugin._register_profile
+
+    def replace(*args):
+        if stop_at == "quiescing" and args[0].predecessor is not None:
+            # The predecessor is not ready; replacement hooks do not exist yet.
+            old.emit("on_session_end", session_id="same-id", completed=completed)
+        return register(*args)
+
+    monkeypatch.setattr(plugin, "_register_profile", replace)
+    runtime.evaluate_hook.append(hold_evaluation)
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        # Equal session IDs in another home must not cancel this invocation.
+        other = runtime.register("b")
+        with runtime.profile("b"):
+            other.emit("on_session_start", session_id="same-id")
+            other.emit("on_session_end", session_id="same-id")
+        assert not done.is_set()
+        with runtime.profile("a"):
+            new = runtime.register("a", {} if same_identity else {"agent_id": "new"})
+            if stop_at == "replaced":
+                # Changed identity has no SessionState for the predecessor.
+                new.emit("on_session_end", session_id="same-id", completed=completed)
+            elif stop_at == "captured":
+                captured_end(session_id="same-id", completed=completed)
+        cancelled_before_http_return = done.wait(1)
+    finally:
+        runtime.evaluate_hook.clear()
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert cancelled_before_http_return, "session end must release the admitted worker"
+    assert len(results) == 1 and "CANCELLED" in results[0].get("error", "")
+    assert "result" not in results[0], "late HTTP approval must not execute the tool"
+    assert not plugin._active_invocations
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("same_identity", [True, False])
+def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity):
+    calls, validations = [], []
+
+    def original(args, *, session_id=""):
+        calls.append((args, session_id))
+        return json.dumps({"result": args["path"]})
+
+    async def async_original(args, *, session_id=""):
+        return original(args, session_id=session_id)
+
+    with runtime.profile("a") as home:
+        runtime.registry.register(
+            name="decorated_tool",
+            toolset="test",
+            schema={"name": "decorated_tool"},
+            handler=async_original if is_async else original,
+            is_async=is_async,
+            check_fn=None,
+            requires_env=[],
+            description="Wrapped tool",
+            emoji="",
+        )
+        ctx = runtime.register("a")
+        ctx.emit("on_session_start", session_id="same-id")
+        predecessor = runtime.registry.get_entry("decorated_tool").handler
+
+        @wraps(predecessor)
+        def validate(args, **kwargs):
+            validations.append(args["path"])
+            if args["path"] == "blocked":
+                return json.dumps({"error": "other plugin policy"})
+            return predecessor({"path": "transformed"}, **kwargs)
+
+        @wraps(predecessor)
+        async def async_validate(args, **kwargs):
+            validations.append(args["path"])
+            if args["path"] == "blocked":
+                return json.dumps({"error": "other plugin policy"})
+            return await predecessor({"path": "transformed"}, **kwargs)
+
+        later = Context(runtime.registry, home)
+        later.register_tool(
+            name="decorated_tool",
+            toolset="test",
+            schema={"name": "decorated_tool"},
+            handler=async_validate if is_async else validate,
+            is_async=is_async,
+            description="Other plugin",
+            override=True,
+        )
+        for generation in range(2):
+            ctx = runtime.register(
+                "a", {} if same_identity else {"agent_id": f"generation-{generation}"}
+            )
+            if not same_identity:
+                ctx.emit("on_session_start", session_id="same-id")
+            handler = runtime.registry.get_entry("decorated_tool").handler
+            for path in ("blocked", "allowed"):
+                value = handler({"path": path}, session_id="same-id", task_id="worker")
+                result = json.loads(asyncio.run(value) if is_async else value)
+                assert result == (
+                    {"error": "other plugin policy"}
+                    if path == "blocked"
+                    else {"result": "transformed"}
+                )
+                assert plugin._guard_replacements.get() is None
+        stale = predecessor({"path": "stale"}, session_id="same-id")
+        assert "error" in json.loads(asyncio.run(stale) if is_async else stale)
+    assert validations == ["blocked", "allowed", "blocked", "allowed"]
+    assert calls == [({"path": "transformed"}, "same-id")] * 2
+    evaluations = [
+        r
+        for r in requests_for(runtime, "/evaluate")
+        if r["body"]["tool"] == "decorated_tool"
+    ]
+    assert len(evaluations) == 2, "only inner guard evaluates each allowed call once"
+    assert all(r["body"]["args"] == {"path": "transformed"} for r in evaluations)
+    if not same_identity:
+        assert [r["headers"]["X-agent-id"] for r in evaluations] == [
+            "generation-0",
+            "generation-1",
+        ]
+    assert not plugin._active_invocations
 
 
 @pytest.mark.parametrize("same_identity", [True, False])
