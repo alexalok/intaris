@@ -28,6 +28,7 @@ import pytest
 class ScopedRegistry:
     def __init__(self, home):
         self.home = home
+        self._lock = threading.RLock()
         self._tools = {}
         self.scoped = {}
 
@@ -105,7 +106,11 @@ class Context:
         self.home = str(home)
         self.settings = settings or {}
         self.hooks = {}
+        self.middleware = {}
         self.unload = []
+
+    def has_capability(self, name):
+        return name == "tools.override"
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
@@ -121,6 +126,36 @@ class Context:
     def register_hook(self, name, handler):
         self.hooks.setdefault(name, []).append(handler)
         return Handle(lambda: self.hooks[name].remove(handler))
+
+    def register_middleware(self, name, handler):
+        self.middleware.setdefault(name, []).append(handler)
+        return Handle(lambda: self.middleware[name].remove(handler))
+
+    def execute(self, name, args, **kwargs):
+        """Model Hermes' fail-open execution chain, including single-use next_call."""
+        callbacks = list(self.middleware.get("tool_execution", []))
+
+        def run(index, payload):
+            if index == len(callbacks):
+                return self.registry.dispatch(name, payload, **kwargs)
+            called = False
+
+            def next_call(next_args):
+                nonlocal called
+                assert not called, "downstream dispatched twice"
+                called = True
+                return run(index + 1, next_args)
+
+            try:
+                return callbacks[index](
+                    tool_name=name, args=payload, next_call=next_call, **kwargs
+                )
+            except Exception:
+                if called:
+                    raise
+                return next_call(payload)
+
+        return run(0, args)
 
     def on_unload(self, handler):
         self.unload.append(handler)
@@ -285,7 +320,25 @@ def runtime(monkeypatch, tmp_path):
             plugin.register(ctx)
             return ctx
 
+    def guarded_entry(name):
+        """Capture the adapter's invocation-local entry for focused guard tests.
+
+        Production registry entries now remain provider-owned. Tests of captured
+        admissions/composed handlers use the same transient factory as dispatch.
+        """
+        source_entry = registry.get_entry(name)
+        coordinator = getattr(registry, "_intaris_dispatch_coordinator", None)
+        if coordinator is None or source_entry is None:
+            return source_entry
+        owner = coordinator.current_owner(str(constants.get_hermes_home().resolve()))
+        return (
+            owner.make_entry(source_entry, owner.profile.home)
+            if owner
+            else source_entry
+        )
+
     yield types.SimpleNamespace(
+        guarded_entry=guarded_entry,
         profile=profile,
         registry=registry,
         register=register,
@@ -316,7 +369,7 @@ def test_existing_wrapper_and_same_session_id_keep_profile_client(runtime, order
         contexts[name] = runtime.register(name)
         with runtime.profile(name):
             contexts[name].emit("on_session_start", session_id="same-id")
-            handlers[name] = runtime.registry.get_entry("read_file").handler
+            handlers[name] = runtime.guarded_entry("read_file").handler
 
     for name in ("a", "b"):
         with runtime.profile(name):
@@ -349,7 +402,7 @@ def test_concurrent_worker_contexts_keep_client_and_sessions(runtime):
     runtime.evaluate_hook.append(lambda: barrier.wait(timeout=5))
 
     def invoke():
-        return runtime.registry.get_entry("read_file").handler(
+        return runtime.guarded_entry("read_file").handler(
             {"path": "ok"}, session_id="same-id"
         )
 
@@ -412,7 +465,7 @@ def test_mcp_exposure_cache_and_captured_handler_are_profile_owned(
     a = runtime.register("a")
     with runtime.profile("a"):
         a.emit("on_session_start", session_id="same-id")
-        handler = runtime.registry.get_entry("private_a").handler
+        handler = runtime.guarded_entry("private_a").handler
     b = runtime.register("b")
     with runtime.profile("b"):
         b.emit("on_session_start", session_id="same-id")
@@ -456,9 +509,7 @@ def test_repeat_registration_does_not_stack_guards_hooks_or_timers(
     with runtime.profile("a"):
         plugin.register(ctx)
         ctx.emit("on_session_start", session_id="same-id")
-        runtime.registry.get_entry("read_file").handler(
-            {"path": "ok"}, session_id="same-id"
-        )
+        runtime.guarded_entry("read_file").handler({"path": "ok"}, session_id="same-id")
     assert len(requests_for(runtime, "/evaluate")) == 1
     assert all(len(handlers) == 1 for handlers in ctx.hooks.values())
     assert len(Timer.instances) == 1
@@ -495,7 +546,7 @@ def test_session_updates_retain_originating_working_directory(
         b.emit("on_session_start", session_id="same-id")
     with runtime.profile("a"):
         for _ in range(3):
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "ok"}, session_id="same-id"
             )
         a.emit("on_session_end", session_id="same-id")
@@ -584,13 +635,13 @@ def test_profile_defaults_and_explicit_empty_false_zero_settings(runtime, monkey
     runtime.request_hook.append(unavailable)
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "ok"}, session_id="same-id"
             )
         ) == {"result": "ok"}
     with runtime.profile("b"):
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "ok"}, session_id="same-id"
             )
         )
@@ -626,7 +677,7 @@ def test_captured_handler_refuses_foreign_profile_even_with_fail_open(runtime):
     a = runtime.register("a", {"fail_open": True, "mcp_tools": True})
     with runtime.profile("a"):
         a.emit("on_session_start", session_id="same-id")
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
     runtime.register("b")
     with runtime.profile("b"):
         assert "error" in json.loads(
@@ -650,7 +701,7 @@ def test_profile_secret_scope_overrides_process_environment(runtime, monkeypatch
         ctx = runtime.register(name, env=False)
         with runtime.profile(name):
             ctx.emit("on_session_start", session_id="same-id")
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "ok"}, session_id="same-id"
             )
     evaluated = requests_for(runtime, "/evaluate")
@@ -672,7 +723,7 @@ def test_reload_keeps_active_session_without_start_replay(
     old = runtime.register("a", {"fail_open": fail_open})
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id", model="original-model")
-        runtime.registry.get_entry("read_file").handler(
+        runtime.guarded_entry("read_file").handler(
             {"path": "before"}, session_id="same-id"
         )
         old.emit(
@@ -687,7 +738,7 @@ def test_reload_keeps_active_session_without_start_replay(
                 callback()
         new = runtime.register("a", {"fail_open": fail_open, "checkpoint_interval": 2})
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after"}, session_id="same-id"
             )
         ) == {"result": "after"}
@@ -719,7 +770,7 @@ def test_reloading_profile_retires_old_callbacks_and_mcp_exposure(runtime):
         old.emit(
             "post_llm_call", session_id="same-id", assistant_response="before reload"
         )
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
         timer = Timer.instances[-1]
         new = runtime.register(
             "a",
@@ -731,9 +782,7 @@ def test_reloading_profile_retires_old_callbacks_and_mcp_exposure(runtime):
         )
         assert runtime.registry.get_entry("old_tool") is None
         new.emit("on_session_start", session_id="same-id")
-        runtime.registry.get_entry("read_file").handler(
-            {"path": "ok"}, session_id="same-id"
-        )
+        runtime.guarded_entry("read_file").handler({"path": "ok"}, session_id="same-id")
         assert "error" in json.loads(
             handler({"path": "must-not-run"}, session_id="same-id")
         )
@@ -770,24 +819,24 @@ def test_reload_identity_change_requires_fresh_start(runtime, monkeypatch, chang
         count = len(runtime.requests)
         new.emit("pre_llm_call", session_id="same-id", user_message="Continue")
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "blocked"}, session_id="same-id"
             )
         )
         assert "error" in json.loads(
-            runtime.registry.get_entry("shared_tool").handler({}, session_id="same-id")
+            runtime.guarded_entry("shared_tool").handler({}, session_id="same-id")
         )
         assert len(runtime.requests) == count
         # Another reload cannot bypass the requirement for a genuine start.
         new = runtime.register("a", settings)
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "still blocked"}, session_id="same-id"
             )
         )
         new.emit("on_session_start", session_id="fresh-session")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "fresh"}, session_id="fresh-session"
             )
         ) == {"result": "fresh"}
@@ -837,8 +886,8 @@ def test_reload_requires_fresh_start_for_each_session(
                     runtime.register("a", settings)
         if reload_again != "none":
             current = runtime.register("a", settings)
-        handler = runtime.registry.get_entry("read_file").handler
-        mcp_handler = runtime.registry.get_entry("shared_tool").handler
+        handler = runtime.guarded_entry("read_file").handler
+        mcp_handler = runtime.guarded_entry("shared_tool").handler
         assert json.loads(handler({"path": "fresh"}, session_id="first")) == {
             "result": "fresh"
         }
@@ -881,14 +930,14 @@ def test_evicted_reload_state_requires_fresh_start(runtime, monkeypatch):
         before = len(runtime.requests)
         ctx.emit("pre_llm_call", session_id="same-id", user_message="Continue")
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "blocked"}, session_id="same-id"
             )
         )
         assert len(runtime.requests) == before
         ctx.emit("on_session_start", session_id="fresh-id")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "fresh"}, session_id="fresh-id"
             )
         ) == {"result": "fresh"}
@@ -898,7 +947,7 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
     old = runtime.register("a")
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id")
-        old_handler = runtime.registry.get_entry("read_file").handler
+        old_handler = runtime.guarded_entry("read_file").handler
     entered, release = threading.Event(), threading.Event()
     results = []
 
@@ -927,7 +976,7 @@ def test_reload_keeps_state_updated_by_inflight_evaluation(runtime):
         thread.join(5)
     assert results == [{"result": "in flight"}]
     with runtime.profile("a"):
-        runtime.registry.get_entry("read_file").handler(
+        runtime.guarded_entry("read_file").handler(
             {"path": "after"}, session_id="same-id"
         )
         new.emit("on_session_end", session_id="same-id")
@@ -947,7 +996,7 @@ def test_session_end_cancels_admitted_call_across_reload(
     old = runtime.register("a")
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id")
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
         captured_end = old.hooks["on_session_end"][0]
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     results = []
@@ -1030,7 +1079,7 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
         )
         ctx = runtime.register("a")
         ctx.emit("on_session_start", session_id="same-id")
-        predecessor = runtime.registry.get_entry("decorated_tool").handler
+        predecessor = runtime.guarded_entry("decorated_tool").handler
 
         @wraps(predecessor)
         def validate(args, **kwargs):
@@ -1075,7 +1124,7 @@ def test_reload_preserves_later_plugin_wrapper(runtime, is_async, same_identity)
             if not same_identity:
                 ctx.emit("on_session_start", session_id="same-id")
             ctx.emit("on_session_start", session_id="other-session")
-            handler = runtime.registry.get_entry("decorated_tool").handler
+            handler = runtime.guarded_entry("decorated_tool").handler
             for path in ("blocked", "retarget", "foreign", "allowed"):
                 value = handler({"path": path}, session_id="same-id", task_id="worker")
                 result = json.loads(asyncio.run(value) if is_async else value)
@@ -1144,7 +1193,7 @@ def test_reload_preserves_mixed_wrapper_calling_convention(
         )
         current = runtime.register("a")
         current.emit("on_session_start", session_id="same-id")
-        predecessor = runtime.registry.get_entry("mixed_tool").handler
+        predecessor = runtime.guarded_entry("mixed_tool").handler
 
         @wraps(predecessor)
         def validate(args, **kwargs):
@@ -1179,7 +1228,7 @@ def test_reload_preserves_mixed_wrapper_calling_convention(
                 )
                 if not same_identity:
                     current.emit("on_session_start", session_id="same-id")
-            entry = runtime.registry.get_entry("mixed_tool")
+            entry = runtime.guarded_entry("mixed_tool")
             value = entry.handler({"path": "allowed"}, session_id="same-id")
             result = asyncio.run(value) if entry.is_async else value
             assert json.loads(result) == {"result": "transformed", "validated": True}
@@ -1235,7 +1284,7 @@ def test_composed_wrapper_cannot_resume_cancelled_invocation(
         )
         old = runtime.register("a")
         old.emit("on_session_start", session_id="same-id")
-        predecessor = runtime.registry.get_entry("paused_tool").handler
+        predecessor = runtime.guarded_entry("paused_tool").handler
 
         @wraps(predecessor)
         def pause(args, **kwargs):
@@ -1266,7 +1315,7 @@ def test_composed_wrapper_cannot_resume_cancelled_invocation(
             override=True,
         )
         current = runtime.register("a")
-        handler = runtime.registry.get_entry("paused_tool").handler
+        handler = runtime.guarded_entry("paused_tool").handler
 
     def invoke():
         with runtime.profile("a"):
@@ -1338,7 +1387,7 @@ def test_reload_observes_admitted_session_start_completion(runtime, same_identit
     assert not failures
     with runtime.profile("a"):
         result = json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after start"}, session_id="fresh-session"
             )
         )
@@ -1396,7 +1445,7 @@ def test_failed_first_load_allows_later_llm_bootstrap(
         # Reload after a failed first attempt does not replay session-start.
         ctx.emit("pre_llm_call", session_id="already-running", user_message="Continue")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "checked"}, session_id="already-running"
             )
         ) == {"result": "checked"}
@@ -1444,7 +1493,7 @@ def test_failed_reload_keeps_session_for_retry(
         monkeypatch.setattr(Context, "register_hook", original)
         runtime.register("a")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after retry"}, session_id="same-id"
             )
         ) == {"result": "after retry"}
@@ -1494,7 +1543,7 @@ def test_reload_never_exposes_unguarded_native_tool(
         with runtime.profile("a"):
             before = len(requests_for(runtime, "/evaluate"))
             result = json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "during"}, session_id="same-id"
                 )
             )
@@ -1508,7 +1557,7 @@ def test_reload_never_exposes_unguarded_native_tool(
     with runtime.profile("a"):
         before = len(requests_for(runtime, "/evaluate"))
         result = json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after"}, session_id="same-id"
             )
         )
@@ -1517,7 +1566,7 @@ def test_reload_never_exposes_unguarded_native_tool(
             monkeypatch.setattr(plugin, "_register_profile", register)
             replacements.append(runtime.register("a"))
             assert json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "retry"}, session_id="same-id"
                 )
             ) == {"result": "retry"}
@@ -1526,21 +1575,25 @@ def test_reload_never_exposes_unguarded_native_tool(
             for callback in ctx.unload:
                 callback()
         assert not getattr(
-            runtime.registry.get_entry("read_file").handler,
+            runtime.guarded_entry("read_file").handler,
             "_intaris_original_handler",
             None,
         )
 
 
-def test_rejected_guard_replacement_keeps_old_guard_installed(runtime, monkeypatch):
+def test_rejected_middleware_replacement_keeps_old_guard_blocking(runtime, monkeypatch):
     old = runtime.register("a", {"fail_open": True})
     with runtime.profile("a"):
         old.emit("on_session_start", session_id="same-id")
-        monkeypatch.setattr(Context, "register_tool", lambda *args, **kwargs: None)
-        with pytest.raises(RuntimeError, match="did not register Intaris guard"):
+        monkeypatch.setattr(
+            Context, "register_middleware", lambda *args, **kwargs: None
+        )
+        with pytest.raises(
+            RuntimeError, match="did not register Intaris execution middleware"
+        ):
             runtime.register("a", {"fail_open": True})
         assert "error" in json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "blocked"}, session_id="same-id"
             )
         )
@@ -1574,14 +1627,14 @@ def test_unload_recording_uses_one_total_http_timeout_budget(runtime, monkeypatc
     assert timeouts == [5.0, 2.0]
     with runtime.profile("a"):
         assert not getattr(
-            runtime.registry.get_entry("read_file").handler,
+            runtime.guarded_entry("read_file").handler,
             "_intaris_original_handler",
             None,
         )
         new = runtime.register("a", {"session_recording": True})
         Timer.instances[-1].fire()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after"}, session_id="session-2"
             )
         ) == {"result": "after"}
@@ -1636,14 +1689,14 @@ def test_reload_waits_for_external_unload_flush_and_cleanup(runtime):
     assert loaded.is_set()
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after"}, session_id="same-id"
             )
         ) == {"result": "after"}
         for callback in contexts[0].unload:
             callback()
         assert not getattr(
-            runtime.registry.get_entry("read_file").handler,
+            runtime.guarded_entry("read_file").handler,
             "_intaris_original_handler",
             None,
         )
@@ -1702,21 +1755,17 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
                 plugin.register(plugins.PluginContext(manifest, manager))
                 assert len(manager._hooks["on_session_start"]) == 1
     with runtime.profile("a"):
-        runtime.registry.get_entry("read_file").handler(
-            {"path": "ok"}, session_id="same-id"
-        )
+        runtime.guarded_entry("read_file").handler({"path": "ok"}, session_id="same-id")
         assert runtime.registry.get_entry("b_tool") is None
     # Host unload can be requested from another profile, but releases only A.
     with runtime.profile("b"):
         managers["a"].unload()
-        runtime.registry.get_entry("read_file").handler(
-            {"path": "ok"}, session_id="same-id"
-        )
+        runtime.guarded_entry("read_file").handler({"path": "ok"}, session_id="same-id")
         assert runtime.registry.get_entry("b_tool") is not None
     with runtime.profile("a"):
         assert runtime.registry.get_entry("a_tool") is None
         assert not getattr(
-            runtime.registry.get_entry("read_file").handler,
+            runtime.guarded_entry("read_file").handler,
             "_intaris_original_handler",
             None,
         )
@@ -1732,7 +1781,7 @@ def test_real_hermes_managers_settings_hooks_registry_and_unload(runtime, monkey
         manager._track_tool_override_policy(manifest, "hermes_intaris")
         plugin.register(plugins.PluginContext(manifest, manager))
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "after reload"}, session_id="same-id"
             )
         ) == {"result": "after reload"}
@@ -1761,7 +1810,7 @@ def test_legacy_unload_restores_original_tool(runtime, monkeypatch, public_resto
             for callback in previous.unload:
                 callback()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "guarded"}, session_id="same-id"
             )
         ) == {"result": "guarded"}
@@ -1769,7 +1818,7 @@ def test_legacy_unload_restores_original_tool(runtime, monkeypatch, public_resto
             callback()
             callback()  # Host cleanup may be repeated after a failed reload.
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "restored"}, session_id="same-id"
             )
         ) == {"result": "restored"}
@@ -1808,7 +1857,7 @@ def test_legacy_registry_refuses_second_profile_without_redirecting_first(
     with runtime.profile("a"):
         assert (
             json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "ok"}, session_id="same-id"
                 )
             )["result"]
@@ -1851,7 +1900,7 @@ def test_legacy_public_enumerator_does_not_imply_profile_scope(runtime, monkeypa
         a.emit("on_session_start", session_id="same-id")
         assert (
             json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "ok"}, session_id="same-id"
                 )
             )["result"]
@@ -2081,7 +2130,7 @@ def test_unload_during_discovery_disposes_late_tools_and_timer(runtime):
     with runtime.profile("a"):
         assert runtime.registry.get_entry("late_tool") is None
         assert not getattr(
-            runtime.registry.get_entry("read_file").handler,
+            runtime.guarded_entry("read_file").handler,
             "_intaris_original_handler",
             None,
         )
@@ -2090,7 +2139,7 @@ def test_unload_during_discovery_disposes_late_tools_and_timer(runtime):
             "pre_llm_call", session_id="already-running", user_message="Continue"
         )
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "recovered"}, session_id="already-running"
             )
         ) == {"result": "recovered"}
@@ -2110,7 +2159,7 @@ def test_changed_reload_finishes_predecessor_with_original_owner(
         old.emit(
             "post_llm_call", session_id="same-id", assistant_response="old private text"
         )
-        runtime.registry.get_entry("read_file").handler(
+        runtime.guarded_entry("read_file").handler(
             {"path": "old"}, session_id="same-id"
         )
         original_id = requests_for(runtime, "/intention")[-1]["body"]["session_id"]
@@ -2250,7 +2299,7 @@ def test_completion_owner_deduplicates_concurrent_generation_hooks(runtime, comp
             with runtime.profile("b"):
                 other.emit("on_session_start", session_id="same-id")
                 assert json.loads(
-                    runtime.registry.get_entry("read_file").handler(
+                    runtime.guarded_entry("read_file").handler(
                         {"path": "other"}, session_id="same-id"
                     )
                 ) == {"result": "other"}
@@ -2311,7 +2360,7 @@ def test_completion_owner_settles_end_during_creation_without_deleting_reused_id
     assert original_state._ended.is_set() and not original_state.start_confirmed
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "new lifetime"}, session_id="same-id"
             )
         ) == {"result": "new lifetime"}
@@ -2356,7 +2405,7 @@ def test_completion_owner_preserves_new_state_during_blocked_final_flush(runtime
     original_id, new_id = [r["body"]["session_id"] for r in created]
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "new lifetime"}, session_id="same-id"
             )
         ) == {"result": "new lifetime"}
@@ -2538,7 +2587,7 @@ def test_session_eviction_retires_completion_owners(
         assert all(ref() is None for ref in references[:-3])
         ctx.emit("on_session_start", session_id="session-11")
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retained"}, session_id="session-11"
             )
         ) == {"result": "retained"}
@@ -2631,7 +2680,7 @@ def test_session_eviction_settles_pending_creation_and_preserves_reused_id(
     assert set(completed) == expected and len(completed) == len(expected)
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "new lifetime"}, session_id="same-id"
             )
         ) == {"result": "new lifetime"}
@@ -2688,7 +2737,7 @@ def test_session_eviction_flush_does_not_hold_map_or_delete_reused_id(
     assert len(requests_for(runtime, "/events")) == 1
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "new lifetime"}, session_id="same-id"
             )
         ) == {"result": "new lifetime"}
@@ -2778,7 +2827,7 @@ def test_real_hermes_eviction_waits_for_outer_guard(
         profile = plugin._profiles[str(home)]
         original = profile.sessions["same-id"]
         original_id = original.intaris_session_id
-        guarded = runtime.registry.get_entry("read_file").handler
+        guarded = runtime.guarded_entry("read_file").handler
 
         def after_native(result):
             if pause == "foreign":
@@ -2973,7 +3022,7 @@ def test_retired_owner_cache_eviction_and_compatible_adoption(runtime, monkeypat
     assert plugin._profiles[str(home)].sessions["same-id"] is state
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "still live"}, session_id="same-id"
             )
         ) == {"result": "still live"}
@@ -3089,7 +3138,7 @@ def test_retired_owner_effects_release_registration_locks(
                 current.emit("on_session_start", session_id="same-id")
                 replacement = plugin._profiles[str(home)].sessions["same-id"]
                 assert json.loads(
-                    runtime.registry.get_entry("read_file").handler(
+                    runtime.guarded_entry("read_file").handler(
                         {"path": "replacement"}, session_id="same-id"
                     )
                 ) == {"result": "replacement"}
@@ -3114,7 +3163,7 @@ def test_retired_owner_cancels_outer_foreign_wrapper(runtime, monkeypatch, is_as
         old = runtime.register("a")
         old.emit("on_session_start", session_id="same-id")
         state = plugin._profiles[str(home)].sessions["same-id"]
-        predecessor = runtime.registry.get_entry("read_file").handler
+        predecessor = runtime.guarded_entry("read_file").handler
 
         @wraps(predecessor)
         def wrapper(args, **kwargs):
@@ -3140,7 +3189,7 @@ def test_retired_owner_cancels_outer_foreign_wrapper(runtime, monkeypatch, is_as
             override=True,
         )
         runtime.register("a")
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
 
     def invoke():
         with runtime.profile("a"):
@@ -3363,7 +3412,7 @@ def test_adopted_continuity_survives_cache_eviction_and_failed_reload(
         assert original._completion is original_owner
         assert original.start_confirmed and not original._ended.is_set()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retry"}, session_id="same-id"
             )
         ) == {"result": "retry"}
@@ -3452,7 +3501,7 @@ def test_unloaded_predecessor_survives_eviction_and_incompatible_rollback(
         assert original._completion is owner
         assert original.start_confirmed and not original._ended.is_set()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retry"}, session_id="same-id"
             )
         ) == {"result": "retry"}
@@ -3524,7 +3573,7 @@ def test_replacement_success_accounts_evicted_predecessor(
         with runtime.profile("a"):
             assert plugin._profiles[str(home)].sessions["same-id"] is original
             assert json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "retained"}, session_id="same-id"
                 )
             ) == {"result": "retained"}
@@ -3586,7 +3635,7 @@ def test_compatible_failed_reload_keeps_predecessor_outside_retired_budget(
     with runtime.profile("a"):
         assert plugin._profiles[str(home)].sessions["same-id"] is original
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retry"}, session_id="same-id"
             )
         ) == {"result": "retry"}
@@ -3654,7 +3703,7 @@ def test_rollback_cleanup_protects_referenced_continuity(
     with runtime.profile("a"):
         assert plugin._profiles[str(home)].sessions["same-id"] is original
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retry"}, session_id="same-id"
             )
         ) == {"result": "retry"}
@@ -3744,7 +3793,7 @@ def test_published_predecessor_leaves_retired_budget_after_unload_wait(
         assert plugin._profiles[str(home)].sessions["same-id"] is original
         assert original.start_confirmed and not original._ended.is_set()
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "retry"}, session_id="same-id"
             )
         ) == {"result": "retry"}
@@ -3850,7 +3899,7 @@ def test_reload_protects_predecessor_before_unload_wait_returns(
             assert original._completion.token not in plugin._retired_owners
             assert not plugin._completion_owners.get((str(home), "same-id"))
             assert "error" in json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "cancelled"}, session_id="same-id"
                 )
             )
@@ -3863,7 +3912,7 @@ def test_reload_protects_predecessor_before_unload_wait_returns(
             assert fresh.start_confirmed and not fresh._ended.is_set()
             assert original._ended.is_set() and not original.start_confirmed
             assert json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "fresh"}, session_id="same-id"
                 )
             ) == {"result": "fresh"}
@@ -3882,7 +3931,7 @@ def test_reload_protects_predecessor_before_unload_wait_returns(
             assert plugin._profiles[str(home)].sessions["same-id"] is original
             assert original.start_confirmed and not original._ended.is_set()
             assert json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "retained"}, session_id="same-id"
                 )
             ) == {"result": "retained"}
@@ -3918,7 +3967,7 @@ def test_stale_predecessor_end_cannot_cancel_fresh_successor(
         fresh = successor.sessions["same-id"]
         assert fresh is not original
         assert (successor.sessions is predecessor.sessions) == compatible
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
     entered, release = threading.Event(), threading.Event()
 
     def hold_evaluation():
@@ -4012,15 +4061,13 @@ def test_explicit_start_survives_direct_replacement(
         if r["body"]["details"]["session_key"] == "new-session"
     ], "registration must not create queued remote sessions"
     with runtime.profile("a"):
-        native = runtime.registry.get_entry("read_file").handler
+        native = runtime.guarded_entry("read_file").handler
         assert "error" in json.loads(
             native({"path": "unstarted"}, session_id="unrelated")
         )
         if admission == "mcp":
             result = json.loads(
-                runtime.registry.get_entry("docs_read").handler(
-                    {}, session_id="new-session"
-                )
+                runtime.guarded_entry("docs_read").handler({}, session_id="new-session")
             )
             expected = (
                 "a.invalid" if compatible or outcome != "success" else "new.invalid"
@@ -4085,7 +4132,7 @@ def test_pending_explicit_start_respects_lifecycle_order(
     assert captured[0] is not None, "explicit start must have local evidence"
     assert not requests_for(runtime, "/intention")
     with runtime.profile("a"):
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
         if order in ("terminal", "idle_resume"):
             assert "error" in json.loads(
                 handler({"path": "ended"}, session_id="pending")
@@ -4134,7 +4181,7 @@ def test_pending_explicit_starts_share_session_capacity(
     assert not requests_for(runtime, "/intention")
     assert all(state._ended.is_set() for state in captured[:2])
     with runtime.profile("a"):
-        handler = runtime.registry.get_entry("read_file").handler
+        handler = runtime.guarded_entry("read_file").handler
         assert "error" in json.loads(
             handler({"path": "evicted"}, session_id="pending-0")
         )
@@ -4171,7 +4218,7 @@ def test_pending_start_creation_cannot_rebind_ended_call(
     def invoke():
         with runtime.profile("a"):
             return json.loads(
-                runtime.registry.get_entry("read_file").handler(
+                runtime.guarded_entry("read_file").handler(
                     {"path": "abandoned"}, session_id="pending"
                 )
             )
@@ -4246,7 +4293,7 @@ def test_pending_start_received_during_failed_handoff_cleanup(
     assert not requests_for(runtime, "/intention")
     current = runtime.register("a")
     with runtime.profile("a"):
-        result = runtime.registry.get_entry("read_file").handler(
+        result = runtime.guarded_entry("read_file").handler(
             {"path": "after-cleanup"}, session_id="cleanup-start"
         )
         assert json.loads(result) == {"result": "after-cleanup"}
@@ -4283,7 +4330,7 @@ def test_pending_duplicate_starts_coalesce_without_intervening_end(
         current = runtime.register("a", {} if compatible else {"agent_id": "new"})
     with runtime.profile("a"):
         assert json.loads(
-            runtime.registry.get_entry("read_file").handler(
+            runtime.guarded_entry("read_file").handler(
                 {"path": "once"}, session_id="same"
             )
         ) == {"result": "once"}
@@ -4326,7 +4373,7 @@ def test_materializing_idle_start_cannot_clear_a_later_end(
 
     def invoke():
         with runtime.profile("a"):
-            entry = runtime.registry.get_entry(
+            entry = runtime.guarded_entry(
                 "read_file" if admission == "native" else "docs_read"
             )
             return json.loads(entry.handler({"path": "live"}, session_id="same"))
