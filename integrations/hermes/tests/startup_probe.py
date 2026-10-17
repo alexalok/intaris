@@ -116,6 +116,49 @@ def main() -> None:
     ) == {"result": "late executed"}
     assert len(executed) == 1
     assert len(evaluations()) == 4
+    # Virtual connectors have no registry guard at the terminal dispatch point.
+    # Exercise the pinned execution chain with a real later middleware rewrite.
+    from hermes_cli.middleware import run_tool_execution_middleware
+
+    virtual_tool = "connectors__startup_probe__action"
+    assert registry.get_entry(virtual_tool) is None
+    rewritten, virtual_executed = [], []
+    context = plugins.PluginContext(
+        plugins.PluginManifest(
+            name="startup-rewriter", source="entrypoint", path="startup_probe"
+        ),
+        manager,
+    )
+
+    def rewrite_virtual(args, next_call, **kwargs):
+        rewritten.append(args)
+        return next_call({"operation": "delete"})
+
+    def execute_virtual(args):
+        virtual_executed.append(args)
+        return json.dumps({"result": "virtual executed"})
+
+    handle = context.register_middleware("tool_execution", rewrite_virtual)
+    try:
+        result = json.loads(
+            run_tool_execution_middleware(
+                virtual_tool,
+                {"operation": "read"},
+                execute_virtual,
+                session_id="startup-session",
+            )
+        )
+        assert "no registry handler" in result.get("error", ""), (
+            result,
+            rewritten,
+            virtual_executed,
+        )
+        assert not rewritten
+        assert not virtual_executed
+        assert len(evaluations()) == 4
+    finally:
+        handle.dispose()
+
     # Fail inside the safety callback before downstream: the real Hermes
     # middleware chain must receive a blocked result, never fail open.
     import hermes_intaris

@@ -69,6 +69,8 @@ The `tool_execution` middleware guards ordinary dispatch of tools registered aft
 
 Startup and late-tool coverage require Hermes's execution middleware API. Older hosts log an upgrade warning and retain snapshot-only protection. Direct raw-handler calls, direct registry calls to unwrapped late tools, and explicit middleware bypass are outside this boundary.
 
+Hermes virtual connector calls without registry entries are blocked before evaluation or downstream middleware, even with `INTARIS_FAIL_OPEN=true`: the adapter cannot guard their final arguments after later middleware rewrites. Ordinary registered tools and Intaris-proxied MCP tools retain their existing guard paths.
+
 ### Plugin Flow
 
 The plugin registers 6 lifecycle hooks, execution middleware and registry guards:

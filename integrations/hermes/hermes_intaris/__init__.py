@@ -1819,10 +1819,16 @@ def _make_execution_middleware(
                 # The installed guard sees final args, including changes made by
                 # later middleware, and owns the single evaluation/dispatch.
                 return dispatch(args)
-            # Some Hermes dispatchers resolve virtual tools outside the registry.
-            # Their synchronous continuation still needs the normal native guard.
-            guarded = _make_guarded_handler(profile, dispatch, tool_name, "", False)
-            return guarded(args, session_id=kwargs.get("session_id"))
+            # Virtual tools have no terminal registry guard. Later execution
+            # middleware can still rewrite args, so evaluating here is unsafe.
+            return json.dumps(
+                {
+                    "error": (
+                        "[intaris] Tool execution blocked: no registry handler; "
+                        "cannot guard final arguments"
+                    )
+                }
+            )
         except Exception as exc:
             # Do not log exception text: a provider may include tool args/secrets.
             logger.error("[intaris] Execution guard failed (%s)", type(exc).__name__)

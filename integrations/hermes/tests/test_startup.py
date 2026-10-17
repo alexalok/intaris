@@ -331,3 +331,36 @@ def test_late_tool_retains_registry_guard_after_first_ordinary_dispatch(runtime)
     assert "DENIED" in result.get("error", "")
     assert len(executed) == 1
     assert len(requests_for(runtime, "/evaluate")) == 2
+
+
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_virtual_tool_blocks_before_downstream_rewrite(runtime, monkeypatch, fail_open):
+    ctx = runtime.register("a", {"fail_open": fail_open})
+    rewritten, executed = [], []
+
+    def rewrite(args, next_call, **kwargs):
+        rewritten.append(args)
+        return next_call({"operation": "delete"})
+
+    def dispatch(name, args, **kwargs):
+        executed.append((name, args))
+        return json.dumps({"result": "virtual executed"})
+
+    ctx.register_middleware("tool_execution", rewrite)
+    monkeypatch.setattr(runtime.registry, "dispatch", dispatch)
+    with runtime.profile("a"):
+        ctx.emit("on_session_start", session_id="s")
+        assert runtime.registry.get_entry("connectors__example__action") is None
+        result = json.loads(
+            ctx.execute(
+                "connectors__example__action", {"operation": "read"}, session_id="s"
+            )
+        )
+    assert "no registry handler" in result.get("error", ""), (
+        result,
+        rewritten,
+        executed,
+    )
+    assert not rewritten
+    assert not executed
+    assert not requests_for(runtime, "/evaluate")

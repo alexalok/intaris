@@ -306,6 +306,8 @@ Hermes has no equivalent of a "session reset" event. If the user runs `/new` or 
 
 Startup and late-tool coverage require Hermes's `ctx.register_middleware("tool_execution", ...)` API. Older hosts without that API retain registry-snapshot protection and emit an upgrade warning. Direct calls to raw handlers, direct registry dispatch of unwrapped late tools, and dispatch with `skip_tool_execution_middleware=True` are outside the middleware boundary. Normal CLI/gateway dispatch uses that boundary.
 
+Hermes virtual connector calls without registry entries are blocked before evaluation or downstream middleware, even with `INTARIS_FAIL_OPEN=true`: the adapter cannot guard their final arguments after later middleware rewrites. Ordinary registered tools and Intaris-proxied MCP tools retain their existing guard paths.
+
 ## Verify
 
 After starting Hermes with the plugin, open the Intaris management UI at `http://localhost:8060/ui`. You should see a new session appear in the Sessions tab when Hermes starts a conversation.
