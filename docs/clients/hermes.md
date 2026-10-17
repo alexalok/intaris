@@ -56,7 +56,7 @@ After starting Hermes, open the Intaris management UI at `http://localhost:8060/
 
 ### Tool Wrapping
 
-Unlike other integrations that use hook-based blocking, the Hermes plugin uses **tool registry wrapping**. During initialization, it:
+The Hermes plugin combines profile-owned **tool execution middleware** with **tool registry wrapping**. During initialization, it:
 
 1. Imports `tools.registry` from Hermes
 2. Captures every existing tool's original handler
@@ -65,11 +65,13 @@ Unlike other integrations that use hook-based blocking, the Hermes plugin uses *
 5. If denied, returns `{"error": "BLOCKED by Intaris: ..."}` to the LLM
 6. If escalated, polls for user decision with exponential backoff
 
-This works because Hermes plugins load **after** built-in tools register, and the tool registry allows handler replacement.
+The `tool_execution` middleware guards ordinary dispatch of tools registered after initialization, including built-ins loaded after CLI or gateway plugin discovery. Existing guarded handlers and Intaris MCP proxies keep their own evaluation without a duplicate request. Middleware safety errors return a blocked result instead of raising into Hermes's fail-open callback handling. Late registry entries are wrapped lazily before continuing the middleware chain, so their guard evaluates final arguments. Registry wrappers also protect later direct dispatch of those entries.
+
+Startup and late-tool coverage require Hermes's execution middleware API. Older hosts log an upgrade warning and retain snapshot-only protection. Direct raw-handler calls, direct registry calls to unwrapped late tools, and explicit middleware bypass are outside this boundary.
 
 ### Plugin Flow
 
-The plugin registers 6 lifecycle hooks plus the tool wrapping:
+The plugin registers 6 lifecycle hooks, execution middleware and registry guards:
 
 1. **`on_session_start`**: Creates an Intaris session via `POST /api/v1/intention` with session ID format `hm-{uuid}`.
 2. **`pre_llm_call`**: Forwards the user message as reasoning context via `POST /api/v1/reasoning`. When session recording is enabled, the user message event is recorded first and `/reasoning` is called with `from_events=true`. Otherwise, includes the last assistant message as context.

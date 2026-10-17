@@ -171,9 +171,9 @@ reload; use the pip entry-point installation for active-session continuity.
 
 ### Tool Wrapping
 
-The plugin uses a **tool wrapping** approach: during initialization, it captures every tool handler registered in Hermes's tool registry and re-registers each with a guarded wrapper. The wrapper calls `POST /api/v1/evaluate` before dispatching to the original handler.
+The plugin registers profile-owned `tool_execution` middleware and wraps the registry handlers already present at initialization. Ordinary Hermes dispatch is guarded even when built-ins or other tools register after the plugin. No eager built-in discovery or import-order assumption is required.
 
-This works because Hermes plugins load **after** built-in tools, and the tool registry allows handler replacement. The wrapper is transparent -- same schema, same toolset, same availability checks.
+At dispatch, existing guarded handlers retain their own evaluation; Intaris MCP proxies retain server-side evaluation through `/mcp/call`. Late registry handlers receive an owned wrapper before `next_call`, so evaluation sees final arguments after downstream middleware changes and runs only once. Guard installation is serialized per profile; evaluation and approval waits run outside that lock. Middleware safety errors return a blocked result because Hermes otherwise skips callbacks that raise. Registry wrappers also protect direct dispatch of entries already wrapped at startup or by an earlier ordinary dispatch.
 
 ### Invocation Identity
 
@@ -302,9 +302,9 @@ Hermes's `delegate_task` tool spawns sub-agents, but the plugin system does not 
 
 Hermes has no equivalent of a "session reset" event. If the user runs `/new` or `/reset`, the `on_session_end` hook fires with `completed=False`, but the plugin cannot distinguish a reset from an idle timeout.
 
-### Plugin load order dependency
+### Execution middleware requirement
 
-The tool wrapping approach depends on plugins loading after built-in tools. This is the current Hermes behavior (built-in tools register at import time, plugins load via `discover_plugins()` afterward), but is not a guaranteed contract.
+Startup and late-tool coverage require Hermes's `ctx.register_middleware("tool_execution", ...)` API. Older hosts without that API retain registry-snapshot protection and emit an upgrade warning. Direct calls to raw handlers, direct registry dispatch of unwrapped late tools, and dispatch with `skip_tool_execution_middleware=True` are outside the middleware boundary. Normal CLI/gateway dispatch uses that boundary.
 
 ## Verify
 
@@ -320,7 +320,7 @@ HERMES_SOURCE=/path/to/hermes-agent PYTHONPATH=integrations/hermes \
 
 The second command additionally executes the checkout's real human-wait,
 interrupt, and sequential/concurrent executor wait code with controlled transport,
-clock and configuration boundaries. It does not modify or start Hermes.
+clock and configuration boundaries. It also launches isolated subprocesses with the full CLI/gateway startup, plugin loader, middleware, model dispatcher and terminal modules. These use temporary Hermes homes and test-only HTTP responses; no model API, real credentials or running gateway is used. The test environment must contain the Hermes dependencies needed by those modules (including `psutil` for terminal).
 
 ## License
 

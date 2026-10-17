@@ -4,10 +4,10 @@ Intercepts every tool call and evaluates it through Intaris's safety
 pipeline before allowing execution.  Tool calls that are denied or
 escalated are blocked with an error message returned to the LLM.
 
-The plugin works by **wrapping** every tool handler in the Hermes tool
-registry with an evaluation guard.  Since plugins load after built-in
-tools, we capture the original handler and re-register with a wrapper
-that calls ``POST /api/v1/evaluate`` before dispatching.
+Profile-owned execution middleware covers tools registered before or after
+plugin startup. Existing registry handlers are also wrapped for direct-dispatch
+protection. Both paths use the same evaluation guard; already guarded handlers
+and Intaris MCP proxies retain their own evaluation without a duplicate request.
 
 Flow:
   1. on_session_start: Creates an Intaris session via POST /api/v1/intention
@@ -1719,6 +1719,123 @@ def _make_guarded_handler(
     return public_handler
 
 
+def _register_tool_guard(
+    profile: ProfileRuntime, ctx: Any, registry: Any, scoped: bool, entry: Any
+) -> None:
+    """Install an owned guard for one entry, at startup or first ordinary dispatch."""
+    original = entry.handler
+    metadata = getattr(original, "__dict__", {})
+    if metadata.get("_intaris_mcp_owner") is not None:
+        return  # These handlers evaluate through /mcp/call themselves.
+    if metadata.get("_intaris_guard") is original:
+        original = metadata["_intaris_original_handler"]
+    guarded = _make_guarded_handler(
+        profile, original, entry.name, entry.toolset, entry.is_async
+    )
+    options = dict(
+        name=entry.name,
+        toolset=entry.toolset,
+        schema=entry.schema,
+        handler=guarded,
+        check_fn=entry.check_fn,
+        requires_env=entry.requires_env,
+        is_async=entry.is_async,
+        description=entry.description,
+        emoji=entry.emoji,
+    )
+    if scoped:
+        # The host enforces tools.override / allow_tool_override permission
+        # and owns teardown of this profile's overlay.
+        handle = ctx.register_tool(**options, override=True)
+        _track_registration(profile, handle)
+        if handle is None:
+            raise RuntimeError(f"Hermes did not register Intaris guard: {entry.name}")
+    else:
+        registry.register(**options)
+        _track_registration(
+            profile,
+            _LegacyToolRegistration(registry, entry, registry._tools[entry.name]),
+        )
+
+
+def _make_execution_middleware(
+    profile: ProfileRuntime, registry: Any, scoped: bool
+) -> Callable:
+    """Guard ordinary Hermes dispatch independently of tool registration order."""
+    registration_lock = _registration_locks[profile.home]
+
+    def execute(**kwargs: Any) -> Any:
+        # Hermes skips middleware callbacks that raise, then executes downstream.
+        # Keep all safety work inside this boundary and return an error on failure.
+        downstream_started = False
+        try:
+            tool_name, args, next_call = (
+                kwargs["tool_name"],
+                kwargs["args"],
+                kwargs["next_call"],
+            )
+            # Serialize lazy guard installation with this profile's reload and
+            # other first calls. Never hold this lock while evaluating or waiting.
+            with registration_lock:
+                if (
+                    not profile.active
+                    or not profile.ready
+                    or _profile_key() != profile.home
+                ):
+                    return json.dumps(
+                        {
+                            "error": "[intaris] Tool belongs to a different or unloaded profile"
+                        }
+                    )
+                get_entry = getattr(registry, "get_entry", None)
+                entry = (
+                    get_entry(tool_name)
+                    if callable(get_entry)
+                    else registry._tools.get(tool_name)
+                )
+                handler = entry.handler if entry is not None else None
+                seen: set[int] = set()
+                while handler is not None and id(handler) not in seen:
+                    seen.add(id(handler))
+                    metadata = getattr(handler, "__dict__", {})
+                    if (
+                        metadata.get("_intaris_guard") is handler
+                        or metadata.get("_intaris_mcp_owner") is not None
+                    ):
+                        break
+                    handler = getattr(handler, "__wrapped__", None)
+                else:
+                    if entry is not None:
+                        _register_tool_guard(
+                            profile, profile.context, registry, scoped, entry
+                        )
+
+            def dispatch(payload: dict) -> Any:
+                nonlocal downstream_started
+                downstream_started = True
+                return next_call(payload)
+
+            if entry is not None:
+                # The installed guard sees final args, including changes made by
+                # later middleware, and owns the single evaluation/dispatch.
+                return dispatch(args)
+            # Some Hermes dispatchers resolve virtual tools outside the registry.
+            # Their synchronous continuation still needs the normal native guard.
+            guarded = _make_guarded_handler(profile, dispatch, tool_name, "", False)
+            return guarded(args, session_id=kwargs.get("session_id"))
+        except Exception as exc:
+            # Do not log exception text: a provider may include tool args/secrets.
+            logger.error("[intaris] Execution guard failed (%s)", type(exc).__name__)
+            message = (
+                "[intaris] Tool execution failed; it may have started"
+                if downstream_started
+                else "[intaris] Tool execution blocked: safety guard failed"
+            )
+            return json.dumps({"error": message})
+
+    return execute
+
+
 # ============================================================================
 # MCP Tool Registration
 # ============================================================================
@@ -2542,45 +2659,25 @@ def _register_profile(
             "if Intaris is unreachable."
         )
 
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if callable(register_middleware):
+        handle = register_middleware(
+            "tool_execution", _make_execution_middleware(profile, registry, scoped)
+        )
+        _track_registration(profile, handle)
+        if handle is None:
+            raise RuntimeError("Hermes did not register Intaris execution middleware")
+    else:
+        logger.warning(
+            "[intaris] Hermes lacks execution middleware; only tools present at "
+            "registration are guarded. Upgrade Hermes for startup/late-tool protection."
+        )
+
     # Scoped public enumeration includes other plugins visible to this profile.
     # Legacy Hermes has only a global registry; support one profile there.
     entries = registry.get_all_entries() if scoped else list(registry._tools.values())
     for entry in entries:
-        original = entry.handler
-        metadata = getattr(original, "__dict__", {})
-        if metadata.get("_intaris_mcp_owner") is not None:
-            continue  # These handlers evaluate through /mcp/call themselves.
-        if metadata.get("_intaris_guard") is original:
-            original = metadata["_intaris_original_handler"]
-        guarded = _make_guarded_handler(
-            profile, original, entry.name, entry.toolset, entry.is_async
-        )
-        options = dict(
-            name=entry.name,
-            toolset=entry.toolset,
-            schema=entry.schema,
-            handler=guarded,
-            check_fn=entry.check_fn,
-            requires_env=entry.requires_env,
-            is_async=entry.is_async,
-            description=entry.description,
-            emoji=entry.emoji,
-        )
-        if scoped:
-            # The host enforces tools.override / allow_tool_override permission
-            # and owns teardown of this profile's overlay.
-            handle = ctx.register_tool(**options, override=True)
-            _track_registration(profile, handle)
-            if handle is None:
-                raise RuntimeError(
-                    f"Hermes did not register Intaris guard: {entry.name}"
-                )
-        else:
-            registry.register(**options)
-            _track_registration(
-                profile,
-                _LegacyToolRegistration(registry, entry, registry._tools[entry.name]),
-            )
+        _register_tool_guard(profile, ctx, registry, scoped, entry)
 
     if profile.cfg.mcp_tools:
         try:

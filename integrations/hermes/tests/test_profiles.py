@@ -105,6 +105,7 @@ class Context:
         self.home = str(home)
         self.settings = settings or {}
         self.hooks = {}
+        self.middleware = {}
         self.unload = []
 
     def get_config(self, key, default=None):
@@ -121,6 +122,36 @@ class Context:
     def register_hook(self, name, handler):
         self.hooks.setdefault(name, []).append(handler)
         return Handle(lambda: self.hooks[name].remove(handler))
+
+    def register_middleware(self, name, handler):
+        self.middleware.setdefault(name, []).append(handler)
+        return Handle(lambda: self.middleware[name].remove(handler))
+
+    def execute(self, name, args, **kwargs):
+        """Model Hermes' fail-open execution chain, including single-use next_call."""
+        callbacks = list(self.middleware.get("tool_execution", []))
+
+        def run(index, payload):
+            if index == len(callbacks):
+                return self.registry.dispatch(name, payload, **kwargs)
+            called = False
+
+            def next_call(next_args):
+                nonlocal called
+                assert not called, "downstream dispatched twice"
+                called = True
+                return run(index + 1, next_args)
+
+            try:
+                return callbacks[index](
+                    tool_name=name, args=payload, next_call=next_call, **kwargs
+                )
+            except Exception:
+                if called:
+                    raise
+                return next_call(payload)
+
+        return run(0, args)
 
     def on_unload(self, handler):
         self.unload.append(handler)

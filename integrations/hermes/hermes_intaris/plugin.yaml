@@ -2,8 +2,8 @@ name: intaris
 version: 0.2.0
 description: >-
   Intaris guardrails — evaluates every tool call through Intaris's safety
-  pipeline before allowing execution. Wraps all registered tools with
-  evaluation guards, forwards reasoning context, manages sessions, and
+  pipeline before allowing execution. Guards tool execution across startup
+  and late registration, forwards reasoning context, manages sessions, and
   optionally proxies MCP tools.
 author: Filip Pytloun
 capabilities:
@@ -22,6 +22,8 @@ config_schema:
   recording_flush_interval: {type: float, description: "Recording flush interval in seconds"}
   mcp_tools: {type: bool, description: "Expose this profile's authenticated Intaris MCP tools"}
   mcp_tools_cache_ttl_s: {type: float, description: "MCP tool cache lifetime in seconds"}
+provides_middleware:
+  - tool_execution
 provides_hooks:
   - pre_tool_call
   - post_tool_call
