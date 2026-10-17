@@ -382,6 +382,13 @@ class Database:
 
     def _migrate_sqlite(self, conn: sqlite3.Connection) -> None:
         """Run schema migrations for SQLite backend."""
+        if not self._sqlite_column_exists(
+            conn, "mcp_servers", "trust_readonly_annotations"
+        ):
+            conn.execute(
+                "ALTER TABLE mcp_servers ADD COLUMN "
+                "trust_readonly_annotations INTEGER NOT NULL DEFAULT 0"
+            )
         for column in (
             "raw_decision",
             "effective_decision",
@@ -959,6 +966,11 @@ class Database:
         try:
             # All columns that may need adding (idempotent with IF NOT EXISTS)
             migrations = [
+                (
+                    "mcp_servers",
+                    "trust_readonly_annotations",
+                    "BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
                 ("audit_log", "args_hash", "TEXT"),
                 ("sessions", "last_activity_at", "TIMESTAMPTZ"),
                 ("sessions", "parent_session_id", "TEXT"),
@@ -1349,6 +1361,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     headers_encrypted TEXT,
     agent_pattern TEXT NOT NULL DEFAULT '*',
     enabled       INTEGER NOT NULL DEFAULT 1,
+    trust_readonly_annotations INTEGER NOT NULL DEFAULT 0,
     source        TEXT NOT NULL DEFAULT 'api',
     server_instructions TEXT,
     tools_cache   TEXT,
@@ -1655,6 +1668,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     headers_encrypted TEXT,
     agent_pattern TEXT NOT NULL DEFAULT '*',
     enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    trust_readonly_annotations BOOLEAN NOT NULL DEFAULT FALSE,
     source        TEXT NOT NULL DEFAULT 'api',
     server_instructions TEXT,
     tools_cache   TEXT,

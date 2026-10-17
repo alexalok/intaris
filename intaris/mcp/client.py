@@ -29,7 +29,9 @@ Transport support:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import logging
 import os
 import shutil
@@ -44,7 +46,16 @@ from urllib.parse import quote
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.types import Implementation
+from mcp.types import (
+    ClientRequest,
+    Implementation,
+    ListToolsRequest,
+    ListToolsResult,
+    PaginatedRequestParams,
+    Tool,
+    ToolAnnotations,
+)
+from pydantic import StrictBool
 
 try:
     from mcp.client.streamable_http import streamablehttp_client
@@ -56,6 +67,40 @@ except ImportError:  # MCP SDK >= 1.26 renamed this client helper.
     _STREAMABLE_HTTP_LEGACY = False
 
 logger = logging.getLogger(__name__)
+
+
+class _ApprovalAnnotations(ToolAnnotations):
+    """Validate the wire boolean before MCP SDK's permissive bool coercion."""
+
+    readOnlyHint: StrictBool | None = None
+
+
+class _ApprovalTool(Tool):
+    annotations: _ApprovalAnnotations | None = None
+
+
+class _ApprovalToolsResult(ListToolsResult):
+    tools: list[_ApprovalTool]
+
+
+async def list_tools_for_approval(
+    session: ClientSession, *, cursor: str | None = None
+) -> ListToolsResult:
+    """Read approval evidence with strict parsing at the SDK response boundary.
+
+    Checking ``is True`` after ClientSession.list_tools() is insufficient:
+    the SDK otherwise converts strings and numbers into boolean hints. Use
+    send_request's public response-model parameter on the raw JSON result.
+    Normal discovery and execution retain the SDK's standard behavior.
+    """
+    return await session.send_request(
+        ClientRequest(
+            ListToolsRequest(
+                params=PaginatedRequestParams(cursor=cursor) if cursor else None,
+            )
+        ),
+        _ApprovalToolsResult,
+    )
 
 
 def _unwrap_exception_group(exc: BaseException) -> BaseException:
@@ -102,6 +147,33 @@ _MAX_CONNECTIONS_PER_USER = 10
 _SWEEP_INTERVAL_SECONDS = 60
 
 
+def config_fingerprint(server_config: dict[str, Any]) -> str:
+    """Bind a connection to its upstream configuration and config revision.
+
+    Discovery caches are excluded. Secrets participate in the digest but are
+    never returned or logged. Tenant isolation is enforced by the cache key.
+    """
+    fields = (
+        "name",
+        "transport",
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "url",
+        "headers",
+        "agent_pattern",
+        "enabled",
+        "trust_readonly_annotations",
+        "created_at",
+        "updated_at",
+    )
+    payload = {key: server_config.get(key) for key in fields}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
 @dataclass
 class _Connection:
     """A live connection to an upstream MCP server."""
@@ -111,6 +183,7 @@ class _Connection:
     server_name: str
     user_id: str
     transport: str = ""
+    config_fingerprint: str = ""
     owner_task_id: int | None = None
     server_instructions: str | None = None
     last_used: float = field(default_factory=time.monotonic)
@@ -291,16 +364,17 @@ class MCPConnectionManager:
         """
         server_name = server_config["name"]
         key = (user_id, server_name)
+        fingerprint = config_fingerprint(server_config)
 
         # Fast path: check cache under lock.
         async with self._lock:
             conn = self._connections.get(key)
-            if conn is not None:
+            if conn is not None and conn.config_fingerprint == fingerprint:
                 conn.touch()
                 return conn.session
 
             # Enforce per-user connection limit.
-            if user_id:
+            if user_id and conn is None:
                 user_count = sum(
                     1 for c in self._connections.values() if c.user_id == user_id
                 )
@@ -321,9 +395,14 @@ class MCPConnectionManager:
             # we waited for the per-server lock.
             async with self._lock:
                 conn = self._connections.get(key)
-                if conn is not None:
+                if conn is not None and conn.config_fingerprint == fingerprint:
                     conn.touch()
                     return conn.session
+
+            # Config edits must not reuse an old endpoint, credentials or trust
+            # decision. Serialize reconnects with other connects for this key.
+            if conn is not None:
+                await self.evict(user_id, server_name)
 
             # Connect outside the main lock.
             try:
@@ -335,16 +414,56 @@ class MCPConnectionManager:
                 await self._stop_lifecycle_task(key)
                 raise
 
-            async with self._lock:
-                self._connections[key] = new_conn
-                logger.info(
-                    "Connected to upstream MCP server '%s' (user=%s)",
-                    server_name,
-                    user_id,
-                )
-                return new_conn.session
+            try:
+                async with self._lock:
+                    self._connections[key] = new_conn
+                    logger.info(
+                        "Connected to upstream MCP server '%s' (user=%s)",
+                        server_name,
+                        user_id,
+                    )
+                    return new_conn.session
+            except asyncio.CancelledError:
+                await self._close_unclaimed_connection(key, new_conn)
+                raise
 
-    async def evict(self, user_id: str, server_name: str) -> None:
+    async def _close_unclaimed_connection(
+        self, key: tuple[str, str], conn: _Connection
+    ) -> None:
+        """Dispose of an unregistered result on its owning lifecycle task."""
+        try:
+            await asyncio.shield(
+                self._run_in_lifecycle_task(
+                    key,
+                    conn.exit_stack.aclose,
+                    timeout=3.0,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to close abandoned MCP connection")
+
+    def connection_matches(
+        self, *, user_id: str, server_config: dict[str, Any], session: ClientSession
+    ) -> bool:
+        """Check that metadata and execution still refer to the same connection.
+
+        Called on the manager's event loop without an intervening await before
+        dispatch. A replacement connection must rediscover its own metadata.
+        """
+        conn = self._connections.get((user_id, server_config["name"]))
+        return (
+            conn is not None
+            and conn.session is session
+            and conn.config_fingerprint == config_fingerprint(server_config)
+        )
+
+    async def evict(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        expected_session: ClientSession | None = None,
+    ) -> None:
         """Remove a dead connection from the cache and close it.
 
         Called by the proxy when an upstream call fails, so the next
@@ -352,6 +471,10 @@ class MCPConnectionManager:
         """
         key = (user_id, server_name)
         async with self._lock:
+            if expected_session is not None:
+                current = self._connections.get(key)
+                if current is None or current.session is not expected_session:
+                    return
             if key in self._connections:
                 try:
                     await self._run_in_lifecycle_task(
@@ -505,6 +628,7 @@ class MCPConnectionManager:
                 server_name=server_name,
                 user_id=user_id,
                 transport=transport,
+                config_fingerprint=config_fingerprint(server_config),
                 owner_task_id=(
                     id(asyncio.current_task())
                     if asyncio.current_task() is not None
@@ -811,7 +935,16 @@ class MCPConnectionManager:
         fut = loop.create_future()
         queue = self._lifecycle_queues[key]
         await queue.put((operation, fut, timeout))
-        return await fut
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # The worker may have delivered a connection just before the
+            # caller was cancelled, but before it could register ownership.
+            if not fut.cancelled() and fut.done() and fut.exception() is None:
+                result = fut.result()
+                if isinstance(result, _Connection):
+                    await self._close_unclaimed_connection(key, result)
+            raise
 
     async def _lifecycle_loop(
         self, key: tuple[str, str], queue: asyncio.Queue[Any]
@@ -845,6 +978,15 @@ class MCPConnectionManager:
             else:
                 if not fut.cancelled():
                     fut.set_result(result)
+                elif isinstance(result, _Connection):
+                    # Discovery timeout/cancellation does not stop the task
+                    # that owns MCP's async contexts. Close its late result
+                    # here, on that same task, rather than leaking transport
+                    # resources or reusing an unevaluated connection.
+                    try:
+                        await result.exit_stack.aclose()
+                    except Exception:
+                        logger.exception("Failed to close late MCP connection")
 
     async def _stop_lifecycle_task(self, key: tuple[str, str]) -> None:
         """Stop the task-affine lifecycle runner for a connection key."""

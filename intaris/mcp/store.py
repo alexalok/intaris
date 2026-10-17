@@ -78,6 +78,7 @@ class MCPServerStore:
         headers: dict[str, str] | None = None,
         agent_pattern: str = "*",
         enabled: bool = True,
+        trust_readonly_annotations: bool = False,
         source: str = "api",
         clear_env: bool = False,
         clear_headers: bool = False,
@@ -93,6 +94,8 @@ class MCPServerStore:
                 secrets are provided without an encryption key.
         """
         self._validate_name(name)
+        if type(trust_readonly_annotations) is not bool:
+            raise ValueError("trust_readonly_annotations must be a boolean")
 
         if transport not in _VALID_TRANSPORTS:
             raise ValueError(
@@ -134,8 +137,8 @@ class MCPServerStore:
                 INSERT INTO mcp_servers
                     (user_id, name, transport, command, args, env_encrypted,
                      cwd, url, headers_encrypted, agent_pattern, enabled,
-                     source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source, created_at, updated_at, trust_readonly_annotations)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (user_id, name) DO UPDATE SET
                     transport = excluded.transport,
                     command = excluded.command,
@@ -152,6 +155,10 @@ class MCPServerStore:
                     END,
                     agent_pattern = excluded.agent_pattern,
                     enabled = excluded.enabled,
+                    trust_readonly_annotations = excluded.trust_readonly_annotations,
+                    tools_cache = NULL,
+                    tools_cache_at = NULL,
+                    server_instructions = NULL,
                     source = excluded.source,
                     updated_at = excluded.updated_at
                 """,
@@ -170,6 +177,7 @@ class MCPServerStore:
                     source,
                     now,
                     now,
+                    trust_readonly_annotations,
                 ),
             )
 
@@ -248,6 +256,7 @@ class MCPServerStore:
         name: str,
         tools: list[dict[str, Any]],
         server_instructions: str | None = None,
+        expected_updated_at: str | None = None,
     ) -> None:
         """Update cached tool list and server instructions."""
         now = datetime.now(timezone.utc).isoformat()
@@ -256,17 +265,18 @@ class MCPServerStore:
                 """
                 UPDATE mcp_servers
                 SET tools_cache = ?, tools_cache_at = ?,
-                    server_instructions = COALESCE(?, server_instructions),
-                    updated_at = ?
+                    server_instructions = COALESCE(?, server_instructions)
                 WHERE user_id = ? AND name = ?
+                    AND (CAST(? AS TEXT) IS NULL OR updated_at = ?)
                 """,
                 (
                     json.dumps(tools),
                     now,
                     server_instructions,
-                    now,
                     user_id,
                     name,
+                    expected_updated_at,
+                    expected_updated_at,
                 ),
             )
 
@@ -334,16 +344,28 @@ class MCPServerStore:
                 """,
                 (user_id, server_name, tool_name, preference, now, now),
             )
+            # Preferences are part of the approval revision. Updating this in
+            # the same transaction makes a concurrent revocation visible to
+            # the proxy's final configuration check, even after a prior read
+            # returned the old preference map.
+            cur.execute(
+                "UPDATE mcp_servers SET updated_at = ? WHERE user_id = ? AND name = ?",
+                (now, user_id, server_name),
+            )
 
     def delete_tool_preference(
         self, *, user_id: str, server_name: str, tool_name: str
     ) -> None:
-        """Reset a tool preference to default (evaluate)."""
+        """Reset a tool preference to the server's default policy."""
         with self._db.cursor() as cur:
             cur.execute(
                 "DELETE FROM mcp_tool_preferences "
                 "WHERE user_id = ? AND server_name = ? AND tool_name = ?",
                 (user_id, server_name, tool_name),
+            )
+            cur.execute(
+                "UPDATE mcp_servers SET updated_at = ? WHERE user_id = ? AND name = ?",
+                (datetime.now(timezone.utc).isoformat(), user_id, server_name),
             )
 
     def list_all_enabled_servers(self) -> list[dict[str, Any]]:
@@ -424,5 +446,6 @@ class MCPServerStore:
 
         # Convert enabled from int to bool
         d["enabled"] = bool(d.get("enabled", 0))
+        d["trust_readonly_annotations"] = bool(d.get("trust_readonly_annotations", 0))
 
         return d

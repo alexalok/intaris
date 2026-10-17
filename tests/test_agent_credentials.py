@@ -19,6 +19,61 @@ AGENT = {"Authorization": "Bearer agent-secret", "X-Agent-Id": "hermes"}
 ADMIN = {"Authorization": "Bearer admin-secret", "X-Agent-Id": "operator"}
 
 
+def test_readonly_trust_is_operator_controlled(client):
+    url = "/api/v1/mcp/servers/files"
+    body = {
+        "name": "files",
+        "transport": "streamable-http",
+        "url": "https://example.test/mcp",
+    }
+    response = client.put(url, headers=ADMIN, json=body)
+    assert response.status_code == 200
+    assert response.json()["trust_readonly_annotations"] is False
+    body["trust_readonly_annotations"] = True
+    assert client.put(url, headers=AGENT, json=body).status_code == 403
+    assert client.get(url, headers=ADMIN).json()["trust_readonly_annotations"] is False
+    assert (
+        client.put(url, headers=ADMIN, json=body).json()["trust_readonly_annotations"]
+        is True
+    )
+    assert client.get(url, headers=ADMIN).json()["trust_readonly_annotations"] is True
+    body["trust_readonly_annotations"] = "false"
+    assert client.put(url, headers=ADMIN, json=body).status_code == 422
+    config = client.get("/api/v1/config", headers=ADMIN)
+    assert config.status_code == 200
+    assert config.json()["mcp"]["auto_approve_readonly"] is True
+
+
+def test_evaluate_api_cannot_supply_readonly_evidence(client):
+    create(client)
+    with patch(
+        "intaris.llm.LLMClient.generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "decision": "deny",
+                "reasoning": "denied",
+            }
+        ),
+    ) as generate:
+        result = client.post(
+            "/api/v1/evaluate",
+            headers=AGENT,
+            json={
+                "session_id": "s",
+                "tool": "files:inspect",
+                "args": {"readOnlyHint": True},
+                "trusted_readonly": True,
+                "annotations": {"readOnlyHint": True},
+                "original_args": {},
+            },
+        )
+    assert result.status_code == 200
+    assert result.json()["decision"] == "deny"
+    generate.assert_called_once()
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     import intaris.server as srv

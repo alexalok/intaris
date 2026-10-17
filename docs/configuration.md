@@ -221,6 +221,7 @@ Separate LLM configuration for L3 cross-session behavioral analysis. L3 detects 
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_CONFIG_FILE` | (empty) | Path to JSON file defining MCP servers (optional) |
+| `MCP_AUTO_APPROVE_READONLY` | `true` | Enable readonly metadata approval for Intaris-proxied MCP tools. Requires explicit per-server `trust_readonly_annotations=true` (default `false`). See [scope and safeguards](mcp-proxy.md#readonly-metadata-approval). |
 | `MCP_ALLOW_STDIO` | `true` | Allow stdio transport for MCP servers. Disable in multi-tenant deployments. |
 | `INTARIS_ENCRYPTION_KEY` | (empty) | Fernet key for encrypting MCP server secrets at rest. Required when servers have secrets. |
 | `MCP_UPSTREAM_TIMEOUT_MS` | `30000` | Timeout for upstream MCP server calls in milliseconds |

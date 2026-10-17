@@ -42,7 +42,8 @@ Define servers in a JSON file and point to it with `MCP_CONFIG_FILE`:
           "type": "streamable-http",
           "url": "https://example.com/mcp",
           "headers": {"Authorization": "Bearer token"},
-          "agent_pattern": "*"
+          "agent_pattern": "*",
+          "trust_readonly_annotations": false
         }
       }
     }
@@ -106,11 +107,61 @@ Per-tool overrides of the default classification behavior. Set via the REST API 
 
 | Preference | Effect |
 |---|---|
+| Default (no override) | Use trusted readonly metadata when eligible; otherwise run normal evaluation |
+| `evaluate` | Disable readonly metadata approval for this tool and run normal evaluation |
 | `auto-approve` | Skip LLM evaluation, classify as READ (fast path) |
 | `escalate` | Always escalate for human review |
 | `deny` | Always deny (classify as CRITICAL) |
 
 Preferences are checked at steps 2-5 of the classification priority chain, before critical patterns and the read-only allowlist.
+
+## Readonly Metadata Approval
+
+`MCP_AUTO_APPROVE_READONLY=true` enables the feature server-wide. Each upstream
+server must also explicitly opt in with `trust_readonly_annotations=true`; new
+and migrated servers default to `false`. Configure trust in the Servers tab,
+the server create/update API, or that server's `MCP_CONFIG_FILE` entry. The
+Settings tab and `GET /api/v1/config` expose the global switch. Changing the
+environment switch requires a server restart, as with other environment config.
+
+Only use this opt-in for an upstream whose tool descriptions you trust. MCP
+annotations are hints, not a sandbox or proof that a tool cannot write. A tool
+qualifies only when its exact upstream tool definition explicitly reports
+`annotations.readOnlyHint=true` as a JSON boolean (strings and numbers do not
+qualify). Missing or false hints, failed/timed-out
+discovery, and ambiguous tool definitions use normal evaluation. An explicit
+`evaluate` tool preference opts out; choose **default** to remove that override.
+Existing explicit allow rules and `auto-approve` preferences retain their
+semantics independently of this switch.
+
+The proxy reads metadata from the same live upstream connection used for
+execution, with tenant and current configuration binding. It checks again before
+dispatch and rejects a changed configuration, connection, or tool preference
+with retry instructions. Server edits invalidate persistent discovery caches
+and reconnect on next use. Cached annotations are discovery data only; they
+never grant approval and are not forwarded as approval claims to clients.
+
+Every call still passes through the evaluator and audit log. Deny and escalation
+rules, session/parent lifecycle, alignment and outcome bounds retain priority.
+Pending alignment checks are awaited. Child sessions retain normal per-call
+evaluation against their parent's latest intention; readonly metadata never
+replaces that review, including after an alignment timeout or failure.
+Path checks use the original arguments before LLM payload compaction; reads
+outside the allowed project boundary require normal evaluation. Known path
+fields, including arrays and nested objects, are checked. Relative MCP paths
+require normal evaluation: an upstream server may resolve them against a
+different cwd or logical root than the agent's session. Without a session
+working directory, absolute deny rules still apply and absolute paths need
+normal evaluation unless explicitly allowed. Cancellation
+during metadata discovery or evaluation never dispatches the tool.
+
+This applies only to `/mcp` calls and `POST /api/v1/mcp/call`, including Hermes
+tools routed through that REST proxy. Direct `POST /api/v1/evaluate` calls,
+Hermes native tools, and MCP connections that bypass Intaris do not acquire
+readonly status from caller arguments or model claims. Native `terminal` and
+`browser_console` are not blanket-approved. Existing credential restrictions
+remain in force: restricted agent API keys cannot access MCP routes or change
+server trust settings.
 
 ### Setting Preferences
 
