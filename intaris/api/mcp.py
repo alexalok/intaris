@@ -12,7 +12,7 @@ import logging
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from intaris.api.deps import SessionContext, get_session_context
 from intaris.mcp.store import MCPServerStore
@@ -46,6 +46,10 @@ class ServerCreateRequest(BaseModel):
     )
     agent_pattern: str = Field("*", description="Agent pattern (fnmatch glob)")
     enabled: bool = Field(True, description="Whether the server is enabled")
+    trust_readonly_annotations: StrictBool = Field(
+        False,
+        description="Trust this server's readOnlyHint annotations for auto-approval",
+    )
 
 
 class ServerResponse(BaseModel):
@@ -59,6 +63,7 @@ class ServerResponse(BaseModel):
     url: str | None = None
     agent_pattern: str = "*"
     enabled: bool = True
+    trust_readonly_annotations: bool = False
     source: str = "api"
     server_instructions: str | None = None
     tools_cache: list[dict[str, Any]] | None = None
@@ -215,6 +220,7 @@ async def upsert_server(
             headers=body.headers,
             agent_pattern=body.agent_pattern,
             enabled=body.enabled,
+            trust_readonly_annotations=body.trust_readonly_annotations,
             source="api",
         )
         return server

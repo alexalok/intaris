@@ -200,6 +200,22 @@ Host paths that omit `session_id` are also blocked. For example, the nested `exe
 
 When `INTARIS_MCP_TOOLS=true` (default), the plugin fetches MCP tools from Intaris and registers them as native Hermes tools. These tools proxy execution through `POST /api/v1/mcp/call` with full safety evaluation server-side.
 
+Intaris can skip LLM review for these proxied tools when its
+`MCP_AUTO_APPROVE_READONLY` switch is on (default) and the operator explicitly
+sets `trust_readonly_annotations=true` on the upstream server (default false).
+Only a fresh `annotations.readOnlyHint=true` from the connection that executes
+the tool qualifies; deny, escalation, path, lifecycle and alignment checks still
+apply. An explicit `evaluate` preference disables this shortcut for that tool.
+Child sessions and calls with relative paths keep normal per-call evaluation.
+See [readonly metadata approval](../../docs/mcp-proxy.md#readonly-metadata-approval).
+
+This does not change native Hermes tools, direct MCP connections outside the
+Intaris proxy, or claims supplied in arguments. Hermes's `NO_EFFECT_TOOL_NAMES`
+is an interruption heuristic, not trusted readonly metadata; it includes
+`browser_console`, which can execute arbitrary JavaScript. `terminal` receives
+no blanket exemption. Restricted agent credentials still cannot use Intaris MCP
+routes; this feature does not broaden their access.
+
 ## Tests
 
 From the Intaris repository root:

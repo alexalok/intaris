@@ -27,6 +27,7 @@ function serversTab() {
       headers: '',
       agent_pattern: '*',
       enabled: true,
+      trust_readonly_annotations: false,
     },
 
     init() {
@@ -80,6 +81,7 @@ function serversTab() {
         headers: '',
         agent_pattern: '*',
         enabled: true,
+        trust_readonly_annotations: false,
       };
       this.showForm = true;
     },
@@ -97,6 +99,7 @@ function serversTab() {
         headers: '',  // Never shown (encrypted)
         agent_pattern: server.agent_pattern || '*',
         enabled: server.enabled,
+        trust_readonly_annotations: server.trust_readonly_annotations === true,
       };
       this.showForm = true;
     },
@@ -110,6 +113,7 @@ function serversTab() {
           transport: this.form.transport,
           agent_pattern: this.form.agent_pattern,
           enabled: isEnabled,
+          trust_readonly_annotations: this.form.trust_readonly_annotations,
         };
 
         if (this.form.transport === 'stdio') {
@@ -204,6 +208,7 @@ function serversTab() {
     // ── Tool Preferences ──────────────────────────────────────
 
     async setPreference(serverName, toolName, preference) {
+      if (preference === 'default') return this.resetPreference(serverName, toolName);
       try {
         await IntarisAPI.setMCPToolPreference(serverName, toolName, preference);
         this.expandedPrefs[toolName] = preference;
@@ -224,7 +229,7 @@ function serversTab() {
     },
 
     getPreference(toolName) {
-      return this.expandedPrefs[toolName] || 'evaluate';
+      return this.expandedPrefs[toolName] || 'default';
     },
 
     prefBadgeClass(pref) {

@@ -282,6 +282,11 @@ class Evaluator:
         self._approved_paths: dict[tuple[str, str], list[str]] = {}
         self._approved_paths_lock = threading.Lock()
 
+    async def wait_for_alignment(self, user_id: str, session_id: str) -> None:
+        """Let MCP metadata calls observe pending alignment checks before evaluation."""
+        if self._alignment_barrier is not None:
+            await self._alignment_barrier.wait(user_id, session_id)
+
     def evaluate(
         self,
         *,
@@ -296,6 +301,8 @@ class Evaluator:
         approval_call_id: str | None = None,
         judge_unattended: bool = False,
         restricted_agent: bool = False,
+        trusted_readonly: bool = False,
+        original_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Evaluate a tool call for safety and intention alignment.
 
@@ -319,6 +326,10 @@ class Evaluator:
             tool_preferences: Optional per-tool preference overrides
                 mapping 'server:tool' → preference string. Used by
                 the MCP proxy to pass user-configured tool policies.
+            trusted_readonly: Internal proxy evidence for an explicitly readonly
+                tool from a trusted upstream connection. Never sourced from args.
+            original_args: Uncompacted MCP arguments for deterministic policy
+                and path checks. The compacted args remain the LLM/audit view.
 
         Returns:
             Dict with: call_id, decision, reasoning, risk, path, latency_ms.
@@ -327,6 +338,10 @@ class Evaluator:
             ValueError: If session not found.
         """
         start_time = time.monotonic()
+        # Internal MCP proxy inputs only; never accepted from /evaluate clients.
+        # LLM/audit payloads may be compacted, but deterministic policy sees
+        # the exact arguments that will be sent upstream.
+        classification_args = args if original_args is None else original_args
         call_id = str(uuid.uuid4())
         clamp_outcome("approve", minimum_outcome)
         if minimum_outcome is not None:
@@ -562,7 +577,9 @@ class Evaluator:
 
         # Resolve the call-scoped working directory for path-aware classification.
         details = session.get("details") or {}
-        working_directory = _effective_working_directory(tool, args, context, details)
+        working_directory = _effective_working_directory(
+            tool, classification_args, context, details
+        )
 
         # Resolve parent intention for sub-sessions (intention chain).
         # Sub-agent tool calls must be aligned with BOTH the parent
@@ -572,6 +589,10 @@ class Evaluator:
         parent_intention: str | None = None
         parent_session_id = session.get("parent_session_id")
         if parent_session_id:
+            # Child calls retain per-call review against the parent's latest
+            # intention. The alignment barrier is fail-open on timeout/error
+            # and does not provide durable proof of successful alignment.
+            trusted_readonly = False
             try:
                 parent_session = self._sessions.get(parent_session_id, user_id=user_id)
                 parent_intention = parent_session.get("intention")
@@ -653,10 +674,11 @@ class Evaluator:
         # Step 1-2: Classify (with path awareness via working_directory)
         classification = classify(
             tool,
-            args,
+            classification_args,
             session_policy=session_policy,
             tool_preferences=tool_preferences,
             working_directory=working_directory,
+            trusted_readonly=trusted_readonly,
         )
 
         # Path approval cache override: if the classifier reclassified a
@@ -669,9 +691,11 @@ class Evaluator:
             not restricted
             and classification == Classification.WRITE
             and working_directory
-            and is_read_only(tool, args)
+            and is_read_only(tool, classification_args)
         ):
-            resolved_paths = resolve_tool_paths(tool, args, working_directory)
+            resolved_paths = resolve_tool_paths(
+                tool, classification_args, working_directory
+            )
             if resolved_paths:
                 outside_paths = [
                     rp
@@ -695,7 +719,7 @@ class Evaluator:
         # either the project directory or explicit target paths are known.
         if classification == Classification.WRITE:
             policy_paths = _resolve_tool_paths_for_context(
-                tool, args_redacted, working_directory or ""
+                tool, redact(classification_args), working_directory or ""
             )
             if not working_directory and not all(
                 os.path.isabs(path) for path in policy_paths

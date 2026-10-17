@@ -1230,6 +1230,7 @@ def _init_mcp_proxy(cfg):
         audit_store=AuditStore(db),
         server_store=server_store,
         upstream_timeout_ms=cfg.mcp.upstream_timeout_ms,
+        auto_approve_readonly=cfg.mcp.auto_approve_readonly,
     )
 
 

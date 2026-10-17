@@ -478,6 +478,7 @@ async def config(
             "mcp": {
                 "config_file": bool(cfg.mcp.config_file),
                 "allow_stdio": cfg.mcp.allow_stdio,
+                "auto_approve_readonly": cfg.mcp.auto_approve_readonly,
                 "encryption_configured": bool(cfg.mcp.encryption_key),
                 "upstream_timeout_ms": cfg.mcp.upstream_timeout_ms,
             },

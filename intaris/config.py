@@ -322,6 +322,11 @@ class MCPConfig:
     # Path to multi-user MCP config JSON file (optional).
     config_file: str = field(default_factory=lambda: _env("MCP_CONFIG_FILE"))
 
+    # Only explicitly trusted servers can supply readonly approval metadata.
+    auto_approve_readonly: bool = field(
+        default_factory=lambda: _env_bool("MCP_AUTO_APPROVE_READONLY", default=True)
+    )
+
     # Allow stdio transport for MCP servers (disable in multi-tenant).
     allow_stdio: bool = field(
         default_factory=lambda: _env_bool("MCP_ALLOW_STDIO", default=True)

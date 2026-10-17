@@ -83,6 +83,9 @@ def load_config_file(path: str) -> dict[str, list[dict[str, Any]]]:
                 "transport": transport,
                 "agent_pattern": server.get("agent_pattern", "*"),
                 "enabled": server.get("enabled", True),
+                "trust_readonly_annotations": server.get(
+                    "trust_readonly_annotations", False
+                ),
             }
 
             # Transport-specific fields
@@ -143,6 +146,9 @@ def sync_file_configs(store: MCPServerStore, path: str) -> int:
                     headers=server.get("headers"),
                     agent_pattern=server.get("agent_pattern", "*"),
                     enabled=server.get("enabled", True),
+                    trust_readonly_annotations=server.get(
+                        "trust_readonly_annotations", False
+                    ),
                     source="file",
                 )
                 synced += 1

@@ -2075,6 +2075,14 @@
             </div>
           </div>
 
+          <div class="mb-3">
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" x-model="form.trust_readonly_annotations" class="rounded">
+              Trust readonly annotations from this server
+            </label>
+            <p class="text-xs text-muted mt-1">Allows tools explicitly marked readonly to skip LLM review when server-wide readonly approval is enabled. Deny, escalation, path and session checks still apply. Enable only for servers you trust to describe their tools accurately.</p>
+          </div>
+
           <div class="flex gap-2">
             <button @click="saveServer()" class="btn-primary text-sm">Save</button>
             <button @click="showForm = false" class="btn-secondary text-sm">Cancel</button>
@@ -2166,6 +2174,7 @@
                           <select class="select text-xs py-0.5 w-28"
                                   :value="getPreference(tool.name)"
                                   @change="setPreference(server.name, tool.name, $event.target.value)">
+                            <option value="default">default</option>
                             <option value="evaluate">evaluate</option>
                             <option value="auto-approve">auto-approve</option>
                             <option value="escalate">escalate</option>
@@ -2423,6 +2432,10 @@
                   <div>
                     <div class="text-xs text-muted">stdio Transport</div>
                     <div x-text="config.mcp.allow_stdio ? 'Allowed' : 'Disabled'"></div>
+                  </div>
+                  <div>
+                    <div class="text-xs text-muted">Readonly Auto-approval</div>
+                    <div x-text="config.mcp.auto_approve_readonly ? 'Enabled (trusted servers only)' : 'Disabled'"></div>
                   </div>
                   <div>
                     <div class="text-xs text-muted">Encryption</div>

@@ -341,6 +341,36 @@ def extract_paths(args: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _extract_mcp_paths(args: dict[str, Any]) -> list[str]:
+    """Include nested and multi-path arguments in generic MCP path policy."""
+    keys = (
+        set(PATH_ARG_KEYS)
+        | {f"{key}s" for key in PATH_ARG_KEYS}
+        | {
+            "directories",
+            "files",
+        }
+    )
+    paths: list[str] = []
+    pending: list[Any] = [args]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in keys:
+                    if isinstance(child, str) and child:
+                        paths.append(child)
+                    elif isinstance(child, list):
+                        paths.extend(
+                            item for item in child if isinstance(item, str) and item
+                        )
+                if isinstance(child, (dict, list)):
+                    pending.append(child)
+        elif isinstance(value, list):
+            pending.extend(item for item in value if isinstance(item, (dict, list)))
+    return paths
+
+
 def extract_apply_patch_paths(patch_text: str) -> list[str]:
     """Extract target paths from apply_patch input.
 
@@ -1040,6 +1070,7 @@ def classify(
     session_policy: dict[str, Any] | None = None,
     tool_preferences: dict[str, str] | None = None,
     working_directory: str | None = None,
+    trusted_readonly: bool = False,
 ) -> Classification:
     """Classify a tool call as READ, WRITE, CRITICAL, or ESCALATE.
 
@@ -1051,7 +1082,7 @@ def classify(
     4.   Session policy allow (allow_tools, allow_commands) → READ
     5.   Tool preference auto-approve → READ
     6.   Critical pattern detection (bash only) → CRITICAL
-    7.   Built-in read-only allowlist → READ
+    7.   Built-in read-only allowlist or trusted MCP metadata → READ
     7.5. Path outside project (not in allow_paths) → WRITE
     8.   Default → WRITE (goes to LLM evaluation)
 
@@ -1065,10 +1096,15 @@ def classify(
             policy enforcement. When set, file paths in tool args are
             resolved against this directory and checked against path
             policy (deny_paths, allow_paths) and project boundary.
+        trusted_readonly: Internal proxy evidence from the exact upstream
+            connection, not a caller-provided claim. Explicit evaluate
+            preferences disable this shortcut. Native tools are excluded.
 
     Returns:
         Classification enum value.
     """
+    metadata_readonly = trusted_readonly is True and ":" in tool
+
     # Step 1: Session policy deny rules (highest priority deny)
     if session_policy:
         deny_override = _check_session_policy_deny(tool, args, session_policy)
@@ -1076,8 +1112,8 @@ def classify(
             return deny_override
 
     # Step 1.5: Session policy deny_paths (resolved path matching)
-    if working_directory and session_policy:
-        resolved = resolve_tool_paths(tool, args, working_directory)
+    if (working_directory or metadata_readonly) and session_policy:
+        resolved = resolve_tool_paths(tool, args, working_directory or "")
         if resolved and _check_deny_paths(resolved, session_policy):
             return Classification.CRITICAL
 
@@ -1107,15 +1143,22 @@ def classify(
             return Classification.CRITICAL
 
     # Step 7: Check read-only allowlist
-    if is_read_only(tool, args):
+    if is_read_only(tool, args) or (metadata_readonly and pref != "evaluate"):
+        if metadata_readonly and any(
+            not os.path.isabs(path) for path in _extract_mcp_paths(args)
+        ):
+            # MCP tools can resolve relative paths against an upstream cwd or
+            # logical root unrelated to the agent's session directory. A
+            # readonly hint does not establish that execution context.
+            return Classification.WRITE
         # Step 7.5: Path policy check for read-only tools.
         # If the tool would be READ but targets paths outside the project
         # directory, reclassify as WRITE to force LLM evaluation.
-        if working_directory:
-            resolved = resolve_tool_paths(tool, args, working_directory)
+        if working_directory or metadata_readonly:
+            resolved = resolve_tool_paths(tool, args, working_directory or "")
             if resolved:
                 path_override = _check_path_policy(
-                    resolved, working_directory, session_policy or {}
+                    resolved, working_directory or "", session_policy or {}
                 )
                 if path_override is not None:
                     return path_override
@@ -1142,7 +1185,7 @@ def resolve_tool_paths(
     Returns:
         List of resolved (normalized absolute) paths.
     """
-    raw_paths = extract_paths(args)
+    raw_paths = _extract_mcp_paths(args) if ":" in tool else extract_paths(args)
 
     # apply_patch stores target paths inside the patch envelope rather than
     # in a conventional file_path/path argument.

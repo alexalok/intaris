@@ -33,7 +33,11 @@ from mcp.types import (
     Tool,
 )
 
-from intaris.mcp.client import MCPConnectionManager
+from intaris.mcp.client import (
+    MCPConnectionManager,
+    config_fingerprint,
+    list_tools_for_approval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,7 @@ class MCPProxy:
         audit_store: Any,  # intaris.audit.AuditStore
         server_store: Any,  # intaris.mcp.store.MCPServerStore
         upstream_timeout_ms: int = 30000,
+        auto_approve_readonly: bool = True,
     ):
         self._conn_mgr = connection_manager
         self._evaluator = evaluator
@@ -138,6 +143,7 @@ class MCPProxy:
         self._audit = audit_store
         self._server_store = server_store
         self._timeout_ms = upstream_timeout_ms
+        self._auto_approve_readonly = auto_approve_readonly
 
         # Track MCP session → Intaris session mapping.
         # Key: mcp_session_id → {user_id, session_id, agent_id}
@@ -258,6 +264,9 @@ class MCPProxy:
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": t.inputSchema,
+                "annotations": t.annotations.model_dump(exclude_none=True)
+                if t.annotations
+                else None,
             }
             for t in result.tools
         ]
@@ -270,6 +279,7 @@ class MCPProxy:
             name=server_name,
             tools=tools_cache,
             server_instructions=instructions,
+            expected_updated_at=server_cfg.get("updated_at"),
         )
 
         logger.info(
@@ -356,6 +366,9 @@ class MCPProxy:
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.inputSchema,
+                            "annotations": t.annotations.model_dump(exclude_none=True)
+                            if t.annotations
+                            else None,
                         }
                         for t in result.tools
                     ]
@@ -369,6 +382,7 @@ class MCPProxy:
                         name=server_name,
                         tools=tools_cache,
                         server_instructions=instructions,
+                        expected_updated_at=server_with_secrets.get("updated_at"),
                     )
                 except Exception:
                     logger.exception(
@@ -395,6 +409,128 @@ class MCPProxy:
                 )
 
         return aggregated_tools
+
+    @staticmethod
+    def _check_server_access(server: dict[str, Any], agent_id: str | None) -> None:
+        """Reject disabled servers and agents outside their configured scope."""
+        if not server.get("enabled", True):
+            raise ValueError("MCP server is disabled")
+        if not fnmatch.fnmatch(agent_id or "", server.get("agent_pattern", "*")):
+            raise ValueError("MCP server is not available to this agent")
+
+    async def _readonly_binding(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        server_name: str,
+        tool_name: str,
+        tool_preferences: dict[str, str],
+    ) -> tuple[dict[str, Any], Any] | None:
+        """Read trusted metadata from the connection that will execute the call.
+
+        Persistent discovery caches and caller arguments are never approval
+        evidence. Failure or absent/ambiguous metadata uses normal evaluation.
+        Cancellation propagates to the caller and cannot reach dispatch.
+        """
+        pref = tool_preferences.get(
+            f"{server_name}:{tool_name}"
+        ) or tool_preferences.get(tool_name)
+        if not self._auto_approve_readonly or pref in {
+            "deny",
+            "escalate",
+            "evaluate",
+            "auto-approve",
+        }:
+            return None
+        try:
+            async with asyncio.timeout(self._timeout_ms / 1000):
+                config = await asyncio.to_thread(
+                    self._server_store.get_server,
+                    user_id=user_id,
+                    name=server_name,
+                    decrypt_secrets=True,
+                )
+                if config.get("trust_readonly_annotations") is not True:
+                    return None
+                self._check_server_access(config, agent_id)
+                client = await self._conn_mgr.get_or_connect(
+                    server_config=config, user_id=user_id
+                )
+                matches = []
+                cursor = None
+                seen = set()
+                for _ in range(100):
+                    page = await list_tools_for_approval(client, cursor=cursor)
+                    matches.extend(
+                        tool for tool in page.tools if tool.name == tool_name
+                    )
+                    cursor = page.nextCursor
+                    if not cursor:
+                        break
+                    if cursor in seen:
+                        raise ValueError("Repeated upstream tools cursor")
+                    seen.add(cursor)
+                else:
+                    raise ValueError("Upstream tools pagination limit exceeded")
+                if (
+                    len(matches) == 1
+                    and matches[0].annotations is not None
+                    and matches[0].annotations.readOnlyHint is True
+                    and self._conn_mgr.connection_matches(
+                        user_id=user_id, server_config=config, session=client
+                    )
+                ):
+                    return config, client
+        except Exception:
+            logger.warning(
+                "Readonly metadata unavailable for '%s:%s'; using normal evaluation",
+                server_name,
+                tool_name,
+                exc_info=True,
+            )
+        return None
+
+    async def _dispatch_client(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        server: dict[str, Any],
+        binding: tuple[dict[str, Any], Any] | None,
+        tool_preferences: dict[str, str],
+    ) -> Any:
+        """Resolve dispatch without moving a readonly approval to a new target."""
+        self._check_server_access(server, agent_id)
+        if binding is None:
+            return await self._conn_mgr.get_or_connect(
+                server_config=server, user_id=user_id
+            )
+        original, client = binding
+        # Read again after evaluation, since both policy and configuration can
+        # change while metadata discovery or evaluation is awaiting work.
+        current_preferences = await asyncio.to_thread(
+            self._server_store.get_all_tool_preferences,
+            user_id=user_id,
+        )
+        server = await asyncio.to_thread(
+            self._server_store.get_server,
+            user_id=user_id,
+            name=original["name"],
+            decrypt_secrets=True,
+        )
+        self._check_server_access(server, agent_id)
+        if (
+            config_fingerprint(original) != config_fingerprint(server)
+            or current_preferences != tool_preferences
+            or not self._conn_mgr.connection_matches(
+                user_id=user_id, server_config=original, session=client
+            )
+        ):
+            raise ValueError(
+                "MCP configuration or connection changed; retry for a fresh evaluation"
+            )
+        return client
 
     async def _handle_call_tool(
         self, name: str, arguments: dict[str, Any]
@@ -438,6 +574,15 @@ class MCPProxy:
             user_id=user_id,
         )
 
+        binding = await self._readonly_binding(
+            user_id=user_id,
+            agent_id=agent_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            tool_preferences=tool_prefs,
+        )
+        if binding is not None:
+            await self._evaluator.wait_for_alignment(user_id, session_id)
         evaluator_args = _compact_evaluator_args(arguments)
 
         # Run safety evaluation (sync evaluator wrapped in to_thread).
@@ -449,6 +594,8 @@ class MCPProxy:
             tool=name,
             args=evaluator_args,
             tool_preferences=tool_prefs,
+            original_args=arguments,
+            trusted_readonly=binding is not None,
         )
 
         decision = eval_result["decision"]
@@ -492,6 +639,13 @@ class MCPProxy:
                 )
             ]
 
+        if decision != "approve":
+            return [
+                TextContent(
+                    type="text", text=f"Unexpected evaluation decision: {decision}"
+                )
+            ]
+
         # Decision is "approve" — forward to upstream.
         try:
             server_with_secrets = await asyncio.to_thread(
@@ -508,10 +662,14 @@ class MCPProxy:
                 )
             ]
 
+        client = None
         try:
-            client = await self._conn_mgr.get_or_connect(
-                server_config=server_with_secrets,
+            client = await self._dispatch_client(
                 user_id=user_id,
+                agent_id=agent_id,
+                server=server_with_secrets,
+                binding=binding,
+                tool_preferences=tool_prefs,
             )
 
             result = await client.call_tool(
@@ -525,8 +683,12 @@ class MCPProxy:
 
         except Exception as exc:
             logger.exception("Upstream call to '%s:%s' failed", server_name, tool_name)
-            # Evict dead connection so next call reconnects.
-            await self._conn_mgr.evict(user_id, server_name)
+            # Rejecting a stale binding must not evict another request's
+            # replacement; transport failures evict only their own session.
+            if client is not None:
+                await self._conn_mgr.evict(
+                    user_id, server_name, expected_session=client
+                )
             return [
                 TextContent(
                     type="text",
@@ -680,6 +842,15 @@ class MCPProxy:
             user_id=user_id,
         )
 
+        binding = await self._readonly_binding(
+            user_id=user_id,
+            agent_id=agent_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            tool_preferences=tool_prefs,
+        )
+        if binding is not None:
+            await self._evaluator.wait_for_alignment(user_id, session_id)
         evaluator_args = _compact_evaluator_args(arguments)
 
         # Run safety evaluation (sync evaluator wrapped in to_thread).
@@ -691,6 +862,8 @@ class MCPProxy:
             tool=namespaced,
             args=evaluator_args,
             tool_preferences=tool_prefs,
+            original_args=arguments,
+            trusted_readonly=binding is not None,
         )
 
         decision = eval_result["decision"]
@@ -807,10 +980,14 @@ class MCPProxy:
                     "agent_id": agent_id,
                 }
 
+        client = None
         try:
-            client = await self._conn_mgr.get_or_connect(
-                server_config=server_with_secrets,
+            client = await self._dispatch_client(
                 user_id=user_id,
+                agent_id=agent_id,
+                server=server_with_secrets,
+                binding=binding,
+                tool_preferences=tool_prefs,
             )
 
             result = await client.call_tool(
@@ -835,8 +1012,10 @@ class MCPProxy:
 
         except Exception as exc:
             logger.exception("Upstream call to '%s:%s' failed", server_name, tool_name)
-            # Evict dead connection so next call reconnects.
-            await self._conn_mgr.evict(user_id, server_name)
+            if client is not None:
+                await self._conn_mgr.evict(
+                    user_id, server_name, expected_session=client
+                )
             return {
                 "content": [
                     {
