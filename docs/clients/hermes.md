@@ -56,20 +56,15 @@ After starting Hermes, open the Intaris management UI at `http://localhost:8060/
 
 ### Tool Wrapping
 
-The Hermes plugin combines profile-owned **tool execution middleware** with **tool registry wrapping**. During initialization, it:
+The Hermes plugin combines profile-owned **tool execution middleware** with a **terminal registry dispatch guard**. Middleware reserves the exact profile generation, then continues the host chain. Once downstream middleware finishes rewriting arguments, the dispatch shim captures the current tool entry and passes an invocation-local guarded copy to Hermes' native dispatcher. This preserves kwargs filtering, async handling, result normalization and all entry metadata without replacing provider registrations.
 
-1. Imports `tools.registry` from Hermes
-2. Captures every existing tool's original handler
-3. Re-registers each tool with a guarded wrapper that calls `POST /api/v1/evaluate` first
-4. If approved, calls the original handler and returns its result
-5. If denied, returns `{"error": "BLOCKED by Intaris: ..."}` to the LLM
-6. If escalated, polls for user decision with exponential backoff
+The guard calls `POST /api/v1/evaluate` and waits for approval using the existing session and cancellation rules. Immediately before invoking the captured handler, it rechecks source identity; removal or replacement during approval blocks execution. Revocation after final admission retains native in-flight semantics. No registry lock is held during HTTP requests, human waits or execution. Intaris MCP proxies keep server-side evaluation without a duplicate request.
 
-The `tool_execution` middleware guards ordinary dispatch of tools registered after initialization, including built-ins loaded after CLI or gateway plugin discovery. Existing guarded handlers and Intaris MCP proxies keep their own evaluation without a duplicate request. Middleware safety errors return a blocked result instead of raising into Hermes's fail-open callback handling. Late registry entries are wrapped lazily before continuing the middleware chain, so their guard evaluates final arguments. Registry wrappers also protect later direct dispatch of those entries.
+One coordinator lives on the registry instance across independent plugin imports. Owners remain profile-scoped, and unload cannot restore native dispatch while a reserved middleware call remains in flight. The adapter restores only its own shim, never another component's later wrapper.
 
-Startup and late-tool coverage require Hermes's execution middleware API. Older hosts log an upgrade warning and retain snapshot-only protection. Direct raw-handler calls, direct registry calls to unwrapped late tools, and explicit middleware bypass are outside this boundary.
+Startup and late-tool coverage require the scoped registry and execution middleware API. Compatibility is verified against Hermes `63d0b94120027d487c9a5235b9ec64b696af1b26`; changes to the native dispatcher contract require revalidation. Older hosts log an upgrade warning and retain snapshot-only handler protection. Direct raw-handler calls bypass guarding; direct registered-tool dispatch remains guarded while the plugin is loaded.
 
-Hermes virtual connector calls without registry entries are blocked before evaluation or downstream middleware, even with `INTARIS_FAIL_OPEN=true`: the adapter cannot guard their final arguments after later middleware rewrites. Ordinary registered tools and Intaris-proxied MCP tools retain their existing guard paths.
+Hermes virtual connectors (`connectors__*`) are blocked before evaluation or downstream middleware, even when a registry tool shares the name or `INTARIS_FAIL_OPEN=true`. Their terminal path bypasses the registry, so the adapter cannot guard final arguments. The host must not bypass execution middleware for virtual calls, and must pause new tool dispatch during full plugin unload/reload gaps.
 
 ### Plugin Flow
 

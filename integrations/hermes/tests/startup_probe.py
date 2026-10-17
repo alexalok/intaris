@@ -187,6 +187,13 @@ def main() -> None:
     finally:
         hermes_intaris._make_guarded_handler = original_factory
 
+    if len(sys.argv) > 2:
+        from dispatch_probe import check_dispatch_boundary
+
+        case = sys.argv[2]
+        decision = "deny" if case == "replacement-race" else "approve"
+        check_dispatch_boundary(case, manager, evaluations)
+
     manager.unload()
     assert not manager._middleware.get("tool_execution")
     print("startup contract passed:", startup, "evaluations=4 late_dispatches=1")

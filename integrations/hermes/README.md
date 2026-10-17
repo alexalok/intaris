@@ -95,7 +95,7 @@ does. Process env is shared, so use profile settings/scopes for distinct values.
 
 Multiple profiles require Hermes' scoped tool registry. Older global-only
 registries retain single-profile support and reject a second profile instead
-of sharing guards or authenticated MCP tools. A handler called with a foreign
+of sharing guards or authenticated MCP tools. A guarded dispatch with a foreign
 or unloaded profile is blocked even when fail-open is enabled. Hooks and timer
 callbacks remain bound to their originating manager.
 
@@ -171,9 +171,13 @@ reload; use the pip entry-point installation for active-session continuity.
 
 ### Tool Wrapping
 
-The plugin registers profile-owned `tool_execution` middleware and wraps the registry handlers already present at initialization. Ordinary Hermes dispatch is guarded even when built-ins or other tools register after the plugin. No eager built-in discovery or import-order assumption is required.
+The plugin registers profile-owned `tool_execution` middleware and installs one dispatch shim on the Hermes registry instance. Ordinary Hermes dispatch and direct `registry.dispatch()` calls are guarded even when built-ins or other tools register after the plugin. No eager discovery or import-order assumption is required. Source tool registrations remain unchanged.
 
-At dispatch, existing guarded handlers retain their own evaluation; Intaris MCP proxies retain server-side evaluation through `/mcp/call`. Late registry handlers receive an owned wrapper before `next_call`, so evaluation sees final arguments after downstream middleware changes and runs only once. Guard installation is serialized per profile; evaluation and approval waits run outside that lock. Middleware safety errors return a blocked result because Hermes otherwise skips callbacks that raise. Registry wrappers also protect direct dispatch of entries already wrapped at startup or by an earlier ordinary dispatch.
+Middleware reserves the exact profile generation before calling `next_call`. At terminal dispatch, after downstream argument rewrites, the shim captures the current source entry and creates an invocation-local guarded copy. It calls the saved native dispatcher with that view, preserving kwargs filtering, async bridging, result normalization, dynamic schemas and result budgets. Intaris MCP proxies retain server-side evaluation through `/mcp/call`; ordinary tools evaluate once.
+
+Immediately after approval, the guard rechecks source entry and handler identity. Removal or replacement while waiting blocks execution; a replacement never inherits the old approval. Revocation after this final admission retains Hermes' native in-flight semantics: there is no host execution lease to cancel already-admitted provider work. No registry lock is held during evaluation, human waits or tool execution.
+
+The registry-owned coordinator survives independent plugin imports and keeps profiles isolated. Unload retains interception until all downstream reservations finish; a paused call cannot adopt a replacement profile generation. The shim restores the original dispatch attribute only when its last owner and reservation have drained, and only if another component has not replaced it. Middleware safety errors return blocked results because Hermes otherwise skips callbacks that raise.
 
 ### Invocation Identity
 
@@ -236,12 +240,9 @@ no live Hermes service or real credential files are used.
 
 ### Registry compatibility
 
-Current Hermes is enumerated through `registry.get_all_entries()` and wrapped
-through `ctx.register_tool(override=True)`, preserving profile overlays and host
-unload tracking. The host must grant `tools.override` (or
-`allow_tool_override: true`); the adapter does not bypass that check. Legacy
-global-only versions use `registry._tools` and `registry.register()` for one
-profile. Tool discovery after registration still depends on Hermes load order.
+The terminal shim is verified against Hermes revision `63d0b94120027d487c9a5235b9ec64b696af1b26`. It uses the registry instance lock for installation/teardown and rebinds its saved Python dispatch method to a view overriding only `get_entry()`. Changes to that host contract require revalidation. A pre-existing foreign dispatcher override is rejected; a later override is never overwritten during cleanup.
+
+The host must grant `tools.override` (or `allow_tool_override: true`); the adapter checks that permission before installation. Legacy hosts without scoped execution middleware retain snapshot-only handler wrapping and an upgrade warning. Their copied entries retain result-size and dynamic-schema metadata where present; no startup or late-registration guarantee applies there.
 
 ### Latency on every tool call
 
@@ -304,9 +305,9 @@ Hermes has no equivalent of a "session reset" event. If the user runs `/new` or 
 
 ### Execution middleware requirement
 
-Startup and late-tool coverage require Hermes's `ctx.register_middleware("tool_execution", ...)` API. Older hosts without that API retain registry-snapshot protection and emit an upgrade warning. Direct calls to raw handlers, direct registry dispatch of unwrapped late tools, and dispatch with `skip_tool_execution_middleware=True` are outside the middleware boundary. Normal CLI/gateway dispatch uses that boundary.
+Startup and late-tool coverage require Hermes's scoped registry and `ctx.register_middleware("tool_execution", ...)` API. Direct raw-handler calls bypass the guard. Registered tools still pass through the terminal shim when execution middleware is skipped; virtual connectors bypass registry dispatch and must not skip middleware. Normal CLI/gateway dispatch uses both boundaries. Calls after explicit full unload are unguarded until the plugin loads again; the host must pause new dispatch during that interval.
 
-Hermes virtual connector calls without registry entries are blocked before evaluation or downstream middleware, even with `INTARIS_FAIL_OPEN=true`: the adapter cannot guard their final arguments after later middleware rewrites. Ordinary registered tools and Intaris-proxied MCP tools retain their existing guard paths.
+Hermes virtual connector calls (`connectors__*`) are blocked before evaluation or downstream middleware, even when an ordinary registry entry shares the name or `INTARIS_FAIL_OPEN=true`: the adapter cannot guard their final arguments after later middleware rewrites. Ordinary registered tools and Intaris-proxied MCP tools retain their existing guard paths.
 
 ## Verify
 

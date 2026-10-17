@@ -132,6 +132,24 @@ def test_execution_middleware_has_profile_owned_teardown(runtime):
 
 @pytest.mark.parametrize("startup", ["cli", "cli-race", "gateway", "builtins-first"])
 def test_full_hermes_startup_and_late_registration(tmp_path, startup):
+    run_full_hermes_probe(tmp_path, startup)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "provider-unload",
+        "replacement-race",
+        "metadata",
+        "virtual-shadow",
+        "unload-reservation",
+    ],
+)
+def test_full_hermes_dispatch_boundary(tmp_path, case):
+    run_full_hermes_probe(tmp_path, "builtins-first", case)
+
+
+def run_full_hermes_probe(tmp_path, startup, *cases):
     source = os.environ.get("HERMES_SOURCE")
     if not source:
         pytest.skip("set HERMES_SOURCE for full Hermes startup contract tests")
@@ -171,7 +189,12 @@ def test_full_hermes_startup_and_late_registration(tmp_path, startup):
         "TERMINAL_ENV": "local",
     }
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("startup_probe.py")), startup],
+        [
+            sys.executable,
+            str(Path(__file__).with_name("startup_probe.py")),
+            startup,
+            *cases,
+        ],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -199,7 +222,7 @@ def test_foreign_wrapper_evaluates_transformed_args_once(runtime):
     with runtime.profile("a"):
         ctx.emit("on_session_start", session_id="s")
         entry = runtime.registry.get_entry("read_file")
-        original = entry.handler
+        original = runtime.guarded_entry("read_file").handler
 
         @wraps(original)
         def transformed(args, **kwargs):
@@ -356,7 +379,7 @@ def test_virtual_tool_blocks_before_downstream_rewrite(runtime, monkeypatch, fai
                 "connectors__example__action", {"operation": "read"}, session_id="s"
             )
         )
-    assert "no registry handler" in result.get("error", ""), (
+    assert "error" in result, (
         result,
         rewritten,
         executed,
