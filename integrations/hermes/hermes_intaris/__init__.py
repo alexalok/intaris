@@ -1170,13 +1170,21 @@ def _decision_response_error(result: ApiResult) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _HumanPollResult:
+    """A terminal outcome and optional human note from the same audit response."""
+
+    value: str
+    user_note: str | None = None
+
+
 def _poll_human(
     invocation: Invocation,
     label: str,
     fetch: Callable[[], ApiResult],
     field_name: str,
     terminal_values: tuple[str, ...],
-) -> str:
+) -> _HumanPollResult:
     """Poll only while the originating invocation and its approval budget live."""
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
@@ -1203,25 +1211,35 @@ def _poll_human(
             attempt += 1
             result = invocation.request(fetch)
             if result.protocol_error:
-                return "invalid_response"
+                return _HumanPollResult("invalid_response")
             if result.data is None:
                 continue  # Server unreachable; remain within the wait budget.
             if not isinstance(result.data, dict):
-                return "invalid_response"
+                return _HumanPollResult("invalid_response")
             value = result.data.get(field_name)
             if field_name == "user_decision":
                 if field_name not in result.data:
-                    return "invalid_response"
+                    return _HumanPollResult("invalid_response")
                 if value is not None and value not in terminal_values:
-                    return "invalid_response"
+                    return _HumanPollResult("invalid_response")
             if value in terminal_values:
                 logger.info("[intaris] %s: %s", label, value)
-                return value
+                note = result.data.get("user_note")
+                # Older servers may omit resolver identity. Explicit judge
+                # resolutions also use user_note, but are not human guidance.
+                if (
+                    field_name != "user_decision"
+                    or result.data.get("resolved_by") not in (None, "user")
+                    or not isinstance(note, str)
+                    or not note.strip()
+                ):
+                    note = None
+                return _HumanPollResult(value, note)
 
 
 def _poll_escalation(
     profile: ProfileRuntime, call_id: str, tool_name: str, invocation: Invocation
-) -> str:
+) -> _HumanPollResult:
     """Poll for escalation resolution within a Hermes human-wait window."""
     assert profile.client is not None
     client = profile.client
@@ -1232,7 +1250,6 @@ def _poll_escalation(
         "user_decision",
         ("approve", "deny"),
     )
-    # No decision yet — continue polling
 
 
 def _poll_session_status(
@@ -1247,8 +1264,88 @@ def _poll_session_status(
         lambda: client.get_session(session_id),
         "status",
         ("active", "terminated"),
-    )
-    # Still suspended — continue polling
+    ).value
+
+
+def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str) -> Any:
+    """Add human guidance to this invocation's result without losing tool data."""
+    if resolution.user_note is None:
+        return result
+    if inspect.isawaitable(result):
+
+        async def finish() -> Any:
+            return _with_approval_note(await result, resolution, call_id)
+
+        return finish()
+
+    note = {
+        "source": "human",
+        "call_id": call_id,
+        "decision": resolution.value,
+        "user_note": resolution.user_note,
+    }
+    fields = []
+    for name, value in note.items():
+        encoded = json.dumps(value, ensure_ascii=False)
+        # Hermes scans raw result text for quoted "error"/"failed". Escape
+        # matching suffixes, including a token after an embedded quote, without
+        # changing decoded guidance or native tool failure fields.
+        if value.lower().endswith(("error", "failed")):
+            encoded = f'{encoded[:-2]}\\u{ord(value[-1]):04x}"'
+        fields.append(f"{json.dumps(name)}: {encoded}")
+    encoded_note = "{" + ", ".join(fields) + "}"
+    annotation = "[Intaris human decision note]\n" + encoded_note
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (ValueError, RecursionError):
+            if result.startswith("Error"):
+                # Hermes recognizes this plain-text prefix as a tool failure.
+                # Preserve that signal when our note moves ahead of the text.
+                data = {"error": result}
+            else:
+                return annotation + "\n\n" + result
+        if not isinstance(data, dict):
+            data = {"tool_result": data}
+        # Preserve JSON status/error fields used by Hermes, and never
+        # overwrite a provider's field even if it uses our metadata name.
+        key = "_intaris_approval"
+        while key in data:
+            key += "_"
+        # Keep guidance at the front of Hermes' previews for large results.
+        prefix = "{" + json.dumps(key) + ": " + encoded_note
+        return prefix + (
+            ", " + json.dumps(data, ensure_ascii=False)[1:] if data else "}"
+        )
+    if (
+        isinstance(result, dict)
+        and result.get("_multimodal") is True
+        and isinstance(result.get("content"), list)
+    ):
+        # Hermes can replace an oversized summary with the first text part
+        # that actually spills. Prefix every text part so that preview carries
+        # guidance too, while retaining bounded summaries for text-only models.
+        parts = []
+        has_text = False
+        for part in result["content"]:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                parts.append({**part, "text": annotation + "\n\n" + part["text"]})
+                has_text = True
+            else:
+                parts.append(part)
+        if not has_text:
+            parts.insert(0, {"type": "text", "text": annotation})
+        enriched = {**result, "content": parts}
+        summary = result.get("text_summary")
+        if summary:
+            enriched["text_summary"] = annotation + "\n\n" + str(summary)
+        return enriched
+    # Leave unsupported return types to the native dispatcher's validation.
+    return result
 
 
 # ============================================================================
@@ -1265,6 +1362,7 @@ def _make_guarded_handler(
     *,
     _admission: _GuardAdmission | None = None,
     _source_check: Callable[[], None] | None = None,
+    _note_sink: Callable[[_HumanPollResult, str], None] | None = None,
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
     wrapped = original_handler
@@ -1319,6 +1417,7 @@ def _make_guarded_handler(
             inspect.iscoroutinefunction(replacement_target),
             _admission=admission,
             _source_check=_source_check,
+            _note_sink=_note_sink,
         )
         replacements = dict(_guard_replacements.get() or {})
         replacements[replacement_target] = replacement
@@ -1345,7 +1444,17 @@ def _make_guarded_handler(
         args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
     ) -> Any:
 
-        def dispatch(call_id: str = "") -> Any:
+        def finish_resolution(
+            result: Any, resolution: _HumanPollResult, call_id: str
+        ) -> Any:
+            if _note_sink is not None:
+                _note_sink(resolution, call_id)
+                return result
+            return _with_approval_note(result, resolution, call_id)
+
+        def dispatch(
+            call_id: str = "", resolution: _HumanPollResult | None = None
+        ) -> Any:
             invocation.check()
             if _source_check is not None:
                 _source_check()
@@ -1362,7 +1471,14 @@ def _make_guarded_handler(
                             del state.pending_tool_results[i]
                             break
                 raise
-            return invoke_original(args, **kwargs)
+            if resolution is not None and _note_sink is not None:
+                # Capture only after final admission. The native dispatcher
+                # owns exception sanitization and invalid-result conversion.
+                _note_sink(resolution, call_id)
+            result = invoke_original(args, **kwargs)
+            if resolution is not None and _note_sink is None:
+                return _with_approval_note(result, resolution, call_id)
+            return result
 
         # Evaluate the tool call
         intention_pending = state.intention_pending
@@ -1496,18 +1612,22 @@ def _make_guarded_handler(
                         poll_result = _poll_escalation(
                             profile, re_call_id, tool_name, invocation
                         )
-                        if poll_result == "invalid_response":
+                        if poll_result.value == "invalid_response":
                             return json.dumps(
                                 {
                                     "error": f"[intaris] Invalid escalation response ({re_call_id})"
                                 }
                             )
-                        if poll_result == "approve":
-                            return dispatch(re_call_id)
-                        return json.dumps(
-                            {
-                                "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
-                            }
+                        if poll_result.value == "approve":
+                            return dispatch(re_call_id, poll_result)
+                        return finish_resolution(
+                            json.dumps(
+                                {
+                                    "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
+                                }
+                            ),
+                            poll_result,
+                            re_call_id,
                         )
                     re_reason = (
                         re_result.data.get("reasoning", "denied after reactivation")
@@ -1545,14 +1665,18 @@ def _make_guarded_handler(
                 reasoning,
             )
             poll_result = _poll_escalation(profile, call_id, tool_name, invocation)
-            if poll_result == "invalid_response":
+            if poll_result.value == "invalid_response":
                 return json.dumps(
                     {"error": f"[intaris] Invalid escalation response ({call_id})"}
                 )
-            if poll_result == "approve":
-                return dispatch(call_id)
-            return json.dumps(
-                {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
+            if poll_result.value == "approve":
+                return dispatch(call_id, poll_result)
+            return finish_resolution(
+                json.dumps(
+                    {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
+                ),
+                poll_result,
+                call_id,
             )
 
         # -- APPROVE -----------------------------------------------------------
@@ -1561,6 +1685,8 @@ def _make_guarded_handler(
         return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
     def stopped_result(exc: WaitStopped) -> str:
+        if _note_sink is not None:
+            _note_sink(_HumanPollResult("cancelled"), "")
         return json.dumps(
             {
                 "error": (
@@ -1790,6 +1916,19 @@ def _make_dispatch_entry(
     if metadata.get("_intaris_mcp_owner") is not None:
         return source  # This profile-owned handler evaluates through /mcp/call.
 
+    resolution_note: tuple[_HumanPollResult, str] | None = None
+
+    def capture_note(resolution: _HumanPollResult, call_id: str) -> None:
+        nonlocal resolution_note
+        resolution_note = (
+            (resolution, call_id) if resolution.user_note is not None else None
+        )
+
+    def finish_result(result: Any) -> Any:
+        nonlocal resolution_note
+        captured, resolution_note = resolution_note, None
+        return _with_approval_note(result, *captured) if captured else result
+
     def check_source() -> None:
         current = registry.get_entry(source.name, scope=scope)
         if current is not source or current.handler is not handler:
@@ -1802,7 +1941,9 @@ def _make_dispatch_entry(
         source.toolset,
         source.is_async,
         _source_check=check_source,
+        _note_sink=capture_note,
     )
+    guarded._intaris_finish_result = finish_result
     # Pinned ToolEntry is a dataclass; retain every metadata field. The copy
     # fallback supports older entry shapes without a partial reconstruction.
     if hasattr(source, "__dataclass_fields__"):
