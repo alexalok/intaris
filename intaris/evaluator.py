@@ -841,6 +841,7 @@ class Evaluator:
                     and record.get("decision") == "escalate"
                     and record.get("user_decision") == "approve"
                     and record.get("resolved_by") == "user"
+                    and record.get("approval_scope", "reusable") == "reusable"
                 )
                 if not approved:
                     decision.decision = "deny"
@@ -1190,6 +1191,8 @@ class Evaluator:
         Args:
             record: Audit record dict from the resolved escalation.
         """
+        if record.get("approval_scope") == "call":
+            return
         if (
             record.get("resolved_by") != "user"
             and record.get("raw_decision") == "deny"

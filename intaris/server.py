@@ -1046,7 +1046,27 @@ async def lifespan(app):
     )
     metrics_server = None
     metrics_server_task = None
+    native_approval_socket = None
     try:
+        if cfg.notification.hermes_bridge is not None:
+            from intaris.notifications.hermes_bridge import HermesApprovalBridge
+            from intaris.notifications.hermes_peer import HermesApprovalSocket
+
+            native_bridge = HermesApprovalBridge(
+                _get_db(),
+                resolution_context={
+                    "evaluator": _get_evaluator(),
+                    "alignment_barrier": app.state.alignment_barrier,
+                    "event_bus": app.state.event_bus,
+                    "notification_dispatcher": notification_dispatcher,
+                    "metrics": background_worker.metrics,
+                },
+            )
+            native_approval_socket = HermesApprovalSocket(
+                cfg.notification.hermes_bridge, native_bridge
+            )
+            await native_approval_socket.start()
+            logger.info("Native Hermes approval socket initialized")
         if cfg.server.metrics_enabled:
             metrics_server, metrics_server_task = await _start_metrics_server(
                 app,
@@ -1086,6 +1106,8 @@ async def lifespan(app):
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Shutdown interrupted — running cleanup")
     finally:
+        if native_approval_socket is not None:
+            await native_approval_socket.close()
         if metrics_server is not None:
             metrics_server.should_exit = True
         if metrics_server_task is not None:

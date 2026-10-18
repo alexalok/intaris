@@ -413,6 +413,10 @@ class NotificationConfig:
     action_ttl_minutes: int = field(
         default_factory=lambda: _env_int("NOTIFICATION_ACTION_TTL_MINUTES", 60)
     )
+    # Operator-owned local gateway policy. Never exposed in agent config/API.
+    hermes_bridge: dict | None = field(
+        default_factory=lambda: _strict_json_object("INTARIS_TELEGRAM_BRIDGE")
+    )
 
 
 @dataclass
@@ -727,6 +731,12 @@ class Config:
 
     def validate(self) -> None:
         """Validate that required configuration is present."""
+        if self.notification.hermes_bridge is not None:
+            from intaris.notifications.hermes_peer import parse_config
+
+            self.notification.hermes_bridge = parse_config(
+                self.notification.hermes_bridge
+            )
         # Database backend validation.
         if self.db.backend not in ("sqlite", "postgresql"):
             raise ValueError(

@@ -208,7 +208,7 @@ async def evaluate(
                         notify_channels=getattr(
                             judge_reviewer, "notify_mode", "deny_only"
                         )
-                        == "always",
+                        != "never",
                     )
             else:
                 await _emit_unresolved_escalation(

@@ -2521,8 +2521,9 @@ class TestEvaluate:
         assert data["reasoning"] == "Judge denied"
         assert data["risk"] == "high"
 
+    @pytest.mark.parametrize("notify_mode", ["always", "deny_only"])
     def test_evaluate_advisory_defer_returns_escalate_once(
-        self, client_no_auth, monkeypatch
+        self, client_no_auth, monkeypatch, notify_mode
     ):
         """Unresolved judge outcomes emit a single escalation after judge wait."""
         from intaris.judge import JudgeEffectiveOutcome
@@ -2539,7 +2540,7 @@ class TestEvaluate:
 
         class _Reviewer:
             is_enabled = True
-            notify_mode = "always"
+            notify_mode = "never"
 
             async def review_for_evaluate(self, **kwargs):
                 return JudgeEffectiveOutcome(
@@ -2551,6 +2552,7 @@ class TestEvaluate:
                     notification_event_type="judge_deferral",
                 )
 
+        _Reviewer.notify_mode = notify_mode
         monkeypatch.setattr(
             "intaris.server._get_evaluator",
             lambda: _FakeEvaluator(result),
@@ -2634,7 +2636,8 @@ class TestEvaluate:
         assert "failed" in data["reasoning"]
         time.sleep(0.02)
         assert len(webhook.sent) == 1
-        assert len(dispatcher.notifications) == 0
+        assert len(dispatcher.notifications) == 1
+        assert dispatcher.notifications[0][1].event_type == "judge_error"
 
     def test_evaluate_judge_notify_never_skips_unresolved_channel_notification(
         self, client_no_auth, monkeypatch

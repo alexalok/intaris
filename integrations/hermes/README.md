@@ -7,7 +7,7 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that evalu
 - **Tool Call Guardrails**: Every tool call is evaluated via `POST /api/v1/evaluate` before execution -- including built-in tools
 - **Full Blocking**: Denied and escalated tool calls are blocked and return an error to the LLM
 - **Session Management**: Creates/manages Intaris sessions mirroring Hermes agent sessions
-- **Escalation Handling**: Escalated tool calls enter a polling loop waiting for human approval via the Intaris UI
+- **Escalation Handling**: Escalated tool calls wait for Intaris UI approval or optional native Telegram Approve / Deny buttons in the originating Hermes chat/topic.
 - **Session Recording**: Optional audit trail recording of all messages, tool calls, and results
 - **MCP Tool Proxy**: Fetches and registers MCP tools from Intaris-connected MCP servers as native Hermes tools
 - **Reasoning Context**: Forwards user messages and assistant responses to Intaris for informed safety decisions
@@ -150,6 +150,11 @@ resetting its in-memory state. Start a new Hermes session after a directory
 reload; use the pip entry-point installation for active-session continuity.
 
 ### Configuration Options
+
+For existing-bot inline Telegram approvals, protected gateway authentication, and
+an operator-configured fallback chat/topic, see the
+[native Telegram setup](../../docs/clients/hermes-telegram.md). This keeps
+`approvals.mode: off` and introduces no agent-side decision credential.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|

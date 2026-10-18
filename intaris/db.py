@@ -560,6 +560,12 @@ class Database:
             conn.execute("ALTER TABLE audit_log ADD COLUMN resolved_by TEXT")
             logger.info("Migration: added resolved_by column to audit_log")
 
+        if not self._sqlite_column_exists(conn, "audit_log", "approval_scope"):
+            conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN approval_scope TEXT NOT NULL DEFAULT 'reusable'"
+            )
+            logger.info("Migration: added approval_scope column to audit_log")
+
         if not self._sqlite_column_exists(conn, "audit_log", "judge_reasoning"):
             conn.execute("ALTER TABLE audit_log ADD COLUMN judge_reasoning TEXT")
             logger.info("Migration: added judge_reasoning column to audit_log")
@@ -993,6 +999,7 @@ class Database:
                 ("behavioral_profiles", "agent_id", "TEXT NOT NULL DEFAULT ''"),
                 ("session_summaries", "summary_type", "TEXT NOT NULL DEFAULT 'window'"),
                 ("audit_log", "resolved_by", "TEXT"),
+                ("audit_log", "approval_scope", "TEXT NOT NULL DEFAULT 'reusable'"),
                 ("audit_log", "judge_reasoning", "TEXT"),
                 ("audit_log", "judge_decision", "TEXT"),
                 ("audit_log", "judge_risk", "TEXT"),
@@ -1276,6 +1283,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     user_note TEXT,
     resolved_at TEXT,
     resolved_by TEXT,
+    approval_scope TEXT NOT NULL DEFAULT 'reusable',
     judge_reasoning TEXT,
     judge_decision TEXT,
     judge_risk TEXT,
@@ -1585,6 +1593,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     user_note TEXT,
     resolved_at TIMESTAMPTZ,
     resolved_by TEXT,
+    approval_scope TEXT NOT NULL DEFAULT 'reusable',
     judge_reasoning TEXT,
     judge_decision TEXT,
     judge_risk TEXT,

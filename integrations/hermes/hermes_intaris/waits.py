@@ -65,31 +65,75 @@ class Invocation:
         self._deadline: float | None = None
         self._stopped: str | None = None
         self._label = "approval"
+        self._check_lock = threading.Lock()
+        self._owner_tid = threading.get_ident()
+        self._acting_for_tid: int | None = None
+        self._is_thread_interrupted: Callable[[int | None], bool] | None = None
         try:
             from tools.interrupt import is_interrupted
         except ImportError:
             is_interrupted = None
         self._is_interrupted = is_interrupted
+        if is_interrupted is not None:
+            try:
+                from tools.interrupt import acting_for_tid, is_thread_interrupted
+            except ImportError:
+                pass
+            else:
+                # Callback/to_thread workers do not inherit the tool owner's
+                # identity. Pin both public Hermes cancellation identities now.
+                self._acting_for_tid = acting_for_tid.get()
+                self._is_thread_interrupted = is_thread_interrupted
 
     def close(self) -> None:
         """Retire this invocation without cancelling its whole Hermes session."""
         self._closed.set()
 
+    @property
+    def remaining_seconds(self) -> float:
+        """Remaining established human-wait budget; never grant a new window."""
+        self.check()
+        if self._deadline is None:
+            raise WaitStopped("Native approval requires an active human-wait window")
+        return max(0.0, self._deadline - time.monotonic())
+
     def check(self) -> None:
         """Latch cancellation before accepting a result or dispatching a tool."""
-        if self._stopped is None:
-            if self._closed.is_set():
-                self._stopped = "CANCELLED: Intaris invocation already completed"
-            elif self._ended is not None and self._ended.is_set():
-                self._stopped = "CANCELLED: Hermes session ended"
-            elif self._is_interrupted is not None and self._is_interrupted():
-                self._stopped = (
-                    "CANCELLED: Hermes interrupted or abandoned this invocation"
-                )
-            elif self._deadline is not None and time.monotonic() >= self._deadline:
-                self._stopped = f"APPROVAL WAIT TIMEOUT ({self._label})"
-        if self._stopped:
-            raise WaitStopped(self._stopped)
+        with self._check_lock:
+            if self._stopped is None:
+                if self._closed.is_set():
+                    self._stopped = "CANCELLED: Intaris invocation already completed"
+                elif self._ended is not None and self._ended.is_set():
+                    self._stopped = "CANCELLED: Hermes session ended"
+                else:
+                    try:
+                        if self._interrupted():
+                            self._stopped = "CANCELLED: Hermes interrupted or abandoned this invocation"
+                    except WaitStopped as exc:
+                        self._stopped = str(exc)
+                    if (
+                        self._stopped is None
+                        and self._deadline is not None
+                        and time.monotonic() >= self._deadline
+                    ):
+                        self._stopped = f"APPROVAL WAIT TIMEOUT ({self._label})"
+            if self._stopped:
+                raise WaitStopped(self._stopped)
+
+    def _interrupted(self) -> bool:
+        if self._is_thread_interrupted is not None and (
+            self._is_thread_interrupted(self._owner_tid)
+            or self._is_thread_interrupted(self._acting_for_tid)
+        ):
+            return True
+        if threading.get_ident() == self._owner_tid:
+            # Preserve the execution thread's current context check too.
+            return self._is_interrupted is not None and self._is_interrupted()
+        if self._is_thread_interrupted is None:
+            raise WaitStopped(
+                "Cannot safely check cancellation: Hermes owner-thread API unavailable"
+            )
+        return False
 
     def sleep(self, seconds: float) -> None:
         """Wait in interruptible slices, bounded by the invocation's deadline."""

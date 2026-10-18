@@ -29,6 +29,11 @@ export INTARIS_URL=http://localhost:8060
 
 ### Configuration Options
 
+Optional [native Telegram approvals](hermes-telegram.md) present call-specific
+Approve / Deny buttons through the existing Hermes bot, in the originating
+chat/topic or an operator-configured fallback. Intaris remains the decision
+authority; Hermes `approvals.mode: off` remains unchanged.
+
 All configuration is via environment variables.
 
 | Env Var | Default | Description |

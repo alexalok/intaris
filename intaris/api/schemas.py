@@ -274,6 +274,7 @@ class AuditRecord(BaseModel):
     user_note: str | None = None
     resolved_at: str | None = None
     resolved_by: str | None = None
+    approval_scope: str = "reusable"
     judge_reasoning: str | None = None
     judge_decision: str | None = None
     judge_risk: str | None = None

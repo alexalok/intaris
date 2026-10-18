@@ -428,7 +428,8 @@ class AuditStore:
     ) -> list[dict[str, Any]]:
         """Get recent final human decisions for a session.
 
-        Only final human resolutions are returned. Judge-authored decisions
+        Only reusable final human resolutions are returned. Call-only approvals
+        never become authority for another invocation. Judge-authored decisions
         are excluded so this data can be treated as authoritative human
         guidance in evaluator, judge, and intention prompts.
 
@@ -452,6 +453,7 @@ class AuditStore:
                   AND record_type = 'tool_call'
                   AND user_decision IS NOT NULL
                   AND resolved_by = 'user'
+                  AND approval_scope = 'reusable'
                   AND COALESCE(user_note, '') != 'Resolved via notification action link'
                 ORDER BY COALESCE(resolved_at, timestamp) DESC
                 LIMIT ?
@@ -496,6 +498,7 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  AND approval_scope = 'reusable'
                   AND (outcome_override IS NULL OR outcome_override != ?)
                   AND (
                       resolved_by = 'user'
@@ -526,6 +529,7 @@ class AuditStore:
         judge_reasoning: str | None = None,
         judge_decision: str | None = None,
         judge_risk: str | None = None,
+        pending_only: bool = False,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -546,6 +550,12 @@ class AuditStore:
             judge_reasoning: Judge's reasoning (stored when judge resolves).
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
+            pending_only: Resolve only an unresolved escalation, without the
+                normal human override of a prior judge verdict. Native
+                callbacks use this to make stale buttons inert.
+
+        ``resolved_by="integration"`` is reserved for pending-only lifecycle
+        denials (withdrawal/expiry), never an approval or human precedent.
 
         Returns:
             Updated audit record.
@@ -558,10 +568,14 @@ class AuditStore:
             raise ValueError(
                 f"Invalid user_decision '{user_decision}'. Must be 'approve' or 'deny'."
             )
-        if resolved_by not in ("user", "judge"):
+        if resolved_by not in ("user", "judge", "integration"):
             raise ValueError(
-                f"Invalid resolved_by '{resolved_by}'. Must be 'user' or 'judge'."
+                f"Invalid resolved_by '{resolved_by}'. Must be 'user', 'judge', or 'integration'."
             )
+        if resolved_by == "integration" and (
+            user_decision != "deny" or not pending_only
+        ):
+            raise ValueError("Integration lifecycle can only deny pending escalations")
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -584,6 +598,7 @@ class AuditStore:
                 WHERE call_id = ? AND user_id = ?
                   AND decision IN ('escalate', 'deny')
                   AND (user_decision IS NULL OR resolved_by = 'judge')
+                  AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                 """,
                 (
@@ -597,6 +612,7 @@ class AuditStore:
                     user_decision,
                     call_id,
                     user_id,
+                    int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
                 ),

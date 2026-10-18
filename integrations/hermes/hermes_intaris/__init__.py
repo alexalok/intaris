@@ -51,7 +51,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy
 from dataclasses import dataclass, field, fields, replace
 from functools import partial, wraps
@@ -269,6 +269,7 @@ class ProfileRuntime:
     ready: bool = True
     registered: bool = False
     continuity_adopted: bool = False
+    native_approvals: Any = field(default=None, repr=False)
     predecessor: ProfileRuntime | None = field(default=None, repr=False)
 
 
@@ -1176,13 +1177,16 @@ def _poll_human(
     fetch: Callable[[], ApiResult],
     field_name: str,
     terminal_values: tuple[str, ...],
+    presentation: Callable | None = None,
 ) -> str:
     """Poll only while the originating invocation and its approval budget live."""
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
     last_reminder = start
     attempt = 0
-    with invocation.human_wait(label) as heartbeat:
+    with invocation.human_wait(label) as heartbeat, ExitStack() as stack:
+        if presentation is not None:
+            stack.enter_context(presentation())
         while True:
             invocation.check()
             now = time.monotonic()
@@ -1220,17 +1224,35 @@ def _poll_human(
 
 
 def _poll_escalation(
-    profile: ProfileRuntime, call_id: str, tool_name: str, invocation: Invocation
+    profile: ProfileRuntime,
+    call_id: str,
+    tool_name: str,
+    invocation: Invocation,
+    *,
+    session_id: str,
+    intaris_session_id: str,
 ) -> str:
     """Poll for escalation resolution within a Hermes human-wait window."""
     assert profile.client is not None
     client = profile.client
+    native = profile.native_approvals
     return _poll_human(
         invocation,
         f"{tool_name} escalation ({call_id})",
         lambda: client.get_audit(call_id),
         "user_decision",
         ("approve", "deny"),
+        presentation=(
+            partial(
+                native.pending,
+                session_id,
+                call_id,
+                invocation,
+                intaris_session_id=intaris_session_id,
+            )
+            if native is not None
+            else None
+        ),
     )
     # No decision yet — continue polling
 
@@ -1494,7 +1516,12 @@ def _make_guarded_handler(
                             )
                         )
                         poll_result = _poll_escalation(
-                            profile, re_call_id, tool_name, invocation
+                            profile,
+                            re_call_id,
+                            tool_name,
+                            invocation,
+                            session_id=kwargs["session_id"],
+                            intaris_session_id=state.intaris_session_id,
                         )
                         if poll_result == "invalid_response":
                             return json.dumps(
@@ -1544,7 +1571,14 @@ def _make_guarded_handler(
                 call_id,
                 reasoning,
             )
-            poll_result = _poll_escalation(profile, call_id, tool_name, invocation)
+            poll_result = _poll_escalation(
+                profile,
+                call_id,
+                tool_name,
+                invocation,
+                session_id=kwargs["session_id"],
+                intaris_session_id=state.intaris_session_id,
+            )
             if poll_result == "invalid_response":
                 return json.dumps(
                     {"error": f"[intaris] Invalid escalation response ({call_id})"}
@@ -2666,6 +2700,10 @@ def _register_profile(
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
         on_unload(partial(_close_profile, profile))
+    from .native import NativeApprovals
+
+    profile.native_approvals = NativeApprovals(profile.home, ctx)
+    _track_registration(profile, profile.native_approvals)
     cfg = profile.cfg
     if not cfg.api_key:
         logger.warning(

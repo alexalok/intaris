@@ -1090,6 +1090,7 @@ async def resolve_with_side_effects(
     event_bus: Any | None = None,
     notification_dispatcher: Any | None = None,
     metrics: Any | None = None,
+    pending_only: bool = False,
 ) -> dict[str, Any]:
     """Resolve an escalation or denial with all side effects.
 
@@ -1123,6 +1124,8 @@ async def resolve_with_side_effects(
         event_bus: EventBus instance.
         notification_dispatcher: NotificationDispatcher instance.
         metrics: Metrics instance for observability counters.
+        pending_only: Refuse resolved calls even when the prior resolver was
+            the judge. Used by invocation-bounded native callbacks.
 
     Returns:
         The updated audit record dict.
@@ -1159,6 +1162,7 @@ async def resolve_with_side_effects(
         judge_reasoning=judge_reasoning,
         judge_decision=judge_decision,
         judge_risk=judge_risk,
+        **({"pending_only": True} if pending_only else {}),
     )
 
     # Look up the full record for downstream processing
@@ -1193,6 +1197,7 @@ async def resolve_with_side_effects(
     if (
         record is not None
         and user_decision == "approve"
+        and record.get("approval_scope") != "call"
         and record.get("evaluation_path") == "alignment"
         and alignment_barrier is not None
     ):
@@ -1212,6 +1217,7 @@ async def resolve_with_side_effects(
         record is not None
         and resolved_by == "user"
         and user_decision == "approve"
+        and record.get("approval_scope") != "call"
         and user_note
         and intention_barrier is not None
     ):

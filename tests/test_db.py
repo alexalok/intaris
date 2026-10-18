@@ -43,6 +43,44 @@ def task_queue(db):
 class TestSessionStore:
     """Test session CRUD operations."""
 
+    def test_call_scope_migration_preserves_legacy_approval_semantics(self, tmp_path):
+        path = str(tmp_path / "legacy.db")
+        with sqlite3.connect(path) as conn:
+            conn.executescript(
+                _SCHEMA_SQL_SQLITE.replace(
+                    "    approval_scope TEXT NOT NULL DEFAULT 'reusable',\n", ""
+                )
+            )
+            conn.execute(
+                "INSERT INTO sessions (user_id, session_id, intention, created_at, updated_at) "
+                "VALUES ('tenant', 'session', 'Test', '2026-01-01', '2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO audit_log (id, call_id, user_id, session_id, timestamp, "
+                "decision, evaluation_path, latency_ms, user_decision, resolved_by) "
+                "VALUES ('record', 'call', 'tenant', 'session', '2026-01-01', "
+                "'escalate', 'llm', 0, 'approve', 'user')"
+            )
+        for _ in range(2):
+            db = Database(DBConfig(path=path))
+            record = AuditStore(db).get_by_call_id("call", user_id="tenant")
+            assert record["approval_scope"] == "reusable"
+            assert record["user_decision"] == "approve"
+            assert AuditStore(db).get_user_decisions("session", user_id="tenant")
+            db.close()
+
+        conn = MagicMock()
+        conn.cursor.return_value.fetchone.return_value = None
+        db = Database.__new__(Database)
+        db._migrate_pg(conn)
+        statements = [
+            call.args[0] for call in conn.cursor.return_value.execute.call_args_list
+        ]
+        assert (
+            "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS approval_scope TEXT NOT NULL DEFAULT 'reusable'"
+            in statements
+        )
+
     def test_outcome_provenance_pg_migration_columns(self):
         conn = MagicMock()
         conn.cursor.return_value.fetchone.return_value = None
