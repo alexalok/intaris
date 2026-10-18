@@ -1121,22 +1121,28 @@ def classify(
         if allowed_script:
             # The generic shell extractor splits at raw delimiters, including
             # quoted ones. Use intact literal argv for this narrower fast path.
-            candidates = script_path_candidates(_extract_bash_command(args))
+            candidates, options_known = script_path_candidates(
+                _extract_bash_command(args)
+            )
             resolved.extend(
                 resolve_path(path, working_directory or "")
                 for path in candidates
                 if working_directory or os.path.isabs(path)
             )
             if session_policy.get("deny_paths"):
-                script_paths_known = all(
-                    not path.startswith(("//", "~"))
-                    and (working_directory or os.path.isabs(path))
-                    for path in candidates
-                ) and all(
-                    # Relative operands can inherit a double-leading slash
-                    # from cwd, so validate resolved paths as well as argv.
-                    os.path.isabs(path) and not path.startswith("//")
-                    for path in resolved
+                script_paths_known = (
+                    options_known
+                    and all(
+                        not path.startswith(("//", "~"))
+                        and (working_directory or os.path.isabs(path))
+                        for path in candidates
+                    )
+                    and all(
+                        # Relative operands can inherit a double-leading slash
+                        # from cwd, so validate resolved paths as well as argv.
+                        os.path.isabs(path) and not path.startswith("//")
+                        for path in resolved
+                    )
                 )
         if resolved and _check_deny_paths(resolved, session_policy):
             return Classification.CRITICAL

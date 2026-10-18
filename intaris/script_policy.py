@@ -85,18 +85,30 @@ def _literal_shell_words(command: str) -> list[str]:
         return []
 
 
-def script_path_candidates(command: str) -> list[str]:
-    """Keep intact literal operands when checking an allowed script's path denies.
+def script_path_candidates(command: str) -> tuple[list[str], bool]:
+    """Return possible paths and whether option values can be checked completely.
 
     A generic script has no known argument schema, so every positional operand
-    and attached option value is conservatively treated as a possible path.
+    and option-shaped token is conservatively treated as a possible path.
+    Attached short options can also be clusters, so their complete meaning is
+    unknown. Preserve obvious values for denials, but do not fast-approve them
+    when path denies are configured.
     """
     candidates = []
+    options_known = True
+    positional = False
     for word in _literal_shell_words(command)[1:]:
-        if word.startswith("-"):
-            _, separator, word = word.partition("=")
-            if not separator:
-                continue
+        if word == "--" and not positional:
+            positional = True
+            continue
         if word:
             candidates.append(word)
-    return candidates
+        if positional or not word.startswith("-"):
+            continue
+        if not word.startswith("--") and len(word) > 2:
+            options_known = False
+            candidates.append(word[2:])
+        _, separator, value = word.partition("=")
+        if separator and value:
+            candidates.append(value)
+    return candidates, options_known

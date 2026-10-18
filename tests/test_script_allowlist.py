@@ -176,6 +176,67 @@ def test_relative_script_arguments_with_path_denials_need_known_cwd():
 
 
 @pytest.mark.parametrize(
+    ("arguments", "denied"),
+    [
+        ("-- -blocked.json", "/tmp/-blocked.json"),
+        ("-blocked.json", "/tmp/-blocked.json"),
+        ("-o/tmp/blocked.json", "/tmp/blocked.json"),
+        ("-oblocked.json", "/tmp/blocked.json"),
+        ("-o=blocked.json", "/tmp/blocked.json"),
+        ("-- --ledger=/tmp/blocked.json", "/tmp/--ledger=/tmp/blocked.json"),
+    ],
+)
+def test_option_shaped_script_paths_cannot_bypass_denials(arguments, denied):
+    assert (
+        classify(
+            "terminal",
+            {"command": f"python {SCRIPT} {arguments}"},
+            session_policy={**POLICY, "deny_paths": [denied]},
+            working_directory="/tmp",
+        )
+        == Classification.CRITICAL
+    )
+
+
+@pytest.mark.parametrize("arguments", ["-vo/tmp/blocked.json", "-vblocked.json"])
+def test_ambiguous_short_options_with_path_denials_require_review(arguments):
+    assert (
+        classify(
+            "terminal",
+            {"command": f"python {SCRIPT} {arguments}"},
+            session_policy={**POLICY, "deny_paths": ["/tmp/blocked.json"]},
+            working_directory="/tmp",
+        )
+        != Classification.READ
+    )
+
+
+@pytest.mark.parametrize("arguments", ["-- -vblocked.json", "-vblocked.json"])
+def test_option_shaped_literals_remain_allowed_without_path_denials(arguments):
+    assert (
+        classify(
+            "terminal",
+            {"command": f"python {SCRIPT} {arguments}"},
+            session_policy=POLICY,
+            working_directory="/tmp",
+        )
+        == Classification.READ
+    )
+
+
+def test_end_of_options_keeps_unrelated_hyphenated_operand_literal():
+    assert (
+        classify(
+            "terminal",
+            {"command": f"python {SCRIPT} -- -vblocked.json"},
+            session_policy={**POLICY, "deny_paths": ["/tmp/blocked.json"]},
+            working_directory="/tmp",
+        )
+        == Classification.READ
+    )
+
+
+@pytest.mark.parametrize(
     ("ledger", "denied"),
     [
         ("//tmp/blocked.json", "/tmp/blocked.json"),

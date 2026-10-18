@@ -102,9 +102,11 @@ passed to `--ledger` or `--replace-in`. It does not limit operations to a citati
 cache, hash files, resolve symlinks, or validate imports and interpreter lookup.
 The operator must trust the script contents and runtime, including future edits.
 Explicit deny rules and session lifecycle restrictions still take precedence;
-script path checks retain quoted operands and attached option values. Arguments
-are conservatively treated as possible paths. With path denies configured,
-relative operands require a known working directory for fast approval.
+script path checks retain quoted operands, option-shaped filenames (including
+after `--`), and attached option values. Arguments are conservatively treated as
+possible paths. With path denies configured, ambiguous attached short options
+require normal evaluation, and relative operands require a known working
+directory for fast approval.
 Ambiguous double-slash or tilde paths, including double slashes inherited from
 the working directory, and double-quoted dollar/backtick escapes also fall
 through to normal evaluation.
