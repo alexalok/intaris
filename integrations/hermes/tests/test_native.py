@@ -486,6 +486,51 @@ def test_exact_hermes_route_and_distinct_intaris_id(harness):
     until(lambda: not actionable(h))
 
 
+def test_routing_snapshot_eviction_requires_fallback_until_readmission(harness):
+    from hermes_intaris import MAX_SESSIONS
+
+    h = harness
+    for index in range(MAX_SESSIONS):
+        h.ctx.hooks["post_gateway_admission"](
+            session_key=f"session-{index}",
+            platform="telegram",
+            source={"platform": "telegram", "chat_id": "-200", "user_id": "8"},
+        )
+    assert len(h.native._admitted) == MAX_SESSIONS
+    binding, origin = h.native._route("hermes-root")
+    assert binding.bot is h.app.bot and origin is None
+    h.admit("9")
+    assert len(h.native._admitted) == MAX_SESSIONS
+    assert h.native._route("hermes-root")[1]["user_id"] == "9"
+
+
+def test_child_eviction_does_not_inherit_a_different_session(harness):
+    from hermes_intaris import MAX_SESSIONS
+
+    h = harness
+    child = h.ctx.hooks["subagent_start"]
+    child(parent_session_id="hermes-root", child_session_id="old-child")
+    for index in range(MAX_SESSIONS):
+        child(parent_session_id="hermes-root", child_session_id=f"child-{index}")
+    assert len(h.native._parents) == MAX_SESSIONS
+    assert h.native._route("old-child")[1] is None
+    assert h.native._route(f"child-{MAX_SESSIONS - 1}")[1]["user_id"] == "9"
+
+
+def test_recent_conflicting_child_stays_unroutable_under_cache_pressure(harness):
+    from hermes_intaris import MAX_SESSIONS
+
+    h = harness
+    child = h.ctx.hooks["subagent_start"]
+    child(parent_session_id="hermes-root", child_session_id="conflict")
+    for index in range(MAX_SESSIONS + 1):
+        child(parent_session_id="other-root", child_session_id="conflict")
+        child(parent_session_id="hermes-root", child_session_id=f"child-{index}")
+    assert len(h.native._parents) == MAX_SESSIONS
+    with pytest.raises(ValueError, match="Ambiguous child session"):
+        h.native._route("conflict")
+
+
 def test_pre_auth_only_captures_runner_and_never_supplies_actor(harness):
     h = harness
     h.entry.session_key = "unadmitted"

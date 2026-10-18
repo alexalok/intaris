@@ -2702,7 +2702,9 @@ def _register_profile(
         on_unload(partial(_close_profile, profile))
     from .native import NativeApprovals
 
-    profile.native_approvals = NativeApprovals(profile.home, ctx)
+    profile.native_approvals = NativeApprovals(
+        profile.home, ctx, max_sessions=MAX_SESSIONS
+    )
     _track_registration(profile, profile.native_approvals)
     cfg = profile.cfg
     if not cfg.api_key:

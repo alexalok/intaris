@@ -180,8 +180,9 @@ class _Prompt:
 class NativeApprovals:
     """Own native approvals for one resolved Hermes profile home."""
 
-    def __init__(self, home: str, ctx: Any) -> None:
+    def __init__(self, home: str, ctx: Any, *, max_sessions: int = 100) -> None:
         self.home = str(Path(home).resolve())
+        self._max_sessions = max(1, max_sessions)
         self._lock = threading.RLock()
         self._disposed = False
         self._handles: list[Any] = []
@@ -244,6 +245,7 @@ class NativeApprovals:
             self._admitted.pop(session_key, None)
             if platform == "telegram" and isinstance(source, dict):
                 self._admitted[session_key] = dict(source)
+            self._trim_routes()
 
     def _child(
         self, parent_session_id: str, child_session_id: str, **kwargs: Any
@@ -257,13 +259,19 @@ class NativeApprovals:
                 return
             if not parent_session_id or not child_session_id:
                 return
-            if (
-                child_session_id in self._parents
-                and self._parents[child_session_id] != parent_session_id
-            ):
-                self._parents[child_session_id] = None
-            else:
-                self._parents[child_session_id] = parent_session_id
+            previous = self._parents.pop(child_session_id, parent_session_id)
+            self._parents[child_session_id] = (
+                parent_session_id if previous == parent_session_id else None
+            )
+            self._trim_routes()
+
+    def _trim_routes(self) -> None:
+        # Called under _lock. Eviction loses correlation, so subsequent waits
+        # use only the operator fallback until fresh admission restores it.
+        # Active prompts already captured their immutable origin and lease.
+        for routes in (self._admitted, self._parents):
+            while len(routes) > self._max_sessions:
+                routes.pop(next(iter(routes)))
 
     def _install(self, application: Any, adapter: Any) -> None:
         from telegram.ext import CallbackQueryHandler
