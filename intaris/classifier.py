@@ -13,7 +13,7 @@ Classification priority (deny always wins):
 1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
 2.   Tool preference deny → CRITICAL
 3.   Tool preference escalate → ESCALATE
-4.   Session policy allow (allow_tools, allow_commands) → READ
+4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
 5.   Tool preference auto-approve → READ
 6.   Critical pattern detection (bash only) → CRITICAL
 7.   Built-in read-only allowlist → READ
@@ -30,6 +30,8 @@ import re
 import shlex
 from enum import Enum
 from typing import Any
+
+from intaris.script_policy import match_allowed_script, script_path_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -1079,7 +1081,7 @@ def classify(
     1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
     2.   Tool preference deny → CRITICAL
     3.   Tool preference escalate → ESCALATE
-    4.   Session policy allow (allow_tools, allow_commands) → READ
+    4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
     5.   Tool preference auto-approve → READ
     6.   Critical pattern detection (bash only) → CRITICAL
     7.   Built-in read-only allowlist or trusted MCP metadata → READ
@@ -1104,6 +1106,8 @@ def classify(
         Classification enum value.
     """
     metadata_readonly = trusted_readonly is True and ":" in tool
+    allowed_script = match_allowed_script(tool, args, session_policy)
+    script_paths_known = True
 
     # Step 1: Session policy deny rules (highest priority deny)
     if session_policy:
@@ -1112,8 +1116,28 @@ def classify(
             return deny_override
 
     # Step 1.5: Session policy deny_paths (resolved path matching)
-    if (working_directory or metadata_readonly) and session_policy:
+    if (working_directory or metadata_readonly or allowed_script) and session_policy:
         resolved = resolve_tool_paths(tool, args, working_directory or "")
+        if allowed_script:
+            # The generic shell extractor splits at raw delimiters, including
+            # quoted ones. Use intact literal argv for this narrower fast path.
+            candidates = script_path_candidates(_extract_bash_command(args))
+            resolved.extend(
+                resolve_path(path, working_directory or "")
+                for path in candidates
+                if working_directory or os.path.isabs(path)
+            )
+            if session_policy.get("deny_paths"):
+                script_paths_known = all(
+                    not path.startswith(("//", "~"))
+                    and (working_directory or os.path.isabs(path))
+                    for path in candidates
+                ) and all(
+                    # Relative operands can inherit a double-leading slash
+                    # from cwd, so validate resolved paths as well as argv.
+                    os.path.isabs(path) and not path.startswith("//")
+                    for path in resolved
+                )
         if resolved and _check_deny_paths(resolved, session_policy):
             return Classification.CRITICAL
 
@@ -1128,7 +1152,9 @@ def classify(
 
     # Step 4: Session policy allow rules
     if session_policy:
-        allow_override = _check_session_policy_allow(tool, args, session_policy)
+        allow_override = _check_session_policy_allow(
+            tool, args, session_policy, script_paths_known=script_paths_known
+        )
         if allow_override is not None:
             return allow_override
 
@@ -1554,6 +1580,7 @@ def _check_session_policy(
         "allow_tools": ["tool_name", ...],     # Force READ classification
         "deny_tools": ["tool_name", ...],      # Force CRITICAL classification
         "allow_commands": ["pattern", ...],     # Glob patterns for bash
+        "allow_scripts": ["/path/script.py"],   # Exact Python script paths
         "deny_commands": ["pattern", ...],     # Glob patterns for bash
         "allow_paths": ["pattern", ...],       # Exempt paths from project boundary
         "deny_paths": ["pattern", ...]         # Always deny (fnmatch on resolved)
@@ -1595,10 +1622,15 @@ def _check_session_policy_allow(
     tool: str,
     args: dict[str, Any],
     policy: dict[str, Any],
+    *,
+    script_paths_known: bool = True,
 ) -> Classification | None:
     """Check session policy allow rules only."""
     allow_tools = policy.get("allow_tools", [])
     if tool in allow_tools:
+        return Classification.READ
+
+    if script_paths_known and match_allowed_script(tool, args, policy) is not None:
         return Classification.READ
 
     if tool in {"bash", "terminal"}:

@@ -92,6 +92,7 @@ Create a new session or update an existing session's intention.
     "allow_tools": ["read", "glob", "grep"],
     "deny_tools": [],
     "allow_commands": [],
+    "allow_scripts": [],
     "deny_commands": ["rm -rf"],
     "allow_paths": ["/home/user/other-project/*"],
     "deny_paths": ["/etc/*", "/root/*"]

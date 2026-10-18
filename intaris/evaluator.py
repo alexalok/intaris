@@ -58,6 +58,7 @@ from intaris.prompts import (
 )
 from intaris.redactor import redact
 from intaris.sanitize import ANTI_INJECTION_PREAMBLE
+from intaris.script_policy import match_allowed_script
 from intaris.session import SessionStore
 
 if TYPE_CHECKING:
@@ -740,6 +741,11 @@ class Evaluator:
         # Step 3-5: Fast paths for read-only, critical, and escalate
         if classification == Classification.READ:
             reasoning = f"Read-only tool call: {tool}"
+            allowed_script = match_allowed_script(
+                tool, classification_args, session_policy
+            )
+            if allowed_script is not None:
+                reasoning = f"Explicitly allowed Python script: {allowed_script}"
             if resolved_paths and not path_reclassified:
                 # Check if this was a cache-hit override
                 if any(

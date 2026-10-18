@@ -67,7 +67,7 @@ Checked in order -- first match wins:
 | 1.5 | Session policy `deny_paths` | **CRITICAL** | Filesystem path deny (fnmatch) |
 | 2 | Tool preference deny | **CRITICAL** | Per-tool MCP preference |
 | 3 | Tool preference escalate | **ESCALATE** | Per-tool MCP preference |
-| 4 | Session policy `allow_tools` / `allow_commands` | **READ** | Admin-defined allow rules |
+| 4 | Session policy `allow_tools` / `allow_commands` / `allow_scripts` | **READ** | Admin-defined allow rules; script allowances require an exact path and a literal Python invocation |
 | 5 | Tool preference auto-approve | **READ** | Per-tool MCP preference |
 | 6 | Critical pattern detection (bash) | **CRITICAL** | Dangerous commands (rm -rf, etc.) |
 | 7 | Built-in read-only allowlist | **READ** | Known safe tools and commands |
