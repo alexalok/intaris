@@ -1229,7 +1229,7 @@ def test_unix_exchange_enforces_newline_json_and_size(monkeypatch, response, val
     monkeypatch.setattr(native, "_trusted_socket", lambda path: True)
     received = []
     with (
-        tempfile.TemporaryDirectory(dir="/private/tmp", prefix="native-") as directory,
+        tempfile.TemporaryDirectory(dir="/tmp", prefix="native-") as directory,
         socket.socket(socket.AF_UNIX) as listener,
     ):
         path = str(Path(directory) / "n.sock")
