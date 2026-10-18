@@ -35,9 +35,11 @@ Concurrent calls in one topic; shared bot across runtime profiles; stale callbac
 
 ## Verification results
 
-- Server suite: 2,674 passed; 68 external E2E cases deselected.
-- Hermes adapter suite: 796 passed with the pinned host source. The focused native
-  presentation/lifecycle suite passes all 82 tests, including fallback delivery.
+- Server suite: 2,677 passed; 68 external E2E cases deselected.
+- Hermes adapter suite: 799 passed with the pinned host source. The focused native
+  presentation/lifecycle suite passes all 85 tests, including fallback delivery.
+- PR follow-up tests cover portable socket paths, bounded origin/child routing
+  caches, and event-buffer persistence after native shutdown error/cancellation/timeout.
 - Ruff and diff checks pass. Before the fallback follow-up, two fresh scoped reviewers found no
   remaining actionable defects after fixes. A separate fresh verifier confirmed closure
   of all six review/self-review findings with 19 targeted passing tests.

@@ -1107,7 +1107,16 @@ async def lifespan(app):
         logger.info("Shutdown interrupted — running cleanup")
     finally:
         if native_approval_socket is not None:
-            await native_approval_socket.close()
+            try:
+                await asyncio.wait_for(native_approval_socket.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Native approval socket shutdown timed out (3s)")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "Native approval socket shutdown failed; continuing cleanup"
+                )
         if metrics_server is not None:
             metrics_server.should_exit = True
         if metrics_server_task is not None:
