@@ -570,3 +570,131 @@ def test_native_scope_claim_and_lease_creation_rollback_together(bridge, monkeyp
     with original() as cursor:
         cursor.execute("SELECT COUNT(*) FROM hermes_approval_leases")
         assert cursor.fetchone()[0] == 0
+
+
+def lease_state(bridge, lease):
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "SELECT state FROM hermes_approval_leases WHERE lease_id = ?",
+            (lease["lease_id"],),
+        )
+        row = cur.fetchone()
+    return row["state"] if row is not None else None
+
+
+@pytest.mark.parametrize(
+    "outcome,status,decision,resolver",
+    [
+        ("completed", "approve", "approve", "user"),
+        ("denied", "deny", "deny", "user"),
+        ("cancelled", "cancelled", "deny", "integration"),
+        ("expired", "expired", "deny", "integration"),
+        ("failed", "failed", "deny", "integration"),
+        ("completed_pending", "cancelled", "deny", "integration"),
+    ],
+)
+def test_settled_leases_retained_for_grace_then_purged_without_reopening(
+    bridge, outcome, status, decision, resolver
+):
+    from intaris.notifications.hermes_bridge import HermesApprovalBridge
+
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    if outcome == "completed":
+        assert decide(bridge, lease)["ok"]
+        assert run(bridge, op="close", lease_id=lease["lease_id"], reason="completed")[
+            "ok"
+        ]
+    elif outcome == "denied":
+        assert decide(bridge, lease, decision="deny")["ok"]
+    elif outcome == "expired":
+        bridge.clock.now = lease["expires_at"]
+        asyncio.run(bridge.service.sweep())
+    else:
+        reason = "completed" if outcome == "completed_pending" else outcome
+        assert run(bridge, op="close", lease_id=lease["lease_id"], reason=reason)["ok"]
+    assert lease_state(bridge, lease) == status
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record["user_decision"] == decision
+    assert record["resolved_by"] == resolver
+
+    # Retention survives restart and gives late close requests one hour after
+    # the original invocation deadline to observe the settled result.
+    bridge.service = HermesApprovalBridge(bridge.db, clock=lambda: bridge.clock.now)
+    bridge.clock.now = lease["expires_at"] + 3599
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) == status
+    assert run(bridge, op="close", lease_id=lease["lease_id"], reason="completed") == {
+        "ok": True,
+        "status": status,
+    }
+
+    bridge.clock.now += 1
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) is None
+    assert not decide(bridge, lease)["ok"]
+    assert not run(bridge, op="close", lease_id=lease["lease_id"], reason="completed")[
+        "ok"
+    ]
+    assert not open_call(bridge)["ok"]
+    assert bridge.audit.get_by_call_id("call-owner", user_id="owner") == record
+    assert lease_state(bridge, lease) is None
+
+
+@pytest.mark.parametrize("state", ["pending", "resolving", "retiring:cancelled"])
+def test_retention_keeps_failed_withdrawals_recoverable(bridge, monkeypatch, state):
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "UPDATE hermes_approval_leases SET state = ? WHERE lease_id = ?",
+            (state, lease["lease_id"]),
+        )
+    bridge.clock.now = lease["expires_at"] + 3600
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            bridge.service,
+            "_resolve",
+            AsyncMock(side_effect=RuntimeError("Audit temporarily unavailable")),
+        )
+        asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease).startswith("retiring:")
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        is None
+    )
+    assert not decide(bridge, lease)["ok"]
+
+    asyncio.run(bridge.service.sweep())
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record["user_decision"] == "deny"
+    assert record["resolved_by"] == "integration"
+    assert lease_state(bridge, lease) is None
+    assert not open_call(bridge)["ok"]
+
+
+def test_retention_preserves_terminal_lease_without_a_settled_audit(bridge):
+    lease = open_call(bridge)
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "UPDATE hermes_approval_leases SET state = 'cancelled' WHERE lease_id = ?",
+            (lease["lease_id"],),
+        )
+    bridge.clock.now = lease["expires_at"] + 3600
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) == "cancelled"
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        is None
+    )
+    assert not open_call(bridge)["ok"]
+
+
+def test_retention_preserves_unexpired_pending_lease(bridge):
+    lease = open_call(bridge)
+    bridge.clock.now = lease["expires_at"] - 1
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) == "pending"
+    assert open_call(bridge)["lease_id"] == lease["lease_id"]
+    assert bind(bridge, lease)["ok"]
+    assert decide(bridge, lease)["ok"]

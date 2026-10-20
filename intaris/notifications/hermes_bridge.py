@@ -24,6 +24,10 @@ from intaris.session import SessionStore
 
 logger = logging.getLogger(__name__)
 
+# Keep settled results available for late close requests after the original
+# invocation deadline. The durable audit verdict remains after lease cleanup.
+_SETTLED_LEASE_GRACE_SECONDS = 60 * 60
+
 
 def telegram_id(value: Any, *, positive: bool = False) -> str:
     """Accept canonical numeric Telegram identities, never usernames or bools."""
@@ -392,7 +396,7 @@ class HermesApprovalBridge:
         return {"ok": True, "status": decision}
 
     async def sweep(self) -> None:
-        """Fail closed on expired or abandoned calls, including after restart."""
+        """Reconcile unfinished calls and prune settled leases after a grace period."""
         async with self._lock:
             with self._db.cursor() as cur:
                 cur.execute(
@@ -414,3 +418,21 @@ class HermesApprovalBridge:
                     logger.debug("Native lease reconciliation deferred", exc_info=True)
                 except Exception:
                     logger.exception("Native lease reconciliation failed; will retry")
+
+            # Never prune unfinished withdrawals or unresolved audit records:
+            # their leases are needed for recovery and to prevent reopening.
+            # Terminal leases with durable verdicts no longer carry authority;
+            # the audit's settled state rejects any later open for the same call.
+            with self._db.cursor() as cur:
+                cur.execute(
+                    """DELETE FROM hermes_approval_leases
+                    WHERE state IN ('approve', 'deny', 'cancelled', 'expired', 'failed')
+                      AND expires_at <= ?
+                      AND EXISTS (
+                        SELECT 1 FROM audit_log
+                        WHERE audit_log.user_id = hermes_approval_leases.user_id
+                          AND audit_log.call_id = hermes_approval_leases.call_id
+                          AND audit_log.user_decision IS NOT NULL
+                      )""",
+                    (self._clock() - _SETTLED_LEASE_GRACE_SECONDS,),
+                )
