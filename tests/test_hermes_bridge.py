@@ -338,6 +338,53 @@ def test_expiry_and_sweep_deny_pending_calls(bridge):
     )
 
 
+@pytest.mark.parametrize("parent", [False, True])
+def test_idle_session_keeps_approval_until_invocation_deadline(bridge, parent):
+    target = "s"
+    if parent:
+        bridge.sessions.create(
+            session_id="parent", user_id="owner", agent_id="hermes", intention="Test"
+        )
+        with bridge.db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET parent_session_id = 'parent' WHERE user_id = 'owner' AND session_id = 's'"
+            )
+        target = "parent"
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    bridge.sessions.update_status(target, "idle", user_id="owner")
+    asyncio.run(bridge.service.sweep())
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        is None
+    )
+    assert decide(bridge, lease)["status"] == "approve"
+
+
+@pytest.mark.parametrize("status", ["completed", "suspended", "terminated"])
+@pytest.mark.parametrize("parent", [False, True])
+def test_stopped_session_or_parent_retires_native_lease(bridge, status, parent):
+    target = "s"
+    if parent:
+        bridge.sessions.create(
+            session_id="parent", user_id="owner", agent_id="hermes", intention="Test"
+        )
+        with bridge.db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET parent_session_id = 'parent' WHERE user_id = 'owner' AND session_id = 's'"
+            )
+        target = "parent"
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    bridge.sessions.update_status(target, status, user_id="owner")
+    asyncio.run(bridge.service.sweep())
+    assert decide(bridge, lease)["ok"] is False
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        == "deny"
+    )
+
+
 def test_ui_resolution_wins_and_native_cannot_override_judge(bridge):
     lease = open_call(bridge)
     bind(bridge, lease)

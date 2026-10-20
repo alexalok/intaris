@@ -91,7 +91,8 @@ class HermesApprovalBridge:
 
     def _active(self, lease: dict) -> bool:
         session = self._sessions.get(lease["session_id"], user_id=lease["user_id"])
-        if session["status"] != "active":
+        # Idle is resumable: waiting for a human can exceed the idle timeout.
+        if session["status"] not in ("active", "idle"):
             return False
         # Parent suspension/termination must not leave child buttons live.
         seen = {session["session_id"]}
@@ -101,7 +102,7 @@ class HermesApprovalBridge:
                 return False
             seen.add(parent)
             session = self._sessions.get(parent, user_id=lease["user_id"])
-            if session["status"] != "active":
+            if session["status"] not in ("active", "idle"):
                 return False
         return True
 
