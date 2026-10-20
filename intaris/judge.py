@@ -39,7 +39,7 @@ from intaris.policy import (
     policy_for_session,
 )
 from intaris.precedent import find_authoritative_precedent
-from intaris.prompts import render_user_decisions_section
+from intaris.prompts import filter_model_history, render_user_decisions_section
 from intaris.sanitize import (
     ANTI_INJECTION_PREAMBLE,
     sanitize_for_prompt,
@@ -792,6 +792,7 @@ def _build_judge_prompt(
         )
 
     # Recent history (extended context — 30 records)
+    recent_history = filter_model_history(recent_history)
     if recent_history:
         history_lines = []
         for record in recent_history:
@@ -841,6 +842,7 @@ def _build_judge_prompt(
     if decision_section:
         sections.append(decision_section)
 
+    prior_judge_reviews = filter_model_history(prior_judge_reviews or [])
     if prior_judge_reviews:
         judge_lines = []
         for record in prior_judge_reviews[:_PRIOR_JUDGE_LIMIT]:

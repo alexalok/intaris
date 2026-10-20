@@ -55,6 +55,7 @@ from intaris.prompts import (
     SAFETY_EVALUATION_SCHEMA,
     SAFETY_EVALUATION_SYSTEM_PROMPT,
     build_evaluation_user_prompt,
+    filter_model_history,
 )
 from intaris.redactor import redact
 from intaris.sanitize import ANTI_INJECTION_PREAMBLE
@@ -1294,8 +1295,10 @@ class Evaluator:
         # Assemble context
         session_id = session["session_id"]
         user_id = session["user_id"]
-        recent_history = self._audit.get_recent(
-            session_id, user_id=user_id, limit=10, record_type="tool_call"
+        recent_history = filter_model_history(
+            self._audit.get_recent(
+                session_id, user_id=user_id, limit=10, record_type="tool_call"
+            )
         )
         recent_reasoning = self._audit.get_recent(
             session_id, user_id=user_id, limit=4, record_type="reasoning"
