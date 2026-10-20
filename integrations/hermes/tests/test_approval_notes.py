@@ -148,7 +148,7 @@ def test_pending_note_is_ignored_and_terminal_note_is_used(
     responses.insert(-1, {"user_decision": None, "user_note": "stale pending note"})
     scripted_http(*responses)
     result = adapter.wrap('{"result": "ok"}')({}, session_id="A")
-    assert json.loads(result)["_intaris_approval"]["user_note"] == NOTE
+    assert json.loads(result)["_meta"]["_intaris_approval"]["user_note"] == NOTE
     assert "stale pending note" not in result
     assert len(adapter.executions) == 1
 
@@ -281,8 +281,9 @@ def test_concurrent_notes_stay_with_invocation_and_do_not_leak_to_next_call(
         }
         for name, future in futures.items():
             data = json.loads(future.result(timeout=8))
-            assert data["_intaris_approval"]["user_note"] == f"Note for {name}"
-            assert data["_intaris_approval"]["call_id"] == f"call-{name}"
+            metadata = data["_meta"] if name == "A" else data
+            assert metadata["_intaris_approval"]["user_note"] == f"Note for {name}"
+            assert metadata["_intaris_approval"]["call_id"] == f"call-{name}"
     assert adapter.executions == [({"name": "A"}, {"session_id": "A"})]
 
     def approve(*args, **kwargs):
@@ -300,6 +301,26 @@ def test_invalid_decision_with_note_cannot_approve_or_publish_note(
     scripted_http(*replies("unexpected", user_note=NOTE))
     result = adapter.wrap('{"result": "ok"}')({}, session_id="A")
     assert "Invalid escalation response" in json.loads(result)["error"]
+    assert "_intaris_approval" not in result
+    assert not adapter.executions
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+@pytest.mark.parametrize("reactivated", [False, True])
+def test_expired_resolution_discards_historical_human_note(
+    adapter, scripted_http, decision, reactivated
+):
+    scripted_http(
+        *replies(
+            decision,
+            reactivated=reactivated,
+            expired_at="2026-10-20T17:00:00Z",
+            expiration_reason="timeout",
+            user_note=NOTE,
+        )
+    )
+    result = json.loads(adapter.wrap('{"result": "ok"}')({}, session_id="A"))
+    assert "APPROVAL EXPIRED" in result["error"]
     assert "_intaris_approval" not in result
     assert not adapter.executions
 
@@ -636,7 +657,34 @@ def persist_multimodal():
     return namespace["_persist_multimodal_text_parts"]
 
 
-@pytest.mark.parametrize("kind", ["json", "text", "multimodal"])
+@pytest.mark.parametrize(
+    ("original", "failed"),
+    [
+        ('{"result":"native output\\n"}', False),
+        ('{"result":"native output\\n","_meta":{"status":"failed"}}', True),
+        ('{"result":"native output\\n","_meta":{"status":"err\\u006fr"}}', False),
+    ],
+)
+def test_mcp_note_preserves_native_failure_detection(runtime, host, original, failed):
+    if not os.environ.get("HERMES_SOURCE"):
+        pytest.skip("set HERMES_SOURCE for native failure classification")
+    from agent.display import _detect_tool_failure
+    from tools.tool_result_storage import _pageable_text
+
+    note = "Use staging. " * 40 + "error"
+    result = plugin._with_approval_note(
+        original, plugin._HumanPollResult("approve", note), "call-A"
+    )
+    assert _detect_tool_failure("mcp_document", original)[0] is failed
+    assert _detect_tool_failure("mcp_document", result)[0] is failed
+    data = json.loads(result)
+    assert data["_meta"].pop("_intaris_approval")["user_note"] == note
+    assert data["_meta"] == json.loads(original).get("_meta", {})
+    assert data["result"].endswith("native output\n")
+    assert "native output\n" in _pageable_text(result)
+
+
+@pytest.mark.parametrize("kind", ["json", "text", "multimodal", "mcp"])
 @pytest.mark.parametrize("budget_stage", ["result", "turn"])
 def test_human_note_stays_visible_when_hermes_spills_large_output(
     runtime, host, scripted_http, persist_multimodal, kind, budget_stage
@@ -644,12 +692,24 @@ def test_human_note_stays_visible_when_hermes_spills_large_output(
     from agent.tool_dispatch_helpers import make_tool_result_message
     from agent.vision_message_prep import VisionMessagePrepMixin
     from tools.budget_config import BudgetConfig
-    from tools.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
+    from tools.tool_result_storage import (
+        _pageable_text,
+        enforce_turn_budget,
+        maybe_persist_tool_result,
+    )
 
     output = "native output\n" * 9000
     native = (
         json.dumps({"output": output, "exit_code": 0}) if kind == "json" else output
     )
+    if kind == "mcp":
+        native = json.dumps(
+            {
+                "result": output,
+                "structuredContent": {"page": 1},
+                "_meta": {"origin": "native", "_intaris_approval": "provider field"},
+            }
+        )
     if kind == "multimodal":
         native = {
             "_multimodal": True,
@@ -676,6 +736,15 @@ def test_human_note_stays_visible_when_hermes_spills_large_output(
         ctx.emit("on_session_start", session_id="A")
         scripted_http(*replies(user_note=NOTE))
         result = ctx.execute("note_test", {}, session_id="A")
+        if kind == "mcp":
+            pageable = _pageable_text(result)
+            assert output in pageable
+            assert len(pageable.splitlines()) > 9000
+            enriched = json.loads(result)
+            assert enriched["result"].endswith(output)
+            assert enriched["structuredContent"] == {"page": 1}
+            assert enriched["_meta"]["origin"] == "native"
+            assert enriched["_meta"]["_intaris_approval"] == "provider field"
         if kind == "multimodal":
             result = persist_multimodal(result, "note_test", "hermes-A", None, budget)
         else:

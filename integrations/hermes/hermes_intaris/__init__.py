@@ -48,6 +48,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -1398,6 +1399,41 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
         if not isinstance(data, dict):
             data = {"tool_result": data}
             result = '{"tool_result": ' + result + "}"
+        if (
+            set(data) <= {"result", "structuredContent", "_meta"}
+            and isinstance(data.get("result"), str)
+            and data["result"]
+            and ("_meta" not in data or isinstance(data["_meta"], dict))
+        ):
+            # Hermes spills this exact MCP envelope as pageable document text.
+            # A new top-level key would instead archive one escaped JSON line.
+            metadata = dict(data.get("_meta", {}))
+            key = "_intaris_approval"
+            while key in metadata:
+                key += "_"
+            payload = {
+                "result": annotation + "\n\n" + data["result"],
+                **{k: v for k, v in data.items() if k not in {"result", "_meta"}},
+            }
+
+            def encode_native(value: Any) -> str:
+                # Re-encoding must not introduce raw failure tokens. The
+                # annotation already retains any original first-500 signal.
+                return re.sub(
+                    r'(error|failed)"',
+                    lambda match: match[0][:-2] + f'\\u{ord(match[0][-2]):04x}"',
+                    json.dumps(value, ensure_ascii=False),
+                    flags=re.IGNORECASE,
+                )
+
+            encoded_meta = (
+                "{"
+                + json.dumps(key)
+                + ": "
+                + encoded_note
+                + (", " + encode_native(metadata)[1:] if metadata else "}")
+            )
+            return '{"_meta": ' + encoded_meta + ", " + encode_native(payload)[1:]
         # Preserve JSON status/error fields used by Hermes, and never
         # overwrite a provider's field even if it uses our metadata name.
         key = "_intaris_approval"

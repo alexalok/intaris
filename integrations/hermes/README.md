@@ -195,7 +195,7 @@ Approval still executes the tool once; denial executes nothing and retains the
 evaluator's reasoning separately. This also applies when session reactivation
 leads to a new escalation.
 
-JSON object results retain their existing fields and gain `_intaris_approval`
+Ordinary JSON object results retain their existing fields and gain `_intaris_approval`
 as the first field, keeping the note visible in previews of large outputs:
 
 ```json
@@ -220,7 +220,11 @@ so human guidance cannot mark a successful result as failed.
 When native output already contains a failure token in Hermes' first 500-character
 scan, the annotation starts with an adapter-computed `native_failure_signal`.
 This preserves detection even with long notes or call IDs. Native JSON spelling
-and whitespace are retained to avoid introducing new failure tokens.
+and whitespace are retained for ordinary JSON to avoid introducing new failure tokens.
+Native MCP text envelopes (`result`, optional `structuredContent` and object `_meta`)
+keep their pageable shape: guidance prefixes the result text and is also stored
+under `_meta._intaris_approval`, preserving provider metadata and avoiding key
+collisions. Large documents still spill as readable lines with guidance in previews.
 Multimodal results retain their media and prefix each text part and any cached
 `text_summary` with the note. This retains bounded text-only summaries and keeps
 guidance visible when Hermes replaces a large summary with a text-part preview.
