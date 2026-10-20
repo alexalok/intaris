@@ -176,7 +176,7 @@ class LLMConfig:
 
 @dataclass
 class JevConfig:
-    """TypeSafe Jev configuration for bounded safety classifications."""
+    """Jev-compatible decision model configuration (TypeSafe or OpenRouter)."""
 
     enabled: bool = field(
         default_factory=lambda: _env("EVALUATOR_BACKEND", "llm").lower() == "jev"
@@ -186,6 +186,18 @@ class JevConfig:
         default_factory=lambda: _env("JEV_BASE_URL", "https://api.typesafe.ai")
     )
     api_key: str = ""
+    openrouter_providers: list[str] = field(
+        default_factory=lambda: [
+            provider.strip()
+            for provider in _env("JEV_OPENROUTER_PROVIDERS").split(",")
+            if provider.strip()
+        ]
+    )
+    # Compact UTF-8 JSON bytes of state + questions; zero disables the limit.
+    # CLEF requires an explicit budget because provider context limits differ.
+    max_input_bytes: int = field(
+        default_factory=lambda: _env_int("JEV_MAX_INPUT_BYTES", 0)
+    )
     timeout_ms: int = field(default_factory=lambda: _env_int("JEV_TIMEOUT_MS", 4000))
     minimum_confidence: float = field(
         default_factory=lambda: _env_float("JEV_MINIMUM_CONFIDENCE", 0.6)
@@ -208,6 +220,25 @@ class JevConfig:
         self.api_key = _env("JEV_API_KEY")
         if not self.api_key and urlsplit(self.base_url).hostname != "openrouter.ai":
             self.api_key = _env("TYPESAFE_API_KEY")
+
+    def validate_transport(self) -> None:
+        """Validate explicit routing and input budgets for decision models."""
+        is_openrouter = urlsplit(self.base_url).hostname == "openrouter.ai"
+        if self.max_input_bytes < 0:
+            raise ValueError("JEV_MAX_INPUT_BYTES must be >= 0.")
+        if self.openrouter_providers and not is_openrouter:
+            raise ValueError(
+                "JEV_OPENROUTER_PROVIDERS requires an OpenRouter endpoint."
+            )
+        if self.model.partition(":")[0] == "cloudflare/clef":
+            if not is_openrouter:
+                raise ValueError(
+                    "cloudflare/clef requires the OpenRouter decisions endpoint."
+                )
+            if not self.openrouter_providers:
+                raise ValueError("CLEF requires explicit JEV_OPENROUTER_PROVIDERS.")
+            if not self.max_input_bytes:
+                raise ValueError("CLEF requires a positive JEV_MAX_INPUT_BYTES budget.")
 
 
 @dataclass
@@ -771,6 +802,7 @@ class Config:
                 "EVALUATOR_BACKEND=jev."
             )
         if self.jev.enabled:
+            self.jev.validate_transport()
             if self.jev.timeout_ms < 500:
                 raise ValueError(
                     f"JEV_TIMEOUT_MS={self.jev.timeout_ms} is too low. "

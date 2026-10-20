@@ -15,6 +15,10 @@ The evaluator backend is selected with `EVALUATOR_BACKEND`; `llm` remains the
 default. See [configuration](configuration.md#tool-call-evaluator) for the
 TypeSafe and OpenRouter endpoints and required credentials.
 
+For the compatible Cloudflare CLEF model, see the separate
+[CLEF integration and October context probe](clef-evaluator.md). The September
+Jev results below are not CLEF measurements.
+
 ## Why consider it?
 
 | | Jev via OpenRouter | Groq-backed `gpt-oss-20b` |
