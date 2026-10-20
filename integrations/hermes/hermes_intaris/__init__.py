@@ -2518,7 +2518,10 @@ def _close_profile(profile: ProfileRuntime) -> None:
             _flush_recording_buffer(profile, task_id, timeout_s=remaining)
         for handle in reversed(registrations):
             try:
-                handle.dispose()
+                if handle is profile.native_approvals:
+                    handle.dispose(deadline=deadline)
+                else:
+                    handle.dispose()
             except Exception:
                 logger.exception("[intaris] Failed to dispose profile registration")
     finally:

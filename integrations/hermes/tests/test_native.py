@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import types
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
@@ -177,7 +177,7 @@ class Server:
         self.transport_gate = None
         self.transport_started = threading.Event()
 
-    def request(self, path, payload):
+    def request(self, path, payload, *, deadline=None):
         self.requests.append(payload)
         op = payload["op"]
         if op == "fallback_transport":
@@ -242,6 +242,13 @@ def harness(monkeypatch):
     error = types.ModuleType("telegram.error")
     error.BadRequest = BadRequest
     monkeypatch.setitem(sys.modules, "telegram.error", error)
+    deadline_module = types.ModuleType("agent.deadline")
+
+    async def bounded(awaitable, timeout, **kwargs):
+        return types.SimpleNamespace(timed_out=False, value=await awaitable)
+
+    deadline_module.run_bounded_async = bounded
+    monkeypatch.setitem(sys.modules, "agent.deadline", deadline_module)
     constants = types.ModuleType("hermes_constants")
     constants.get_hermes_home = lambda: Path("/profiles/alpha")
     monkeypatch.setitem(sys.modules, "hermes_constants", constants)
@@ -347,6 +354,25 @@ def harness(monkeypatch):
     loop.call_soon_threadsafe(loop.stop)
     thread.join(3)
     loop.close()
+
+
+@pytest.fixture
+def real_deadline(harness, monkeypatch):
+    """Use the pinned host primitive for cancellation-shielded I/O regressions."""
+    path = host_file("agent/deadline.py")
+    module = types.ModuleType("agent.deadline")
+    monkeypatch.setitem(sys.modules, "agent.deadline", module)
+    exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+    monkeypatch.setattr(native_module(), "_TELEGRAM_TIMEOUT", 0.03, raising=False)
+    return module
+
+
+async def wait_ignoring_cancellation(gate):
+    while not gate.is_set():
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            pass
 
 
 @contextmanager
@@ -1406,6 +1432,111 @@ def test_dispose_closes_prompts_and_makes_captured_callbacks_inert(harness):
         assert not h.server.ops("resolve")
 
 
+def test_dispose_shares_one_budget_across_unavailable_lease_closes(
+    harness, monkeypatch
+):
+    h = harness
+    native = native_module()
+    monkeypatch.setattr(native, "_TIMEOUT", 0.05)
+
+    def unavailable_close(path, payload, *, deadline=None):
+        if payload["op"] == "close":
+            remaining = (
+                0.05 if deadline is None else max(0, deadline - time.monotonic())
+            )
+            time.sleep(min(0.05, remaining))
+            raise TimeoutError("bridge unavailable")
+        return h.server.request(path, payload)
+
+    with ExitStack() as waits:
+        for index in range(8):
+            h.server.open_reply["lease_id"] = f"{index:032d}"
+            waits.enter_context(
+                h.native.pending(
+                    "hermes-root",
+                    f"call-{index}",
+                    h.budget,
+                    intaris_session_id="hm-uuid",
+                )
+            )
+        until(lambda: len(h.server.ops("bind")) == 8)
+        prompts = list(h.native._prompts)
+        monkeypatch.setattr(native, "_exchange", unavailable_close)
+        started = time.monotonic()
+        h.native.dispose()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.2, f"teardown used per-prompt budgets: {elapsed}"
+        assert not h.native._prompts and not h.native._leases
+        assert all(
+            not prompt.active and prompt.reason == "cancelled" for prompt in prompts
+        )
+        assert all(handle.disposed for handle in h.ctx.handles)
+
+
+@pytest.mark.parametrize("operation", ["send", "enable_edit"])
+def test_telegram_hard_deadline_retires_shielded_io_and_late_result(
+    harness, real_deadline, monkeypatch, operation
+):
+    h = harness
+    gate = asyncio.Event()
+    started = threading.Event()
+    completed = threading.Event()
+    target = "send_message" if operation == "send" else "edit_message_text"
+    original = getattr(h.app.bot, target)
+
+    async def shielded(**kwargs):
+        if operation == "send" or kwargs.get("reply_markup"):
+            started.set()
+            await wait_ignoring_cancellation(gate)
+        result = await original(**kwargs)
+        if operation == "send" or kwargs.get("reply_markup"):
+            completed.set()
+        return result
+
+    monkeypatch.setattr(h.app.bot, target, shielded)
+    try:
+        with pending(h):
+            assert started.wait(1)
+            until(lambda: h.server.ops("close"))
+            assert h.server.ops("close")[0]["reason"] == "failed"
+            assert not h.server.ops("fallback")
+            h.loop.call_soon_threadsafe(gate.set)
+            assert completed.wait(1)
+            until(lambda: h.app.bot.edits and not actionable(h))
+            assert not h.server.ops("resolve")
+    finally:
+        h.loop.call_soon_threadsafe(gate.set)
+
+
+def test_expired_teardown_budget_retires_locally_without_another_rpc(harness):
+    h = harness
+    with pending(h):
+        until(lambda: actionable(h))
+        h.native.dispose(deadline=time.monotonic() - 1)
+        until(lambda: not actionable(h))
+        assert not h.server.ops("close")
+        assert not h.native._leases and not h.native._prompts
+
+
+def test_callback_acknowledgement_has_hard_deadline(
+    harness, real_deadline, monkeypatch
+):
+    h = harness
+    gate = asyncio.Event()
+
+    async def shielded_answer(**kwargs):
+        await wait_ignoring_cancellation(gate)
+
+    monkeypatch.setattr(h.app.bot, "answer_callback_query", shielded_answer)
+    try:
+        with pending(h):
+            until(lambda: actionable(h))
+            click(h).result(0.5)
+            assert h.server.ops("resolve")[0]["decision"] == "approve"
+    finally:
+        h.loop.call_soon_threadsafe(gate.set)
+
+
 @pytest.mark.parametrize(
     "fault", [None, "relative", "owner", "mode", "access", "symlink", "not_socket"]
 )
@@ -1489,3 +1620,34 @@ def test_unix_exchange_enforces_newline_json_and_size(monkeypatch, response, val
                 native._exchange(path, {"op": "open", "profile": "/profiles/alpha"})
         thread.join(3)
     assert received == [{"op": "open", "profile": "/profiles/alpha"}]
+
+
+def test_unix_exchange_obeys_earlier_aggregate_deadline(monkeypatch):
+    native = native_module()
+    monkeypatch.setattr(native, "_trusted_socket", lambda path: True)
+    release = threading.Event()
+    with (
+        tempfile.TemporaryDirectory(dir="/tmp", prefix="native-") as directory,
+        socket.socket(socket.AF_UNIX) as listener,
+    ):
+        path = str(Path(directory) / "n.sock")
+        listener.bind(path)
+        listener.listen(1)
+
+        def server():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(4096)
+                release.wait(1)
+
+        thread = threading.Thread(target=server, daemon=True)
+        thread.start()
+        try:
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                native._exchange(path, {"op": "close"}, deadline=started + 0.03)
+            assert time.monotonic() - started < 0.3
+        finally:
+            release.set()
+            thread.join(2)
+        assert not thread.is_alive()

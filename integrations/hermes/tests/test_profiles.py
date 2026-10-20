@@ -3317,6 +3317,30 @@ def test_retirement_batch_shares_teardown_deadline(
     assert replacement.start_confirmed and not replacement._ended.is_set()
 
 
+def test_native_disposal_receives_remaining_profile_teardown_deadline(
+    runtime, monkeypatch
+):
+    old = runtime.register("a", {"session_recording": True})
+    with runtime.profile("a") as home:
+        old.emit("on_session_start", session_id="native-wait")
+        profile = plugin._profiles[str(home)]
+    clock, observed = [100.0], []
+    original = profile.native_approvals.dispose
+
+    def capture_dispose(**kwargs):
+        observed.append((clock[0], kwargs.get("deadline")))
+        original(**kwargs)
+
+    def flush(*args, **kwargs):
+        clock[0] += 2
+
+    monkeypatch.setattr(profile.native_approvals, "dispose", capture_dispose)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(plugin, "_flush_recording_buffer", flush)
+    plugin._close_profile(profile)
+    assert observed == [(102.0, 105.0)]
+
+
 def test_retirement_batch_bounds_effect_lock_wait(runtime, monkeypatch):
     monkeypatch.setattr(plugin, "MAX_RETIRED_OWNERS", 0)
     old = runtime.register("a")

@@ -18,7 +18,7 @@ import stat
 import threading
 import time
 import weakref
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
@@ -29,6 +29,7 @@ from .waits import Invocation, WaitStopped
 
 logger = logging.getLogger(__name__)
 _TIMEOUT = 2.0
+_TELEGRAM_TIMEOUT = 8.0
 _MAX_BYTES = 65536
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{32}\Z")
 _CALLBACK = re.compile(r"intaris:([ad]):([A-Za-z0-9_-]{32})\Z")
@@ -71,14 +72,17 @@ def _bad_constant(value: str) -> None:
     raise ValueError("Non-finite native protocol value")
 
 
-def _exchange(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _exchange(
+    path: str, payload: dict[str, Any], *, deadline: float | None = None
+) -> dict[str, Any]:
     """One bounded newline-JSON request on a freshly validated Unix socket."""
     if not _trusted_socket(path):
         raise ValueError("Untrusted native approval socket")
     wire = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode() + b"\n"
     if len(wire) > _MAX_BYTES:
         raise ValueError("Native request too large")
-    deadline = time.monotonic() + _TIMEOUT
+    request_deadline = time.monotonic() + _TIMEOUT
+    deadline = request_deadline if deadline is None else min(deadline, request_deadline)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
 
         def remaining() -> None:
@@ -146,6 +150,44 @@ def _approval_route(route: dict[str, Any]) -> dict[str, Any]:
         "thread_id": _thread(route["thread_id"]),
         "actor_ids": actors,
     }
+
+
+async def _telegram_call(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    label: str,
+    on_late: Callable[[Any], None] | None = None,
+) -> Any:
+    # The host primitive abandons cancellation-shielded I/O; wait_for would
+    # await cancellation forever. Import before creating the request coroutine.
+    from agent.deadline import run_bounded_async
+
+    task = asyncio.ensure_future(operation())
+
+    def completed_late(done: asyncio.Future) -> None:
+        if done.cancelled():
+            return
+        try:
+            value = done.result()
+            if on_late is not None:
+                on_late(value)
+        except Exception:
+            logger.debug("Abandoned native Telegram request failed")
+
+    try:
+        result = await run_bounded_async(
+            task,
+            _TELEGRAM_TIMEOUT,
+            label=label,
+            dump_on_blocked_loop=False,
+        )
+    except asyncio.CancelledError:
+        task.add_done_callback(completed_late)
+        raise
+    if result.timed_out:
+        task.add_done_callback(completed_late)
+        raise TimeoutError("Native Telegram request exceeded wall-clock deadline")
+    return result.value
 
 
 class _Unroutable(ValueError):
@@ -459,8 +501,13 @@ class NativeApprovals:
             if gateway is not None and all(g is not gateway for g in self._gateways):
                 self._gateways.append(gateway)
 
-    def _rpc(self, op: str, **fields: Any) -> dict[str, Any]:
-        return _exchange(self._socket, {"op": op, "profile": self.home, **fields})
+    def _rpc(
+        self, op: str, *, deadline: float | None = None, **fields: Any
+    ) -> dict[str, Any]:
+        payload = {"op": op, "profile": self.home, **fields}
+        if deadline is None:
+            return _exchange(self._socket, payload)
+        return _exchange(self._socket, payload, deadline=deadline)
 
     @staticmethod
     def _schedule(binding: _Binding, coroutine: Any) -> None:
@@ -621,15 +668,19 @@ class NativeApprovals:
                 route = prompt.route
             thread_id = route["thread_id"]
             try:
-                return await prompt.binding.bot.send_message(
-                    chat_id=route["chat_id"],
-                    message_thread_id=(
-                        None if thread_id in (None, "1") else int(thread_id)
+                return await _telegram_call(
+                    lambda: prompt.binding.bot.send_message(
+                        chat_id=route["chat_id"],
+                        message_thread_id=(
+                            None if thread_id in (None, "1") else int(thread_id)
+                        ),
+                        text=prompt.text,
+                        parse_mode=None,
+                        reply_markup=None,
+                        **_BOT_TIMEOUTS,
                     ),
-                    text=prompt.text,
-                    parse_mode=None,
-                    reply_markup=None,
-                    **_BOT_TIMEOUTS,
+                    label="intaris native send",
+                    on_late=lambda message: self._late_message(prompt, message),
                 )
             except BadRequest as exc:
                 # Only definite topic rejections prove that no message was sent.
@@ -680,6 +731,20 @@ class NativeApprovals:
                         raise ValueError("Native approval no longer active") from exc
                     prompt.route = fallback
 
+    def _capture_message(self, prompt: _Prompt, message: Any) -> None:
+        with self._lock:
+            if _identifier(message.chat.id, signed=True) != prompt.route[
+                "chat_id"
+            ] or not _same_thread(message.message_thread_id, prompt.route["thread_id"]):
+                raise ValueError("Telegram delivered to a different route")
+            prompt.message_id = _identifier(message.message_id)
+
+    def _late_message(self, prompt: _Prompt, message: Any) -> None:
+        # An ambiguous send is never retried or bound. If it eventually lands,
+        # update that exact message without making the expired lease actionable.
+        self._capture_message(prompt, message)
+        self._schedule(prompt.binding, self._retire(prompt))
+
     async def _deliver(self, prompt: _Prompt) -> None:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -690,15 +755,9 @@ class NativeApprovals:
                     if not self._live(prompt):
                         return
                 message = await self._send(prompt)
-                thread_id = prompt.route["thread_id"]
+                self._capture_message(prompt, message)
                 with self._lock:
-                    prompt.message_id = _identifier(message.message_id)
-                    matches = _identifier(message.chat.id, signed=True) == prompt.route[
-                        "chat_id"
-                    ] and _same_thread(message.message_thread_id, thread_id)
                     live = self._live(prompt)
-                if not matches:
-                    raise ValueError("Telegram delivered to a different route")
                 if live:
                     response = await asyncio.to_thread(
                         prompt.invocation.request,
@@ -732,6 +791,9 @@ class NativeApprovals:
                     await self._edit(prompt, self._status_text(prompt), None)
         except Exception:
             logger.warning("Native Telegram prompt failed; delivery stopped")
+            with self._lock:
+                prompt.active = False
+                prompt.reason = prompt.reason or "failed"
             await asyncio.to_thread(self._finish, prompt, "failed")
 
     @staticmethod
@@ -744,13 +806,23 @@ class NativeApprovals:
         }
 
     async def _edit(self, prompt: _Prompt, text: str, markup: Any) -> None:
-        await prompt.binding.bot.edit_message_text(
-            chat_id=prompt.route["chat_id"],
-            message_id=int(prompt.message_id),
-            text=text,
-            reply_markup=markup,
-            parse_mode=None,
-            **_BOT_TIMEOUTS,
+        await _telegram_call(
+            lambda: prompt.binding.bot.edit_message_text(
+                chat_id=prompt.route["chat_id"],
+                message_id=int(prompt.message_id),
+                text=text,
+                reply_markup=markup,
+                parse_mode=None,
+                **_BOT_TIMEOUTS,
+            ),
+            label="intaris native edit",
+            # A timed-out keyboard update can land after the first withdrawal.
+            # Remove it again on late completion; removal never chains itself.
+            on_late=(
+                (lambda _: self._schedule(prompt.binding, self._retire(prompt)))
+                if markup is not None
+                else None
+            ),
         )
 
     def _status_text(self, prompt: _Prompt) -> str:
@@ -774,7 +846,9 @@ class NativeApprovals:
                         "Native prompt buttons could not be removed; lease is inactive"
                     )
 
-    def _finish(self, prompt: _Prompt, reason: str) -> None:
+    def _finish(
+        self, prompt: _Prompt, reason: str, *, deadline: float | None = None
+    ) -> None:
         with self._lock:
             prompt.active = False
             if prompt.reason is None:
@@ -789,7 +863,11 @@ class NativeApprovals:
             self._leases.pop(lease_id, None)
             reason = prompt.reason
         try:
-            response = self._rpc("close", lease_id=lease_id, reason=reason)
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            response = self._rpc(
+                "close", lease_id=lease_id, reason=reason, deadline=deadline
+            )
             with self._lock:
                 if response.get("ok") is True and response.get("status") in (
                     "approve",
@@ -803,8 +881,11 @@ class NativeApprovals:
 
     async def _answer(self, binding: _Binding, query: Any, text: str) -> None:
         try:
-            await binding.bot.answer_callback_query(
-                callback_query_id=query.id, text=text, **_BOT_TIMEOUTS
+            await _telegram_call(
+                lambda: binding.bot.answer_callback_query(
+                    callback_query_id=query.id, text=text, **_BOT_TIMEOUTS
+                ),
+                label="intaris native callback acknowledgement",
             )
         except Exception:
             logger.debug("Native callback acknowledgement unavailable")
@@ -877,8 +958,10 @@ class NativeApprovals:
         # Only the server resolves the audit. Never dispatch or return approval.
         await asyncio.to_thread(self._finish, prompt, reason)
 
-    def dispose(self) -> None:
+    def dispose(self, *, deadline: float | None = None) -> None:
         """Retire hooks, timers and prompts; captured callbacks become inert."""
+        if deadline is None:
+            deadline = time.monotonic() + _TIMEOUT
         with _hub_lock, self._lock:
             if self._disposed:
                 return
@@ -902,7 +985,7 @@ class NativeApprovals:
                 except Exception:
                     logger.warning("Native hook disposal failed")
         for prompt in prompts:
-            self._finish(prompt, "cancelled")
+            self._finish(prompt, "cancelled", deadline=deadline)
         for binding in bindings:
             self._remove_handler(binding)
 
