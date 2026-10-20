@@ -1211,11 +1211,12 @@ def test_cross_thread_check_ignores_unrelated_worker_interrupt(real_interrupt):
     invocation.check()
 
 
-def test_cross_thread_check_without_owner_api_fails_closed(monkeypatch):
+def test_cross_thread_wait_without_owner_api_fails_closed(monkeypatch):
     module = types.ModuleType("tools.interrupt")
     module.is_interrupted = lambda: False
     monkeypatch.setitem(sys.modules, "tools.interrupt", module)
     invocation = Invocation(threading.Event(), 60)
+    invocation._deadline = time.monotonic() + 60
     errors = []
 
     def worker():
@@ -1229,6 +1230,58 @@ def test_cross_thread_check_without_owner_api_fails_closed(monkeypatch):
     thread.join(3)
     assert not thread.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], WaitStopped)
+
+
+@pytest.mark.parametrize("stop", [None, "interrupted", "session ended", "completed"])
+def test_legacy_cross_thread_immediate_result_preserves_cancellation(monkeypatch, stop):
+    module = types.ModuleType("tools.interrupt")
+    module.is_interrupted = lambda: stop == "interrupted"
+    monkeypatch.setitem(sys.modules, "tools.interrupt", module)
+    ended = threading.Event()
+    invocation = Invocation(ended, 60)
+    if stop == "session ended":
+        ended.set()
+    elif stop == "completed":
+        invocation.close()
+    results = []
+
+    def worker():
+        try:
+            results.append(invocation.request(lambda: "immediate approval"))
+        except WaitStopped as exc:
+            results.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(3)
+    assert not thread.is_alive()
+    if stop is None:
+        assert results == ["immediate approval"]
+    else:
+        assert len(results) == 1 and isinstance(results[0], WaitStopped)
+        assert stop in str(results[0])
+
+
+def test_legacy_cross_thread_cannot_start_human_wait(monkeypatch):
+    module = types.ModuleType("tools.interrupt")
+    module.is_interrupted = lambda: False
+    monkeypatch.setitem(sys.modules, "tools.interrupt", module)
+    invocation = Invocation(threading.Event(), 60)
+    results = []
+
+    def worker():
+        try:
+            with invocation.human_wait("approval"):
+                results.append("wait opened")
+        except WaitStopped as exc:
+            results.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(3)
+    assert not thread.is_alive()
+    assert len(results) == 1 and isinstance(results[0], WaitStopped)
+    assert "owner-thread API unavailable" in str(results[0])
 
 
 def test_fallback_uses_only_server_approved_actors(harness):

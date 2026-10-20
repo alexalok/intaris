@@ -116,3 +116,17 @@ Verification: 2,734 server tests passed (68 external E2E cases deselected) and
 immediate on delivery failure, all 105 native tests passed again. The deadline
 regressions execute the real pinned Hermes primitive. Ruff and diff checks pass.
 No deployment or live Telegram message was performed.
+
+## Legacy wrapper compatibility follow-up (2026-10-20)
+
+Bugbot passed `f87ad10`; Codex identified two existing mixed sync/async wrapper
+parametrizations failing without the pinned host source. Both failures reproduced.
+Legacy immediate evaluations now retain their worker interruption and shared
+session/lifetime checks across wrapper threads. Cross-thread human waits and
+native callbacks still require the owner-thread API; a missing API fails closed.
+
+Verification: 776 adapter tests passed with 51 host-contract skips using legacy
+doubles, and all 827 passed against the pinned Hermes source. Five added
+regressions cover immediate approval, interruption, session end, invocation
+closure, and rejection of unsupported cross-thread human waits. Ruff and diff
+checks pass. Server code is unchanged from its 2,734-test passing run.

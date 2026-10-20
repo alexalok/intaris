@@ -130,9 +130,15 @@ class Invocation:
             # Preserve the execution thread's current context check too.
             return self._is_interrupted is not None and self._is_interrupted()
         if self._is_thread_interrupted is None:
-            raise WaitStopped(
-                "Cannot safely check cancellation: Hermes owner-thread API unavailable"
-            )
+            if self._deadline is not None:
+                raise WaitStopped(
+                    "Cannot safely check cancellation: Hermes owner-thread API unavailable"
+                )
+            # Legacy wrappers can move an immediate evaluation/dispatch across
+            # threads without entering a human wait. Preserve their worker's
+            # interrupt check plus the shared session/closed flags. Native
+            # callbacks always have a wait deadline and require the owner API.
+            return self._is_interrupted is not None and self._is_interrupted()
         return False
 
     def sleep(self, seconds: float) -> None:
@@ -188,6 +194,11 @@ class Invocation:
     def human_wait(self, label: str) -> Iterator[Callable[[], None]]:
         """Register genuine human wait with Hermes, and always close accounting."""
         self.check()
+        if (
+            threading.get_ident() != self._owner_tid
+            and self._is_thread_interrupted is None
+        ):
+            raise WaitStopped("Cannot safely wait: Hermes owner-thread API unavailable")
         if self._is_interrupted is None or self._ended is None:
             raise WaitStopped(
                 "Cannot safely wait: Hermes interruption/session context unavailable"
