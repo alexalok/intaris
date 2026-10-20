@@ -40,6 +40,8 @@ Intaris compares its UID, PID and process start time against a protected operato
 attestation. Agent tool subprocesses share the gateway UID but have different
 PIDs and cannot submit decisions. The bridge has no HTTP route and does not
 accept Intaris agent API keys.
+Unattested processes are rejected before request framing. At most 32 admitted
+connections can wait for or process a request; excess connections are refused.
 
 The gateway process and installed plugin code are trusted host components. This
 does not sandbox arbitrary malicious Python already running inside the gateway,
@@ -97,6 +99,9 @@ overriding the chat never inherits a topic from the global chat. An explicit
 profile `fallback_chat_id: null` disables its fallback. Omit both global fallback
 fields to disable fallback globally, or omit only `fallback_thread_id` for an
 ordinary fallback chat. The selected existing bot must have access to that chat.
+For Telegram's General topic, omit `fallback_thread_id` or set it to `"1"`.
+The plugin omits the thread parameter when sending to General and accepts both
+Telegram representations of that same topic when binding messages and callbacks.
 
 `fallback_transport_profile` selects the bot-owning profile for background work
 without a correlated Telegram session transport. Set it to that profile's
@@ -165,6 +170,10 @@ restart. Until valid attestation exists, native presentation is unavailable and
 ordinary Intaris UI approval remains available. Normal Intaris shutdown removes
 its socket; after a crash, verify no listener remains before removing a stale
 socket. Startup never deletes an existing socket automatically.
+Startup publishes the configured path only after capturing the socket's inode
+and setting permissions. If even the first metadata read fails, an unidentified
+private staging socket is left untouched; there are four bounded staging slots.
+Exhausting those slots requires operator verification and cleanup before retrying.
 
 ## Lifetime and failure behavior
 
@@ -174,6 +183,9 @@ lease exists per tenant/call. Callback identity binds profile, session, call,
 random lease, actor, chat, topic, bot connection, and sent message. The callback
 only records an Intaris verdict; the existing adapter polling and cancellation
 checks decide whether the original invocation can continue.
+An idle session or parent does not cancel a pending approval; the invocation's
+deadline still applies. Completed, suspended, and terminated sessions or parents
+make the buttons non-actionable.
 
 Duplicate taps, moved/forwarded messages, late actions, and callbacks after an
 Intaris UI or judge decision cannot override that decision. Cancellation,
@@ -183,6 +195,8 @@ attributed to `resolved_by=user` with the numeric Telegram actor in the audit
 note. Every leased call has persisted `approval_scope=call`, including resolutions
 from the Intaris UI or judge. Its verdict never enters retry approval caches,
 human precedent, path learning, session alignment overrides, or intention updates.
+It is also excluded from later evaluator and judge model history, including
+prior judge outcomes; raw audit records remain available in the UI.
 Failed withdrawal writes remain recoverable and are retried by the server sweep.
 
 Resolution or withdrawal removes buttons and updates the original message when

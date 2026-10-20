@@ -70,3 +70,27 @@ mapping change's scope.
   the complete rerun pass. No product change was needed for that failure.
 - Ruff and diff checks passed; a fresh independent review found no actionable
   issues. Live deployment and Telegram delivery remain untested.
+
+## Codex and Bugbot follow-up (2026-10-20)
+
+Both bots completed review of the shared-bot mapping commit. Five confirmed
+findings were reproduced before fixing:
+
+- Idle sessions and parents now keep native approval leases until the invocation
+  deadline; completed, suspended, and terminated sessions still retire them.
+- Telegram General-topic sends omit the thread parameter; delivery and callback
+  checks accept only the equivalent absent/1 representations of General.
+- Call-scoped approvals are excluded from later evaluator, JEV, and judge
+  histories, including prior judge outcomes. Raw audit records remain intact.
+- Socket startup captures an unpublished inode and permissions before atomic
+  publication, cleans identified sockets after failure/cancellation, and preserves
+  foreign replacements. Unknown initial metadata failures use at most four
+  private staging slots, requiring operator cleanup if those slots fill.
+- Socket admission rejects unattested processes before frame reads and caps
+  admitted connections/backlog at 32, then rechecks profile authorization after
+  framing.
+
+Final local verification: 2,723 server tests passed (68 external E2E cases
+deselected), 815 Hermes adapter tests passed, and Ruff/diff checks passed.
+Actual Unix socket publication/connect/cleanup ran on macOS; Linux peer
+credentials and Telegram delivery remain mocked. No deployment or live messages.
