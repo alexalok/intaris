@@ -14,7 +14,7 @@ EVALUATOR_BACKEND=jev
 JEV_BASE_URL=https://openrouter.ai/api
 JEV_MODEL=cloudflare/clef
 JEV_API_KEY="${OPENROUTER_API_KEY}"
-JEV_OPENROUTER_PROVIDERS=deepinfra
+JEV_OPENROUTER_PROVIDERS=deepinfra,cloudflare
 JEV_MAX_INPUT_BYTES=60000
 JEV_TIMEOUT_MS=4000
 JEV_MINIMUM_CONFIDENCE=0.6
@@ -28,10 +28,12 @@ selected L1 decision model and parent/child alignment model; it does not add a
 second L1 pass. Escalations still use the existing judge/human workflow.
 The `llm` audit-path name remains unchanged for compatibility.
 
-The client sends `provider.only` and `allow_fallbacks=false`. One provider slug
-pins a provider; multiple slugs permit routing within that allowlist. Native
-Jev defaults remain unchanged. CLEF startup fails without an explicit
-OpenRouter provider selection and a positive input budget.
+The client sends `provider.only`. One provider slug pins a provider with
+`allow_fallbacks=false`; multiple slugs enable `allow_fallbacks=true` so
+OpenRouter can route and retry within that allowlist. Providers outside the
+allowlist remain excluded. Native Jev defaults remain unchanged. CLEF startup
+fails without an explicit OpenRouter provider selection and a positive input
+budget.
 
 The budget counts compact UTF-8 JSON bytes of **both complete state and
 questions**, including rules, intentions, tool arguments, and history. Routing
@@ -40,10 +42,11 @@ alignment checks require review. Neither path sends a provider request or
 silently trims input. Other provider errors retain the existing failure behavior.
 
 This is a byte ceiling, not a token counter or a guarantee about provider-side
-limits. The example uses DeepInfra's advertised 65,536-token context with a
-60,000-byte request ceiling. Revalidate the budget when changing providers or
-models; PrimeIntellect advertises only 16,384 tokens. If allowing multiple
-providers, choose a budget appropriate for the smallest context. The tests
+limits. The example allows DeepInfra and Cloudflare, both advertising about
+65K tokens of context, with a 60,000-byte request ceiling. Revalidate the budget
+when changing providers or models; PrimeIntellect advertises only 16,384 tokens.
+If allowing multiple providers, choose a budget appropriate for the smallest
+context. The tests
 below establish retention up to the measured offsets, not the full advertised
 window. `JEV_DIAGNOSTICS=true` exposes scores and usage for calibration.
 
