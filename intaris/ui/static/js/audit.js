@@ -39,6 +39,15 @@ function auditTab() {
         if (this.initialized) this.load();
       });
 
+      window.addEventListener('intaris:approval-refreshed', (e) => {
+        this.expandedRecord = updateApprovalRecords(e.detail, this.records, this.expandedRecord);
+      });
+      window.addEventListener('intaris:ws-connected', () => {
+        if (!this.initialized) return;
+        this.load();
+        Alpine.store('nav').refreshApprovalRecord(this.expandedRecord?.call_id);
+      });
+
       // Subscribe to WebSocket events for live audit updates
       window.addEventListener('intaris:ws-message', (e) => {
         this._handleWsEvent(e.detail);
@@ -46,6 +55,7 @@ function auditTab() {
     },
 
     _handleWsEvent(data) {
+      this.expandedRecord = updateApprovalRecords(data, this.records, this.expandedRecord);
       if (!this.initialized) return;
       if (Alpine.store('nav').activeTab !== 'audit') return;
 
@@ -99,17 +109,6 @@ function auditTab() {
         clearTimeout(this.eventReloadTimer);
         this.eventReloadTimer = setTimeout(() => this.load(), 150);
       }
-
-      if (data.type === 'decided') {
-        // Update the resolved record in-place if visible
-        this._applyResolutionUpdate(data.call_id, {
-          user_decision: data.user_decision,
-          effective_decision: data.user_decision,
-          user_note: data.user_note,
-          resolved_by: data.resolved_by,
-          resolved_at: new Date().toISOString(),
-        });
-      }
     },
 
     async load() {
@@ -125,7 +124,7 @@ function auditTab() {
         const agentFilter = Alpine.store('nav').selectedAgent;
         if (agentFilter) params.agent_id = agentFilter;
         const result = await IntarisAPI.listAudit(params);
-        this.records = result.items || [];
+        this.records = (result.items || []).map(mergeApprovalExpiration);
         this.total = result.total;
         this.pages = result.pages;
       } catch (e) {
@@ -172,7 +171,7 @@ function auditTab() {
         return;
       }
       try {
-        this.expandedRecord = await IntarisAPI.getAuditRecord(record.call_id);
+        this.expandedRecord = mergeApprovalExpiration(await IntarisAPI.getAuditRecord(record.call_id));
       } catch (e) {
         this.expandedRecord = record;
       }
@@ -198,11 +197,16 @@ function auditTab() {
     async _resolveRecord(callId, decision, mode) {
       if (!callId || !decision) return;
       if (this.resolving[callId]) return;
+      const records = [...this.records, this.expandedRecord];
+      const expired = () => isApprovalExpired({ call_id: callId })
+        || records.some(r => r?.call_id === callId && isApprovalExpired(r));
+      if (expired()) return;
 
       this.resolving = { ...this.resolving, [callId]: true };
       try {
         const note = this.noteText[callId] || null;
         await IntarisAPI.resolveDecision(callId, decision, note);
+        if (expired()) return;
         this._applyResolutionUpdate(callId, {
           user_decision: decision,
           user_note: note,
@@ -234,6 +238,8 @@ function auditTab() {
       } finally {
         const { [callId]: _, ...rest } = this.resolving;
         this.resolving = rest;
+        Alpine.store('nav').refreshPendingApprovals();
+        await Alpine.store('nav').refreshApprovalRecord(callId);
       }
     },
 
@@ -250,17 +256,17 @@ function auditTab() {
     },
 
     canResolveEscalation(record) {
-      return record?.decision === 'escalate' && !record?.user_decision;
+      return canResolveApproval(record);
     },
 
     canOverrideDenial(record) {
       return record?.decision === 'deny'
         && !record?.user_decision
-        && record?.evaluation_path !== 'fast';
+        && record?.evaluation_path !== 'fast' && !isApprovalExpired(record);
     },
 
     canOverrideJudge(record) {
-      return record?.resolved_by === 'judge';
+      return record?.resolved_by === 'judge' && !isApprovalExpired(record);
     },
 
     decisionBadgeClass(decision) {

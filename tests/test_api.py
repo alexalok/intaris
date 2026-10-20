@@ -4696,3 +4696,160 @@ class TestAnalysisDisabled:
         )
         assert resp.status_code == 200
         assert resp.json()["decision"] == "approve"
+
+
+# Explicit invocation retirement is distinct from human denial.
+def test_expired_approval_api_filters_stats_and_late_decision(client_no_auth):
+    client = client_no_auth
+    headers = TestDecision()._create_escalated_record(client)
+    payload = {"session_id": "sess-user-esc", "reason": "timeout"}
+    response = client.post(
+        "/api/v1/audit/esc-call-1/expire", json=payload, headers=headers
+    )
+    assert response.status_code == 200
+    record = response.json()
+    assert record["expired_at"]
+    assert record["expiration_reason"] == "timeout"
+    assert record["decision"] == "escalate"
+    assert record["user_decision"] is None
+    assert (
+        client.post(
+            "/api/v1/audit/esc-call-1/expire", json=payload, headers=headers
+        ).json()
+        == record
+    )
+    assert (
+        client.get(
+            "/api/v1/audit",
+            params={"decision": "escalate", "resolved": "false"},
+            headers=headers,
+        ).json()["total"]
+        == 0
+    )
+    history = client.get(
+        "/api/v1/audit",
+        params={"decision": "escalate", "resolved": "true"},
+        headers=headers,
+    ).json()
+    assert history["items"][0]["expired_at"] == record["expired_at"]
+    assert client.get("/api/v1/stats", headers=headers).json()["pending_approvals"] == 0
+    late = client.post(
+        "/api/v1/decision",
+        json={"call_id": "esc-call-1", "decision": "approve"},
+        headers=headers,
+    )
+    assert late.status_code == 409
+    assert "expired" in late.json()["detail"].lower()
+
+
+def test_expiration_endpoint_validates_scope_and_reason(client_no_auth):
+    client = client_no_auth
+    headers = TestDecision()._create_escalated_record(client)
+    endpoint = "/api/v1/audit/esc-call-1/expire"
+    assert (
+        client.post(
+            endpoint,
+            json={"session_id": "sess-user-esc", "reason": "timeout"},
+            headers={"X-User-Id": "other"},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            endpoint, json={"session_id": "other", "reason": "timeout"}, headers=headers
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            endpoint,
+            json={"session_id": "sess-user-esc", "reason": "old"},
+            headers=headers,
+        ).status_code
+        == 422
+    )
+    assert client.get("/api/v1/stats", headers=headers).json()["pending_approvals"] == 1
+
+
+def test_expiration_disables_explicit_approval_reuse(client_no_auth):
+    client = client_no_auth
+    headers = {"X-User-Id": "expiry-floor"}
+    _create_session(client, "expiry-floor-session", headers)
+    body = {
+        "session_id": "expiry-floor-session",
+        "tool": "read",
+        "args": {"path": "/tmp/a"},
+        "minimum_outcome": "escalate",
+    }
+    first = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+    call_id = first["call_id"]
+    client.post(
+        "/api/v1/decision",
+        headers=headers,
+        json={"call_id": call_id, "decision": "approve"},
+    ).raise_for_status()
+    client.post(
+        f"/api/v1/audit/{call_id}/expire",
+        headers=headers,
+        json={"session_id": "expiry-floor-session", "reason": "timeout"},
+    ).raise_for_status()
+    body["approval_call_id"] = call_id
+    response = client.post("/api/v1/evaluate", headers=headers, json=body)
+    assert response.status_code == 200
+    assert response.json()["decision"] == "deny"
+
+
+def test_expiration_emits_scoped_websocket_event(client_no_auth):
+    from intaris.audit import AuditStore
+    from intaris.server import _get_db
+
+    client = client_no_auth
+    headers = TestDecision()._create_escalated_record(client)
+    events = []
+    _set_app_state(client, "event_bus", SimpleNamespace(publish=events.append))
+    response = client.post(
+        "/api/v1/audit/esc-call-1/expire",
+        headers=headers,
+        json={"session_id": "sess-user-esc", "reason": "abandoned"},
+    )
+    assert response.status_code == 200
+    assert events == [
+        {
+            "type": "expired",
+            "call_id": "esc-call-1",
+            "user_id": "user-esc",
+            "session_id": "sess-user-esc",
+            "expired_at": response.json()["expired_at"],
+            "expiration_reason": "abandoned",
+        }
+    ]
+    assert (
+        AuditStore(_get_db()).get_by_call_id("esc-call-1", user_id="user-esc")[
+            "user_decision"
+        ]
+        is None
+    )
+
+
+def test_expired_notification_link_cannot_offer_approval(client_no_auth):
+    from cryptography.fernet import Fernet
+
+    from intaris.notifications.tokens import generate_action_token
+    from intaris.server import _get_config
+
+    client = client_no_auth
+    headers = TestDecision()._create_escalated_record(client)
+    key = Fernet.generate_key().decode()
+    _get_config().mcp.encryption_key = key
+    token = generate_action_token(
+        call_id="esc-call-1", user_id="user-esc", action="approve", encryption_key=key
+    )
+    client.post(
+        "/api/v1/audit/esc-call-1/expire",
+        headers=headers,
+        json={"session_id": "sess-user-esc", "reason": "timeout"},
+    ).raise_for_status()
+    response = client.get(f"/api/v1/action/{token}")
+    assert response.status_code == 410
+    assert "Expired" in response.text
+    assert "Confirm Approve" not in response.text

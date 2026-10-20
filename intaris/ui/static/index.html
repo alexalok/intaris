@@ -342,9 +342,9 @@
                   <div class="flex items-center justify-between py-2 border-b border-brand-border last:border-0 cursor-pointer hover:bg-brand-elevated/50 rounded px-2 -mx-2"
                        @click="goToSession(r.session_id)">
                     <div class="flex items-center gap-3">
-                      <span :class="decisionBadgeClass(r.decision)" x-text="r.decision"></span>
-                      <span x-show="r.decision === 'escalate' && r.user_decision"
-                            :class="decisionBadgeClass(r.user_decision)" x-text="r.user_decision"></span>
+                      <span :class="approvalStatusClass(r)" x-text="approvalStatusLabel(r)"></span>
+                      <span x-show="!isApprovalExpired(r) && r.decision === 'escalate' && r.user_decision"
+                            :class="'badge badge-' + r.user_decision" x-text="r.user_decision"></span>
                       <span class="text-sm font-mono" x-text="r.tool || r.record_type"></span>
                       <span class="text-xs text-brand-accent" x-text="r.session_id"></span>
                     </div>
@@ -748,9 +748,9 @@
                         <div class="flex items-center justify-between py-1.5 text-sm cursor-pointer hover:bg-brand-elevated/50 rounded px-2 -mx-2"
                              @click.stop="toggleAuditExpand(r)">
                           <div class="flex items-center gap-2">
-                            <span :class="decisionBadgeClass(r.decision)" x-text="r.decision"></span>
-                            <span x-show="r.decision === 'escalate' && r.user_decision"
-                                  :class="decisionBadgeClass(r.user_decision)" x-text="r.user_decision"></span>
+                            <span :class="approvalStatusClass(r)" x-text="approvalStatusLabel(r)"></span>
+                            <span x-show="!isApprovalExpired(r) && r.decision === 'escalate' && r.user_decision"
+                                  :class="'badge badge-' + r.user_decision" x-text="r.user_decision"></span>
                             <span class="font-mono text-xs" x-text="r.tool || r.record_type"></span>
                             <span x-show="r.record_type && r.record_type !== 'tool_call'"
                                   :class="recordTypeBadgeClass(r.record_type)" x-text="r.record_type" class="text-xs"></span>
@@ -811,9 +811,20 @@
                           </template>
 
                           <!-- Resolution (if escalated and resolved) -->
+                          <template x-if="isApprovalExpired(expandedAuditRecord)">
+                            <div class="mb-3 p-3 border border-brand-border rounded bg-brand-elevated">
+                              <div class="flex items-center gap-2 mb-1">
+                                <span class="badge badge-low">Expired</span>
+                                <span x-text="approvalExpirationReason(expandedAuditRecord)"></span>
+                                <span class="text-xs text-muted" x-text="formatTime(approvalExpiration(expandedAuditRecord)?.expired_at)"></span>
+                              </div>
+                              <div class="text-xs text-muted">This approval can no longer be used.</div>
+                              <div class="text-xs text-muted mt-1">Evaluation: <span x-text="expandedAuditRecord.decision"></span></div>
+                            </div>
+                          </template>
                           <template x-if="expandedAuditRecord?.user_decision">
                             <div class="mb-2">
-                              <div class="text-xs text-muted mb-1">Resolution</div>
+                              <div class="text-xs text-muted mb-1" x-text="isApprovalExpired(expandedAuditRecord) ? 'Previous resolution' : 'Resolution'"></div>
                               <div class="flex items-center gap-2">
                                 <span :class="decisionBadgeClass(expandedAuditRecord.user_decision)" x-text="expandedAuditRecord.user_decision"></span>
                                 <span x-show="expandedAuditRecord.resolved_by === 'judge'" class="badge badge-judge">judge</span>
@@ -849,7 +860,7 @@
                           </template>
 
                           <!-- Approve/Deny actions (if escalated and NOT yet resolved) -->
-                          <template x-if="expandedAuditRecord?.decision === 'escalate' && !expandedAuditRecord?.user_decision">
+                          <template x-if="canResolveApproval(expandedAuditRecord)">
                             <div class="mb-2 pt-2 border-t border-brand-border">
                               <div class="flex items-end gap-2">
                                 <div class="flex-1">
@@ -1102,10 +1113,9 @@
                 <div class="flex items-center gap-3">
                   <span :class="sourceBadgeClass(r.source)"
                         x-text="r.source === 'event' ? 'event' : 'evaluation'"></span>
-                  <span x-show="r.decision"
-                        :class="decisionBadgeClass(r.decision)" x-text="r.decision"></span>
-                  <span x-show="r.decision === 'escalate' && r.user_decision"
-                        :class="decisionBadgeClass(r.user_decision)" x-text="r.user_decision"></span>
+                  <span x-show="r.decision" :class="approvalStatusClass(r)" x-text="approvalStatusLabel(r)"></span>
+                  <span x-show="!isApprovalExpired(r) && r.decision === 'escalate' && r.user_decision"
+                        :class="'badge badge-' + r.user_decision" x-text="r.user_decision"></span>
                   <span class="font-mono text-sm" x-text="r.tool || r.record_type"></span>
                   <span x-show="r.record_type && (r.record_type !== 'tool_call' || r.source === 'event')"
                         :class="recordTypeBadgeClass(r.record_type)" x-text="r.record_type"></span>
@@ -1174,9 +1184,20 @@
                 </template>
 
                 <!-- Resolution (if escalated) -->
+                <template x-if="isApprovalExpired(expandedRecord)">
+                  <div class="mb-3 p-3 border border-brand-border rounded bg-brand-elevated">
+                    <div class="flex items-center gap-2 mb-1">
+                      <span class="badge badge-low">Expired</span>
+                      <span x-text="approvalExpirationReason(expandedRecord)"></span>
+                      <span class="text-xs text-muted" x-text="formatTime(approvalExpiration(expandedRecord)?.expired_at)"></span>
+                    </div>
+                    <div class="text-xs text-muted">This approval can no longer be used.</div>
+                    <div class="text-xs text-muted mt-1">Evaluation: <span x-text="expandedRecord.decision"></span></div>
+                  </div>
+                </template>
                 <template x-if="expandedRecord?.user_decision">
                   <div class="mb-3">
-                    <div class="text-xs text-muted mb-1">Resolution</div>
+                    <div class="text-xs text-muted mb-1" x-text="isApprovalExpired(expandedRecord) ? 'Previous resolution' : 'Resolution'"></div>
                     <div class="flex items-center gap-2">
                       <span :class="decisionBadgeClass(expandedRecord.user_decision)" x-text="expandedRecord.user_decision"></span>
                       <span x-show="expandedRecord.resolved_by === 'judge'" class="badge badge-judge">judge</span>
@@ -1382,11 +1403,11 @@
                          x-model="noteText[item.call_id]">
                 </div>
                 <button @click.stop="resolve(item.call_id, 'approve')"
-                        :disabled="resolving[item.call_id] === true"
+                        :disabled="resolving[item.call_id] === true || isApprovalExpired(item)"
                         class="btn-success text-sm"
                         x-text="resolving[item.call_id] === true ? 'Approving...' : 'Approve'"></button>
                 <button @click.stop="resolve(item.call_id, 'deny')"
-                        :disabled="resolving[item.call_id] === true"
+                        :disabled="resolving[item.call_id] === true || isApprovalExpired(item)"
                         class="btn-danger text-sm"
                         x-text="resolving[item.call_id] === true ? 'Denying...' : 'Deny'"></button>
               </div>
@@ -1479,10 +1500,10 @@
                                class="input text-sm" @click.stop x-model="noteText[item.call_id]">
                       </div>
                       <button @click.stop="overrideDenial(item.call_id, 'approve')"
-                              :disabled="resolving[item.call_id] === true" class="btn-success text-sm"
+                              :disabled="resolving[item.call_id] === true || isApprovalExpired(item)" class="btn-success text-sm"
                               x-text="resolving[item.call_id] === true ? 'Approving...' : 'Approve'"></button>
                       <button @click.stop="overrideDenial(item.call_id, 'deny')"
-                              :disabled="resolving[item.call_id] === true" class="btn-danger text-sm"
+                              :disabled="resolving[item.call_id] === true || isApprovalExpired(item)" class="btn-danger text-sm"
                               x-text="resolving[item.call_id] === true ? 'Confirming...' : 'Confirm Deny'"></button>
                     </div>
                   </div>
@@ -1495,22 +1516,23 @@
         <!-- Resolved Approvals Section -->
         <div class="mt-8">
           <div class="flex items-center justify-between mb-4">
-            <h2 class="text-lg font-medium text-secondary">Resolved Approvals</h2>
-            <span class="text-sm text-muted" x-text="resolvedTotal + ' resolved'" x-show="resolvedTotal > 0"></span>
+            <h2 class="text-lg font-medium text-secondary">Approval History</h2>
+            <span class="text-sm text-muted" x-text="resolvedTotal + ' closed'" x-show="resolvedTotal > 0"></span>
           </div>
 
-          <div x-show="resolvedLoading && resolved.length === 0" class="text-center py-8 text-secondary">Loading resolved approvals...</div>
-          <div x-show="!resolvedLoading && resolved.length === 0" class="text-center py-8 text-muted">No resolved approvals</div>
+          <div x-show="resolvedLoading && resolved.length === 0" class="text-center py-8 text-secondary">Loading approval history...</div>
+          <div x-show="!resolvedLoading && resolved.length === 0" class="text-center py-8 text-muted">No closed approvals</div>
 
           <div class="space-y-2">
             <template x-for="item in resolved" :key="item.call_id">
               <div class="card opacity-80 cursor-pointer" @click="toggleResolvedExpand(item)">
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-3">
-                    <span class="badge badge-escalate">escalate</span>
-                    <span :class="decisionBadgeClass(item.user_decision)" x-text="item.user_decision"></span>
-                    <span x-show="item.resolved_by === 'judge'" class="badge badge-judge">judge</span>
-                    <span x-show="item.resolved_by === 'user' && ['approve', 'deny'].includes(item.judge_decision)"
+                    <span :class="approvalStatusClass(item)" x-text="approvalStatusLabel(item)"></span>
+                    <span x-show="!isApprovalExpired(item) && item.decision === 'escalate' && item.user_decision"
+                          :class="'badge badge-' + item.user_decision" x-text="item.user_decision"></span>
+                    <span x-show="!isApprovalExpired(item) && item.resolved_by === 'judge'" class="badge badge-judge">judge</span>
+                    <span x-show="!isApprovalExpired(item) && item.resolved_by === 'user' && ['approve', 'deny'].includes(item.judge_decision)"
                           class="text-xs font-medium px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">overridden</span>
                     <span class="font-mono text-sm" x-text="item.tool"></span>
                     <span :class="riskBadgeClass(item.risk)" x-text="item.risk" x-show="item.risk"></span>
@@ -1520,9 +1542,10 @@
                     <span class="text-brand-accent hover:underline cursor-pointer"
                           @click.stop="goToSession(item.session_id)"
                           x-text="item.session_id"></span>
-                    <span x-text="formatTime(item.resolved_at || item.timestamp)"></span>
+                    <span x-text="formatTime(approvalExpiration(item)?.expired_at || item.resolved_at || item.timestamp)"></span>
                   </div>
                 </div>
+                <div x-show="isApprovalExpired(item)" class="mt-2 text-sm text-muted" x-text="approvalExpirationReason(item)"></div>
                 <div x-show="item.reasoning && expandedResolvedId !== item.call_id" class="mt-2 text-sm text-secondary truncate" x-text="truncate(item.reasoning, 150)"></div>
                 <div x-show="item.user_note && expandedResolvedId !== item.call_id" class="mt-1 text-xs text-muted">
                   Note: <span x-text="item.user_note"></span>
@@ -1559,9 +1582,20 @@
                   </div>
 
                   <!-- Resolution -->
+                  <template x-if="isApprovalExpired(expandedResolvedRecord)">
+                    <div class="mb-3 p-3 border border-brand-border rounded bg-brand-elevated">
+                      <div class="flex items-center gap-2 mb-1">
+                        <span class="badge badge-low">Expired</span>
+                        <span x-text="approvalExpirationReason(expandedResolvedRecord)"></span>
+                        <span class="text-xs text-muted" x-text="formatTime(approvalExpiration(expandedResolvedRecord)?.expired_at)"></span>
+                      </div>
+                      <div class="text-xs text-muted">This approval can no longer be used.</div>
+                      <div class="text-xs text-muted mt-1">Evaluation: <span x-text="expandedResolvedRecord.decision"></span></div>
+                    </div>
+                  </template>
                   <template x-if="expandedResolvedRecord?.user_decision">
                     <div class="mb-3">
-                      <div class="text-xs text-muted mb-1">Resolution</div>
+                      <div class="text-xs text-muted mb-1" x-text="isApprovalExpired(expandedResolvedRecord) ? 'Previous resolution' : 'Resolution'"></div>
                       <div class="flex items-center gap-2">
                         <span :class="decisionBadgeClass(expandedResolvedRecord.user_decision)" x-text="expandedResolvedRecord.user_decision"></span>
                         <span x-show="expandedResolvedRecord.resolved_by === 'judge'" class="badge badge-judge">judge</span>
@@ -1596,7 +1630,7 @@
                   </template>
 
                   <!-- Override Judge Decision -->
-                  <template x-if="expandedResolvedRecord?.resolved_by === 'judge'">
+                  <template x-if="expandedResolvedRecord?.resolved_by === 'judge' && !isApprovalExpired(expandedResolvedRecord)">
                     <div class="mb-3 p-3 border border-amber-500/30 rounded bg-amber-500/5">
                       <div class="text-xs text-muted mb-2">Override Judge Decision</div>
                       <div class="flex items-end gap-3">
@@ -1607,11 +1641,11 @@
                                  x-model="noteText[item.call_id]">
                         </div>
                         <button @click.stop="override(item.call_id, 'approve')"
-                                :disabled="resolving[item.call_id] === true"
+                                :disabled="resolving[item.call_id] === true || isApprovalExpired(item)"
                                 class="btn-success text-sm"
                                 x-text="resolving[item.call_id] === true ? 'Approving...' : 'Approve'"></button>
                         <button @click.stop="override(item.call_id, 'deny')"
-                                :disabled="resolving[item.call_id] === true"
+                                :disabled="resolving[item.call_id] === true || isApprovalExpired(item)"
                                 class="btn-danger text-sm"
                                 x-text="resolving[item.call_id] === true ? 'Denying...' : 'Deny'"></button>
                       </div>
@@ -2935,11 +2969,11 @@
                   <div class="flex items-center justify-between py-1.5 text-sm cursor-pointer hover:bg-brand-elevated/50 rounded px-2 -mx-2"
                        @click.stop="$store.nav.toggleModalAuditExpand(r)">
                     <div class="flex items-center gap-2">
-                      <span :class="'badge badge-' + (r.decision || 'low')" x-text="r.decision"></span>
-                      <span x-show="r.decision === 'escalate' && r.user_decision"
-                            :class="'badge badge-' + (r.user_decision || 'low')" x-text="r.user_decision"></span>
-                      <span x-show="r.resolved_by === 'judge'" class="badge badge-judge text-xs">judge</span>
-                      <span x-show="r.resolved_by === 'user' && ['approve', 'deny'].includes(r.judge_decision)"
+                      <span :class="approvalStatusClass(r)" x-text="approvalStatusLabel(r)"></span>
+                      <span x-show="!isApprovalExpired(r) && r.decision === 'escalate' && r.user_decision"
+                            :class="'badge badge-' + r.user_decision" x-text="r.user_decision"></span>
+                      <span x-show="!isApprovalExpired(r) && r.resolved_by === 'judge'" class="badge badge-judge text-xs">judge</span>
+                      <span x-show="!isApprovalExpired(r) && r.resolved_by === 'user' && ['approve', 'deny'].includes(r.judge_decision)"
                             class="text-xs font-medium px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">overridden</span>
                       <span class="font-mono text-xs" x-text="r.tool || r.record_type"></span>
                       <span :class="'badge badge-' + (r.risk || 'low')" x-text="r.risk" x-show="r.risk" class="text-xs"></span>
@@ -2989,9 +3023,20 @@
                         <pre class="text-xs bg-brand-bg rounded p-2 overflow-x-auto" x-text="typeof $store.nav.sessionModalAuditRecord.args_redacted === 'string' ? $store.nav.sessionModalAuditRecord.args_redacted : JSON.stringify($store.nav.sessionModalAuditRecord.args_redacted, null, 2)"></pre>
                       </div>
                     </template>
+                    <template x-if="isApprovalExpired($store.nav.sessionModalAuditRecord)">
+                      <div class="mb-3 p-3 border border-brand-border rounded bg-brand-elevated">
+                        <div class="flex items-center gap-2 mb-1">
+                          <span class="badge badge-low">Expired</span>
+                          <span x-text="approvalExpirationReason($store.nav.sessionModalAuditRecord)"></span>
+                          <span class="text-xs text-muted" x-text="new Date(approvalExpiration($store.nav.sessionModalAuditRecord)?.expired_at).toLocaleString()"></span>
+                        </div>
+                        <div class="text-xs text-muted">This approval can no longer be used.</div>
+                        <div class="text-xs text-muted mt-1">Evaluation: <span x-text="$store.nav.sessionModalAuditRecord.decision"></span></div>
+                      </div>
+                    </template>
                     <template x-if="$store.nav.sessionModalAuditRecord?.user_decision">
                       <div class="mb-2">
-                        <div class="text-xs text-muted mb-1">Resolution</div>
+                        <div class="text-xs text-muted mb-1" x-text="isApprovalExpired($store.nav.sessionModalAuditRecord) ? 'Previous resolution' : 'Resolution'"></div>
                         <div class="flex items-center gap-2">
                           <span :class="'badge badge-' + ($store.nav.sessionModalAuditRecord.user_decision || 'low')" x-text="$store.nav.sessionModalAuditRecord.user_decision"></span>
                           <span x-show="$store.nav.sessionModalAuditRecord.resolved_by === 'judge'" class="badge badge-judge">judge</span>
@@ -3022,7 +3067,7 @@
                       </div>
                     </template>
                     <!-- Approve/Deny actions (if escalated and NOT yet resolved) -->
-                    <template x-if="$store.nav.sessionModalAuditRecord?.decision === 'escalate' && !$store.nav.sessionModalAuditRecord?.user_decision">
+                    <template x-if="canResolveApproval($store.nav.sessionModalAuditRecord)">
                       <div class="mb-2 pt-2 border-t border-brand-border">
                         <div class="flex items-end gap-2">
                           <div class="flex-1">

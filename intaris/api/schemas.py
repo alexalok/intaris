@@ -215,6 +215,13 @@ class SessionResponse(BaseModel):
 # ── Decision ──────────────────────────────────────────────────────────
 
 
+class ExpireApprovalRequest(BaseModel):
+    """The originating client reports that a guarded invocation was abandoned."""
+
+    session_id: str = Field(min_length=1)
+    reason: Literal["timeout", "cancelled", "abandoned"]
+
+
 class DecisionRequest(BaseModel):
     """Request to resolve an escalated tool call."""
 
@@ -272,6 +279,8 @@ class AuditRecord(BaseModel):
     injection_detected: bool = False
     user_decision: str | None = None
     user_note: str | None = None
+    expired_at: str | None = None
+    expiration_reason: str | None = None
     resolved_at: str | None = None
     resolved_by: str | None = None
     judge_reasoning: str | None = None
