@@ -7,6 +7,7 @@ stays on the Hermes worker, where its interruption and tool context remain valid
 from __future__ import annotations
 
 import contextvars
+import logging
 import math
 import threading
 import time
@@ -14,6 +15,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TypeVar
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _CHECK_INTERVAL_S = 0.1
@@ -54,6 +57,10 @@ def _shared_deadline(key: str, timeout_s: float) -> Iterator[float]:
 class WaitStopped(Exception):
     """The invocation must not dispatch, including when fail-open is enabled."""
 
+    def __init__(self, message: str, reason: str = "abandoned") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 class Invocation:
     """Own cancellation checks and a single approval budget for one invocation."""
@@ -64,6 +71,7 @@ class Invocation:
         self._timeout_s = timeout_s
         self._deadline: float | None = None
         self._stopped: str | None = None
+        self._stop_reason = "cancelled"
         self._label = "approval"
         try:
             from tools.interrupt import is_interrupted
@@ -88,8 +96,9 @@ class Invocation:
                 )
             elif self._deadline is not None and time.monotonic() >= self._deadline:
                 self._stopped = f"APPROVAL WAIT TIMEOUT ({self._label})"
+                self._stop_reason = "timeout"
         if self._stopped:
-            raise WaitStopped(self._stopped)
+            raise WaitStopped(self._stopped, reason=self._stop_reason)
 
     def sleep(self, seconds: float) -> None:
         """Wait in interruptible slices, bounded by the invocation's deadline."""
@@ -107,20 +116,40 @@ class Invocation:
         else:
             time.sleep(seconds)
 
-    def request(self, operation: Callable[[], T]) -> T:
+    def request(
+        self,
+        operation: Callable[[], T],
+        *,
+        on_abandoned: Callable[[T, str], None] | None = None,
+    ) -> T:
         """Observe cancellation even while urllib is blocked in transport.
 
-        urllib's own socket timeout still applies. A detached request can finish
-        later, but has no path to dispatch a tool or publish its stale result.
+        A detached result can only reach the optional cleanup callback, never
+        dispatch. The callback must be nonblocking. A locked handoff covers both
+        completion before cancellation and completion after the waiter leaves.
         """
         self.check()
         done = threading.Event()
+        handoff = threading.Lock()
         values: list[T] = []
         errors: list[BaseException] = []
+        abandoned_reason: str | None = None
+
+        def abandon(value: T, reason: str) -> None:
+            if on_abandoned is not None:
+                try:
+                    on_abandoned(value, reason)
+                except Exception:
+                    logger.exception("[intaris] Detached request cleanup failed")
 
         def run() -> None:
             try:
-                values.append(operation())
+                value = operation()
+                with handoff:
+                    values.append(value)
+                    reason = abandoned_reason
+                if reason is not None:
+                    abandon(value, reason)
             except BaseException as exc:
                 errors.append(exc)
             finally:
@@ -133,12 +162,22 @@ class Invocation:
             daemon=True,
         )
         thread.start()
-        while not done.wait(_CHECK_INTERVAL_S):
+        try:
+            while not done.wait(_CHECK_INTERVAL_S):
+                self.check()
             self.check()
-        self.check()
-        if errors:
-            raise errors[0]
-        return values[0]
+            if errors:
+                raise errors[0]
+            return values[0]
+        except BaseException as exc:
+            with handoff:
+                abandoned_reason = (
+                    exc.reason if isinstance(exc, WaitStopped) else "abandoned"
+                )
+                completed = bool(values)
+            if completed:
+                abandon(values[0], abandoned_reason)
+            raise
 
     @contextmanager
     def human_wait(self, label: str) -> Iterator[Callable[[], None]]:

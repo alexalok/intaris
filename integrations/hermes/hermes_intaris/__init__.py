@@ -41,6 +41,7 @@ Configuration via profile-scoped Hermes env/credentials and plugin settings:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 import inspect
@@ -1163,7 +1164,9 @@ def _decision_response_error(result: ApiResult) -> str | None:
         return (
             "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
         )
-    if decision == "escalate":
+    if decision == "escalate" or (
+        decision == "approve" and result.data.get("requires_expiration") is True
+    ):
         call_id = result.data.get("call_id")
         if not isinstance(call_id, str) or not call_id.strip():
             return "Invalid API response: escalation requires a non-empty call_id"
@@ -1178,12 +1181,69 @@ class _HumanPollResult:
     user_note: str | None = None
 
 
+class _NativeApproval:
+    """Track only native escalations that have not crossed the dispatch boundary."""
+
+    def __init__(
+        self, client: IntarisClient, session_id: str, invocation: Invocation
+    ) -> None:
+        self.client = client
+        self.session_id = session_id
+        self.invocation = invocation
+        self.pending: set[str] = set()
+
+    @staticmethod
+    def escalation_id(result: ApiResult) -> str | None:
+        """Return only an explicit, identifiable, unexpired escalation."""
+        if result.protocol_error or not isinstance(result.data, dict):
+            return None
+        data = result.data
+        if data.get("decision") != "escalate" and not (
+            data.get("decision") == "approve"
+            and data.get("requires_expiration") is True
+        ):
+            return None
+        if isinstance(data.get("expired_at"), str) and data["expired_at"].strip():
+            return None
+        call_id = data.get("call_id")
+        return call_id if isinstance(call_id, str) and call_id.strip() else None
+
+    def abandon(self, result: ApiResult, reason: str) -> None:
+        """Retire a late evaluate result using its captured client/session."""
+        call_id = self.escalation_id(result)
+        if call_id is not None:
+            self.client.report_expiration(call_id, self.session_id, reason)
+
+    def evaluate(self, tool: str, args: dict, **kwargs: Any) -> ApiResult:
+        """Register a known escalation before any further pre-dispatch work."""
+        result = self.invocation.request(
+            lambda: self.client.evaluate(self.session_id, tool, args, **kwargs),
+            on_abandoned=self.abandon,
+        )
+        call_id = self.escalation_id(result)
+        if call_id is not None:
+            self.pending.add(call_id)
+        return result
+
+    def settle(self, call_id: str) -> None:
+        """Stop tracking an explicit denial, expired audit or dispatched call."""
+        self.pending.discard(call_id)
+
+    def retire(self, reason: str) -> None:
+        """Retire remaining calls on every non-dispatch exit, without waiting."""
+        pending, self.pending = self.pending, set()
+        for call_id in pending:
+            self.client.report_expiration(call_id, self.session_id, reason)
+
+
 def _poll_human(
     invocation: Invocation,
     label: str,
     fetch: Callable[[], ApiResult],
     field_name: str,
     terminal_values: tuple[str, ...],
+    *,
+    on_settled: Callable[[], None] | None = None,
 ) -> _HumanPollResult:
     """Poll only while the originating invocation and its approval budget live."""
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
@@ -1213,16 +1273,31 @@ def _poll_human(
             if result.protocol_error:
                 return _HumanPollResult("invalid_response")
             if result.data is None:
+                if result.status is not None and 400 <= result.status < 500:
+                    return _HumanPollResult("invalid_response")
                 continue  # Server unreachable; remain within the wait budget.
             if not isinstance(result.data, dict):
                 return _HumanPollResult("invalid_response")
             value = result.data.get(field_name)
             if field_name == "user_decision":
+                expired_at = result.data.get("expired_at")
+                expiration_reason = result.data.get("expiration_reason")
+                if expired_at is not None:
+                    if not isinstance(expired_at, str) or not expired_at.strip():
+                        return _HumanPollResult("invalid_response")
+                    # Expiration takes precedence over retained human/judge history.
+                    if on_settled is not None:
+                        on_settled()
+                    return _HumanPollResult("expired")
+                if expiration_reason is not None:
+                    return _HumanPollResult("invalid_response")
                 if field_name not in result.data:
                     return _HumanPollResult("invalid_response")
                 if value is not None and value not in terminal_values:
                     return _HumanPollResult("invalid_response")
             if value in terminal_values:
+                if value == "deny" and on_settled is not None:
+                    on_settled()
                 logger.info("[intaris] %s: %s", label, value)
                 note = result.data.get("user_note")
                 # Older servers may omit resolver identity. Explicit judge
@@ -1238,7 +1313,12 @@ def _poll_human(
 
 
 def _poll_escalation(
-    profile: ProfileRuntime, call_id: str, tool_name: str, invocation: Invocation
+    profile: ProfileRuntime,
+    call_id: str,
+    tool_name: str,
+    invocation: Invocation,
+    *,
+    on_settled: Callable[[], None] | None = None,
 ) -> _HumanPollResult:
     """Poll for escalation resolution within a Hermes human-wait window."""
     assert profile.client is not None
@@ -1249,6 +1329,7 @@ def _poll_escalation(
         lambda: client.get_audit(call_id),
         "user_decision",
         ("approve", "deny"),
+        on_settled=on_settled,
     )
 
 
@@ -1455,7 +1536,11 @@ def _make_guarded_handler(
             _guard_replacements.reset(token)
 
     def evaluate_and_dispatch(
-        args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
+        args: dict,
+        state: SessionState,
+        invocation: Invocation,
+        approval: _NativeApproval,
+        **kwargs: Any,
     ) -> Any:
 
         def finish_resolution(
@@ -1466,7 +1551,7 @@ def _make_guarded_handler(
                 return result
             return _with_approval_note(result, resolution, call_id)
 
-        def dispatch(
+        def dispatch_now(
             call_id: str = "", resolution: _HumanPollResult | None = None
         ) -> Any:
             invocation.check()
@@ -1485,6 +1570,8 @@ def _make_guarded_handler(
                             del state.pending_tool_results[i]
                             break
                 raise
+            # Handler entry owns execution even if native code raises.
+            approval.settle(call_id)
             if resolution is not None and _note_sink is not None:
                 # Capture only after final admission. The native dispatcher
                 # owns exception sanitization and invalid-result conversion.
@@ -1494,17 +1581,25 @@ def _make_guarded_handler(
                 return _with_approval_note(result, resolution, call_id)
             return result
 
+        def dispatch(
+            call_id: str = "", resolution: _HumanPollResult | None = None
+        ) -> Any:
+            if is_async or inspect.iscoroutinefunction(original_handler):
+
+                async def dispatch_async() -> Any:
+                    # Process task cancellation queued while synchronous HTTP was
+                    # being awaited. Recheck host cancellation/source at body entry.
+                    await asyncio.sleep(0)
+                    result = dispatch_now(call_id, resolution)
+                    return await result if inspect.isawaitable(result) else result
+
+                return dispatch_async()
+            return dispatch_now(call_id, resolution)
+
         # Evaluate the tool call
         intention_pending = state.intention_pending
-        client = profile.client
-        result = invocation.request(
-            lambda: client.evaluate(
-                state.intaris_session_id,
-                tool_name,
-                args,
-                intention_pending=intention_pending,
-            )
-        )
+        client = approval.client
+        result = approval.evaluate(tool_name, args, intention_pending=intention_pending)
 
         # Clear intention_pending after first evaluate
         if intention_pending:
@@ -1604,11 +1699,7 @@ def _make_guarded_handler(
                         "[intaris] Session reactivated — re-evaluating %s",
                         tool_name,
                     )
-                    re_result = invocation.request(
-                        lambda: client.evaluate(
-                            state.intaris_session_id, tool_name, args
-                        )
-                    )
+                    re_result = approval.evaluate(tool_name, args)
                     response_error = _decision_response_error(re_result)
                     if response_error:
                         return json.dumps(
@@ -1624,7 +1715,11 @@ def _make_guarded_handler(
                             )
                         )
                         poll_result = _poll_escalation(
-                            profile, re_call_id, tool_name, invocation
+                            profile,
+                            re_call_id,
+                            tool_name,
+                            invocation,
+                            on_settled=partial(approval.settle, re_call_id),
                         )
                         if poll_result.value == "invalid_response":
                             return json.dumps(
@@ -1634,6 +1729,13 @@ def _make_guarded_handler(
                             )
                         if poll_result.value == "approve":
                             return dispatch(re_call_id, poll_result)
+                        approval.settle(re_call_id)
+                        if poll_result.value == "expired":
+                            return json.dumps(
+                                {
+                                    "error": f"[intaris] APPROVAL EXPIRED ({re_call_id}). Tool was not executed; retry in a new invocation."
+                                }
+                            )
                         return finish_resolution(
                             json.dumps(
                                 {
@@ -1678,13 +1780,26 @@ def _make_guarded_handler(
                 call_id,
                 reasoning,
             )
-            poll_result = _poll_escalation(profile, call_id, tool_name, invocation)
+            poll_result = _poll_escalation(
+                profile,
+                call_id,
+                tool_name,
+                invocation,
+                on_settled=partial(approval.settle, call_id),
+            )
             if poll_result.value == "invalid_response":
                 return json.dumps(
                     {"error": f"[intaris] Invalid escalation response ({call_id})"}
                 )
             if poll_result.value == "approve":
                 return dispatch(call_id, poll_result)
+            approval.settle(call_id)
+            if poll_result.value == "expired":
+                return json.dumps(
+                    {
+                        "error": f"[intaris] APPROVAL EXPIRED ({call_id}). Tool was not executed; retry in a new invocation."
+                    }
+                )
             return finish_resolution(
                 json.dumps(
                     {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
@@ -1805,8 +1920,11 @@ def _make_guarded_handler(
                         )
 
         invocation = admission.invocation
+        approval: _NativeApproval | None = None
 
-        def release_admission() -> None:
+        def release_admission(reason: str = "abandoned") -> None:
+            if approval is not None:
+                approval.retire(reason)
             if admission_token is None:
                 return  # Only the outer call owns this lifetime.
             invocation.close()
@@ -1829,23 +1947,32 @@ def _make_guarded_handler(
             if replacement_target is not None:
                 result = invoke_composed(args, admission, **kwargs)
             else:
+                approval = _NativeApproval(
+                    profile.client, admission.state.intaris_session_id, invocation
+                )
                 result = evaluate_and_dispatch(
-                    args, admission.state, invocation, **kwargs
+                    args, admission.state, invocation, approval, **kwargs
                 )
         except BaseException as exc:
-            release_admission()
+            reason = exc.reason if isinstance(exc, WaitStopped) else "abandoned"
+            release_admission(reason)
             if isinstance(exc, WaitStopped):
                 return stopped_result(exc)
             raise
         if inspect.isawaitable(result):
 
             async def finish() -> Any:
+                reason = "abandoned"
                 try:
                     return await result
                 except WaitStopped as exc:
+                    reason = exc.reason
                     return stopped_result(exc)
+                except asyncio.CancelledError:
+                    reason = "cancelled"
+                    raise
                 finally:
-                    release_admission()
+                    release_admission(reason)
 
             return finish()
         release_admission()

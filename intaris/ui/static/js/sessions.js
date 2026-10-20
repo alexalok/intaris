@@ -45,6 +45,13 @@ function sessionsTab() {
         if (this.initialized) this.load();
       });
 
+      window.addEventListener('intaris:approval-refreshed', (e) => {
+        this.expandedAuditRecord = updateApprovalRecords(e.detail, this.sessionAudit, this.expandedAuditRecord);
+      });
+      window.addEventListener('intaris:ws-connected', () => {
+        if (this.expandedId) this.refreshAudit();
+      });
+
       // Subscribe to WebSocket events for live session updates
       window.addEventListener('intaris:ws-message', (e) => {
         this._handleWsEvent(e.detail);
@@ -76,6 +83,7 @@ function sessionsTab() {
     },
 
     _handleWsEvent(data) {
+      this.expandedAuditRecord = updateApprovalRecords(data, this.sessionAudit, this.expandedAuditRecord);
       if (data.type === 'session_created') {
         // Add new session to list if on page 1 and matching filter
         if (this.page === 1 && (!this.statusFilter || this.statusFilter === 'active')) {
@@ -483,7 +491,7 @@ function sessionsTab() {
             agent_summaries: [],
           })),
         ]);
-        this.sessionAudit = audit.items || [];
+        this.sessionAudit = (audit.items || []).map(mergeApprovalExpiration);
         this.auditTotal = audit.total || 0;
         // Attach summaries to session for template access
         const intarisSummaries = (summaries.intaris_summaries || []).map(s => ({
@@ -592,7 +600,7 @@ function sessionsTab() {
       }
       this.expandedAuditId = record.call_id;
       try {
-        this.expandedAuditRecord = await IntarisAPI.getAuditRecord(record.call_id);
+        this.expandedAuditRecord = mergeApprovalExpiration(await IntarisAPI.getAuditRecord(record.call_id));
       } catch (e) {
         this.expandedAuditRecord = record;
       }
@@ -604,10 +612,15 @@ function sessionsTab() {
     async resolveEscalation(callId, decision) {
       if (!callId || !decision) return;
       if (this.resolvingAudit[callId]) return;
+      const records = [...this.sessionAudit, this.expandedAuditRecord];
+      const expired = () => isApprovalExpired({ call_id: callId })
+        || records.some(r => r?.call_id === callId && isApprovalExpired(r));
+      if (expired()) return;
       this.resolvingAudit = { ...this.resolvingAudit, [callId]: true };
       try {
         const note = this.auditNoteText[callId] || null;
         await IntarisAPI.resolveDecision(callId, decision, note);
+        if (expired()) return;
         Alpine.store('notify').success(
           `Call ${decision === 'approve' ? 'approved' : 'denied'}`
         );
@@ -629,21 +642,31 @@ function sessionsTab() {
       } finally {
         const { [callId]: _, ...rest } = this.resolvingAudit;
         this.resolvingAudit = rest;
+        Alpine.store('nav').refreshPendingApprovals();
+        await Alpine.store('nav').refreshApprovalRecord(callId);
       }
     },
 
     async loadMoreAudit() {
       if (!this.expandedId) return;
       this.auditLimit += 10;
+      await this.refreshAudit();
+    },
+
+    async refreshAudit() {
+      const sessionId = this.expandedId;
+      if (!sessionId) return;
       try {
         const audit = await IntarisAPI.listAudit({
-          session_id: this.expandedId,
+          session_id: sessionId,
           limit: this.auditLimit,
         });
-        this.sessionAudit = audit.items || [];
+        if (this.expandedId !== sessionId) return;
+        this.sessionAudit = (audit.items || []).map(mergeApprovalExpiration);
         this.auditTotal = audit.total || 0;
+        await Alpine.store('nav').refreshApprovalRecord(this.expandedAuditId);
       } catch (e) {
-        Alpine.store('notify').error('Failed to load more evaluations: ' + e.message);
+        Alpine.store('notify').error('Failed to load evaluations: ' + e.message);
       }
     },
 

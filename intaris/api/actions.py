@@ -238,6 +238,16 @@ async def action_get(request: Request) -> HTMLResponse:
         store = AuditStore(_get_db())
         record = store.get_by_call_id(payload.call_id, user_id=payload.user_id)
         tool = record.get("tool") or "unknown"
+        if record.get("expired_at"):
+            return HTMLResponse(
+                content=_RESULT_HTML.format(
+                    title="Expired",
+                    color="#94a3b8",
+                    message="This invocation is no longer waiting for approval.",
+                    ui_url=escape(ui_url),
+                ),
+                status_code=410,
+            )
         # Check if already resolved
         if record.get("user_decision"):
             return HTMLResponse(

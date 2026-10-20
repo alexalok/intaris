@@ -1,6 +1,6 @@
 /**
  * Approvals tab — pending escalations awaiting user decision,
- * plus resolved approvals history with pagination.
+ * plus closed approvals history (resolved or expired) with pagination.
  *
  * Uses the shared WebSocket store ($store.ws) for real-time updates
  * with 10s polling fallback when WebSocket is disconnected.
@@ -45,6 +45,8 @@ function approvalsTab() {
     _loadDenialsDebounce: null,
     recentlyResolved: new Map(),  // call_id -> timestamp
     _tabActive: false,
+    _pendingRequest: 0,
+    _historyRequest: 0,
 
     init() {
       window.addEventListener('intaris:tab-changed', (e) => {
@@ -87,6 +89,30 @@ function approvalsTab() {
         clearTimeout(this._loadDenialsDebounce);
       });
 
+      window.addEventListener('intaris:ws-connected', () => {
+        this.stopPolling();
+        if (this._tabActive) {
+          this.load();
+          this.loadDenials();
+          this.loadResolved();
+        }
+      });
+      window.addEventListener('intaris:ws-disconnected', () => {
+        if (this._tabActive) this.startPolling();
+      });
+
+      window.addEventListener('intaris:approval-refreshed', (e) => {
+        const data = e.detail;
+        const records = [...this.pending, ...this.denials, ...this.resolved];
+        this.expandedResolvedRecord = updateApprovalRecords(data, records, this.expandedResolvedRecord);
+        this.expandedDenialRecord = updateApprovalRecords(data, [], this.expandedDenialRecord);
+        const before = this.pending.length;
+        this.pending = this._filterResolved(this.pending);
+        this.total = Math.max(0, this.total - (before - this.pending.length));
+        this.denials = this._filterResolved(this.denials);
+        this.denialsTotal = this.denials.length;
+      });
+
       // Subscribe to shared WebSocket events
       window.addEventListener('intaris:ws-message', (e) => {
         if (this._tabActive) {
@@ -102,21 +128,20 @@ function approvalsTab() {
         this._scheduleLoad();
       } else if (data.type === 'evaluated' && data.decision === 'deny') {
         this._scheduleLoadDenials();
-      } else if (data.type === 'decided') {
-        // Another user (or this user via resolve/override) resolved an item
+      } else if (data.type === 'decided' || data.type === 'expired') {
         const callId = data.call_id;
         if (callId) {
-          if (data.decision === 'deny') {
-            // Denial override — remove from denials list
-            this.denials = this.denials.filter(d => d.call_id !== callId);
-            this.denialsTotal = this.denials.length;
-          } else {
-            // Escalation resolution — remove from pending list
-            this._markResolved(callId);
-            this.pending = this.pending.filter(p => p.call_id !== callId);
-            this.total = this.pending.length;
-          }
-          // Refresh resolved list to show the newly resolved item
+          const records = [...this.pending, ...this.denials, ...this.resolved];
+          this.expandedResolvedRecord = updateApprovalRecords(data, records, this.expandedResolvedRecord);
+          this.expandedDenialRecord = updateApprovalRecords(data, [], this.expandedDenialRecord);
+          this._markResolved(callId);
+          const removed = this.pending.filter(p => p.call_id === callId).length;
+          this.pending = this.pending.filter(p => p.call_id !== callId);
+          this.total = Math.max(0, this.total - removed);
+          this.denials = this.denials.filter(d => d.call_id !== callId);
+          this.denialsTotal = this.denials.length;
+          this._scheduleLoad();
+          this._scheduleLoadDenials();
           this.loadResolved();
         }
       }
@@ -129,6 +154,7 @@ function approvalsTab() {
       this.pollTimer = setInterval(() => {
         this.load();
         this.loadDenials();
+        this.loadResolved();
       }, POLL_INTERVAL_MS);
     },
 
@@ -156,6 +182,8 @@ function approvalsTab() {
     },
 
     async load() {
+      const request = ++this._pendingRequest;
+      Alpine.store('nav').refreshPendingApprovals();
       this.loading = !this.initialized;
       try {
         const params = {
@@ -166,10 +194,10 @@ function approvalsTab() {
         const agentFilter = Alpine.store('nav').selectedAgent;
         if (agentFilter) params.agent_id = agentFilter;
         const result = await IntarisAPI.listAudit(params);
-        this.pending = this._filterResolved(result.items || []);
-        this.total = this.pending.length;
-        // Sync with global nav store for badge
-        Alpine.store('nav').pendingApprovals = result.total || this.total;
+        if (request !== this._pendingRequest) return;
+        const items = (result.items || []).map(mergeApprovalExpiration);
+        this.pending = this._filterResolved(items);
+        this.total = Math.max(0, (result.total ?? items.length) - (items.length - this.pending.length));
       } catch (e) {
         Alpine.store('notify').error('Failed to load approvals: ' + e.message);
       } finally {
@@ -178,6 +206,7 @@ function approvalsTab() {
     },
 
     async loadResolved() {
+      const request = ++this._historyRequest;
       this.resolvedLoading = true;
       try {
         const params = {
@@ -189,9 +218,14 @@ function approvalsTab() {
         const agentFilter = Alpine.store('nav').selectedAgent;
         if (agentFilter) params.agent_id = agentFilter;
         const result = await IntarisAPI.listAudit(params);
-        this.resolved = result.items || [];
+        if (request !== this._historyRequest) return;
+        this.resolved = (result.items || []).map(mergeApprovalExpiration);
         this.resolvedTotal = result.total;
         this.resolvedPages = result.pages;
+        const expanded = this.resolved.find(r => r.call_id === this.expandedResolvedId);
+        if (expanded) {
+          this.expandedResolvedRecord = { ...this.expandedResolvedRecord, ...expanded };
+        }
       } catch (e) {
         Alpine.store('notify').error('Failed to load resolved approvals: ' + e.message);
       } finally {
@@ -213,7 +247,7 @@ function approvalsTab() {
         const result = await IntarisAPI.listAudit(params);
         // Filter out session-status denials (evaluation_path='fast')
         // which cannot benefit from the denial override retry mechanism.
-        const items = (result.items || []).filter(
+        const items = this._filterResolved((result.items || []).map(mergeApprovalExpiration)).filter(
           item => item.evaluation_path !== 'fast'
         );
         this.denials = items;
@@ -253,7 +287,15 @@ function approvalsTab() {
           this.recentlyResolved.delete(id);
         }
       }
-      return items.filter(item => !this.recentlyResolved.has(item.call_id));
+      return items.filter(item => !isApprovalExpired(item)
+        && !item.user_decision && !this.recentlyResolved.has(item.call_id));
+    },
+
+    _isExpiredCall(callId) {
+      return isApprovalExpired({ call_id: callId })
+        || [...this.pending, ...this.denials, ...this.resolved,
+          this.expandedResolvedRecord, this.expandedDenialRecord]
+          .some(r => r?.call_id === callId && isApprovalExpired(r));
     },
 
     // ── User actions ─────────────────────────────────────────
@@ -266,11 +308,12 @@ function approvalsTab() {
      */
     async _resolveOrOverride(callId, decision, isOverride) {
       if (!callId || !decision) return;
-      if (this.resolving[callId]) return;
+      if (this.resolving[callId] || this._isExpiredCall(callId)) return;
       this.resolving = { ...this.resolving, [callId]: true };
       try {
         const note = this.noteText[callId] || null;
         await IntarisAPI.resolveDecision(callId, decision, note);
+        if (this._isExpiredCall(callId)) return;
         if (isOverride) {
           Alpine.store('notify').success(
             `Judge decision overridden to ${decision}`
@@ -287,8 +330,6 @@ function approvalsTab() {
           this.total = this.pending.length;
         }
         delete this.noteText[callId];
-        // Refresh resolved list to show the updated item
-        this.loadResolved();
       } catch (e) {
         const action = isOverride ? 'override' : 'resolve';
         console.error(`[intaris] ${action} failed:`, e);
@@ -296,6 +337,10 @@ function approvalsTab() {
       } finally {
         const { [callId]: _, ...rest } = this.resolving;
         this.resolving = rest;
+        await Alpine.store('nav').refreshApprovalRecord(callId);
+        this.load();
+        this.loadDenials();
+        this.loadResolved();
       }
     },
 
@@ -309,11 +354,12 @@ function approvalsTab() {
 
     async overrideDenial(callId, decision) {
       if (!callId || !decision) return;
-      if (this.resolving[callId]) return;
+      if (this.resolving[callId] || this._isExpiredCall(callId)) return;
       this.resolving = { ...this.resolving, [callId]: true };
       try {
         const note = this.noteText[callId] || null;
         await IntarisAPI.resolveDecision(callId, decision, note);
+        if (this._isExpiredCall(callId)) return;
         Alpine.store('notify').success(
           decision === 'approve'
             ? 'Denial overridden — retry will be approved'
@@ -328,6 +374,10 @@ function approvalsTab() {
       } finally {
         const { [callId]: _, ...rest } = this.resolving;
         this.resolving = rest;
+        await Alpine.store('nav').refreshApprovalRecord(callId);
+        this.load();
+        this.loadDenials();
+        this.loadResolved();
       }
     },
 
@@ -349,7 +399,7 @@ function approvalsTab() {
       this.expandedDenialId = item.call_id;
       this.expandedDenialArgs = null;
       try {
-        this.expandedDenialRecord = await IntarisAPI.getAuditRecord(item.call_id);
+        this.expandedDenialRecord = mergeApprovalExpiration(await IntarisAPI.getAuditRecord(item.call_id));
       } catch (e) {
         this.expandedDenialRecord = item;
       }
@@ -365,7 +415,7 @@ function approvalsTab() {
       this.expandedResolvedId = item.call_id;
       this.expandedResolvedArgs = null;
       try {
-        this.expandedResolvedRecord = await IntarisAPI.getAuditRecord(item.call_id);
+        this.expandedResolvedRecord = mergeApprovalExpiration(await IntarisAPI.getAuditRecord(item.call_id));
       } catch (e) {
         this.expandedResolvedRecord = item;
       }

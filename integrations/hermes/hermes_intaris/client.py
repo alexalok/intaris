@@ -9,13 +9,71 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Best-effort cleanup must not park Hermes workers or grow an unbounded queue.
+_expiration_pending: deque[tuple[str, Callable[[], None]]] = deque()
+_expiration_lock = threading.Lock()
+_expiration_workers = 0
+
+
+def _deliver_expirations() -> None:
+    """Drain queued reports, retiring idle workers without an enqueue/exit race."""
+    global _expiration_workers
+    while True:
+        with _expiration_lock:
+            if not _expiration_pending:
+                _expiration_workers -= 1
+                return
+            call_id, deliver = _expiration_pending.popleft()
+        try:
+            deliver()
+        except BaseException:
+            # A detached worker cannot propagate to an invocation; keep draining.
+            logger.exception(
+                "[intaris] Approval expiration not confirmed for %s", call_id
+            )
+
+
+def _queue_expiration(call_id: str, deliver: Callable[[], None]) -> None:
+    """Queue normal parallel batches while bounding memory and HTTP concurrency."""
+    global _expiration_workers
+    with _expiration_lock:
+        if len(_expiration_pending) >= 128:
+            logger.warning(
+                "[intaris] Approval expiration not confirmed for %s: cleanup queue capacity exhausted",
+                call_id,
+            )
+            return
+        _expiration_pending.append((call_id, deliver))
+        if _expiration_workers >= 4:
+            return
+        _expiration_workers += 1
+        try:
+            threading.Thread(
+                target=_deliver_expirations, name="intaris-expire", daemon=True
+            ).start()
+        except Exception:
+            _expiration_workers -= 1
+            if not _expiration_workers:
+                _expiration_pending.pop()
+                logger.exception(
+                    "[intaris] Approval expiration not confirmed for %s: worker could not start",
+                    call_id,
+                )
+            else:
+                logger.exception(
+                    "[intaris] Could not start extra expiration worker; report remains queued"
+                )
 
 
 def _reject_json_constant(value: str) -> None:
@@ -272,6 +330,63 @@ class IntarisClient:
             timeout_s=5.0,
             agent_id=agent_id,
         )
+
+    def report_expiration(self, call_id: str, session_id: str, reason: str) -> None:
+        """Best-effort retirement of an undispatched native escalation.
+
+        Capture this client and identity, even across profile unload/replacement.
+        Up to 128 reports wait behind four daemon workers. Each delivery gets
+        three attempts with a two-second socket timeout. No delivery outcome
+        authorizes execution; queued work is not durable across process exit.
+        """
+
+        def deliver() -> None:
+            try:
+                path = f"/api/v1/audit/{urllib.parse.quote(call_id, safe='')}/expire"
+                body = {"session_id": session_id, "reason": reason}
+                result = ApiResult(error="no attempts")
+                for attempt in range(3):
+                    if attempt:
+                        threading.Event().wait(0.25 * attempt)
+                    result = self.call_api("POST", path, body, timeout_s=2.0)
+                    if result.data is not None:
+                        data = result.data
+                        expired_at = data.get("expired_at")
+                        if (
+                            data.get("call_id") == call_id
+                            and data.get("session_id") == session_id
+                            and isinstance(expired_at, str)
+                            and expired_at.strip()
+                            and data.get("expiration_reason")
+                            in ("timeout", "cancelled", "abandoned")
+                        ):
+                            return
+                        result = ApiResult(
+                            error="invalid expiration acknowledgment",
+                            protocol_error=True,
+                        )
+                    if result.status == 404:
+                        logger.warning(
+                            "[intaris] Approval expiration not confirmed for %s: HTTP 404; "
+                            "server compatibility limitation (endpoint unsupported or audit unavailable)",
+                            call_id,
+                        )
+                        return
+                    if result.protocol_error or (
+                        result.status is not None and 400 <= result.status < 500
+                    ):
+                        break
+                logger.warning(
+                    "[intaris] Approval expiration not confirmed for %s: %s",
+                    call_id,
+                    result.error or "server unreachable",
+                )
+            except Exception:
+                logger.exception(
+                    "[intaris] Approval expiration not confirmed for %s", call_id
+                )
+
+        _queue_expiration(call_id, deliver)
 
     def submit_agent_summary(
         self,

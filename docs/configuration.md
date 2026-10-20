@@ -64,12 +64,57 @@ The adapter uses `INTARIS_API_KEY=replace-agent-key` in its **own** environment 
 Validation and enforcement:
 
 - `INTARIS_AGENT_API_KEYS` is a JSON object of nonempty ASCII keys without whitespace to nonempty fixed user IDs without surrounding whitespace or glob characters (`*`, `?`, `[`, `]`). Values are never coerced. Duplicate JSON keys, malformed JSON, and overlap with `INTARIS_API_KEY` or `INTARIS_API_KEYS` fail startup. An absent or empty mapping disables the role.
-- `INTARIS_AGENT_POLICY` must be an explicit JSON object when agent keys are present. Unknown fields, duplicate JSON keys (including nested ones), and invalid types fail startup. Supported fields are the string arrays `allow_tools`, `deny_tools`, `allow_commands`, `deny_commands`, `allow_paths`, `deny_paths`; `allow_policies`/`deny_policies` arrays of strings or objects; and optional `maximum_outcome`, which may only be `"deny"` (or null/omitted). Here `deny` preserves the full severity of the evaluator's decision; it does not deny every call. `judge` and `interaction_mode` overrides are unsupported: the operator controls `JUDGE_MODE`.
+- `INTARIS_AGENT_POLICY` must be an explicit JSON object when agent keys are present. Unknown fields, duplicate JSON keys (including nested ones), and invalid types fail startup. Supported fields are the string arrays `allow_tools`, `deny_tools`, `allow_commands`, `deny_commands`, `allow_scripts`, `allow_paths`, `deny_paths`; `allow_policies`/`deny_policies` arrays of strings or objects; and optional `maximum_outcome`, which may only be `"deny"` (or null/omitted). Here `deny` preserves the full severity of the evaluator's decision; it does not deny every call. `judge` and `interaction_mode` overrides are unsupported: the operator controls `JUDGE_MODE`.
 - `allow_tools` is an explicit, trusted native-tool list. Do not include `terminal` or `bash`, or broad shell command patterns. The example deliberately leaves `allow_commands` unset so shell calls use the conservative classifier. An explicit `allow_tools` match returns READ before the ordinary project-boundary check, including for paths outside `working_directory`. With `deny_paths: []`, access by those trusted readonly tools is bounded by the agent process's OS permissions, not by the project directory. Keep sensitive service files inaccessible to that OS user. When `working_directory` is supplied, explicit `deny_paths` rules are checked before tool allows and retain precedence. Ordinary built-in readonly classification still checks the project boundary when no explicit allow rule applies.
 - The fixed tenant cannot be overridden by `X-User-Id`, `X-Agent-Id`, or role headers. If a request includes a restricted key in any supported credential carrier, it remains restricted even with an admin SSO cookie. Conflicting restricted tenants are rejected. Agent credentials cannot exchange themselves for admin cookies or use WebSocket/MCP surfaces.
 - Agent session creation ignores client-supplied policy and stores the server policy plus a durable, server-only `agent_restricted` flag. Evaluating an existing same-tenant session with an agent key permanently sets this flag, including sessions created by an admin. Every later evaluation and Judge review uses the current server policy independently of the stored session policy and caller role. Removing the policy from configuration makes restricted-session evaluation fail closed. A restart or PATCH cannot remove the flag.
 - Agent PATCH permits `details` and the legacy ignored `intention` field only. Policy, parent, and security-field edits are forbidden. Status PATCH permits `active`, `idle`, and `completed` only while the current status is one of those values. Its database update is conditional, so an agent cannot clear a concurrent human suspension/termination. Human admin keys retain the full lifecycle controls.
 - Client `maximum_outcome`, `judge`, and unattended-mode policy cannot weaken mandatory enforcement. Restricted sessions never reuse cached Judge approvals or learned directory-prefix approvals. They do not train the path-prefix cache, including when an earlier admin inference finishes after agent adoption. Human approval applies to the exact tool and arguments on retry, not to other reads in the same directory. A human admin can still approve the exact call through `/decision`, and normal human approval polling/retry remains supported.
+
+### Exact Python script allowances
+
+Add `allow_scripts` to the existing `INTARIS_AGENT_POLICY` to fast-approve a
+trusted Python utility without allowing arbitrary terminal commands:
+
+```json
+{
+  "allow_scripts": [
+    "/home/hermes/.hermes/skills/research/grounded-citations/scripts/sources.py"
+  ]
+}
+```
+
+Merge this field into the existing policy, preserving its deny rules. The server
+loads environment configuration at startup; changing the environment file takes
+effect after an operator restarts Intaris. Restricted agents cannot add or change
+this allowance through session policy updates.
+
+Entries must be normalized absolute POSIX paths, without glob patterns. A matching
+`bash` or `terminal` command must invoke literal `python` or `python3` followed
+immediately by that exact script path. Quotes and escapes for literal arguments
+are supported, including quoted URLs containing `&`. Interpreter options, wrappers,
+relative or alternative script paths, shell chaining, substitutions, expansions,
+redirections, comments, and control characters require normal evaluation instead.
+For example, `python /absolute/script.py list && other-command` does not qualify.
+
+This is explicit trust in the script and **all its arguments**, including paths
+passed to `--ledger` or `--replace-in`. It does not limit operations to a citation
+cache, hash files, resolve symlinks, or validate imports and interpreter lookup.
+The operator must trust the script contents and runtime, including future edits.
+Explicit deny rules and session lifecycle restrictions still take precedence;
+script path checks retain quoted operands, option-shaped filenames (including
+after `--`), and attached option values. Arguments are conservatively treated as
+possible paths. With path denies configured, ambiguous attached short options
+require normal evaluation, and relative operands require a known working
+directory for fast approval.
+Ambiguous double-slash or tilde paths, including double slashes inherited from
+the working directory, and double-quoted dollar/backtick escapes also fall
+through to normal evaluation.
+Existing broader allow rules continue to apply independently. Matches use the
+existing `READ`/`fast` approval category and are audited as an explicitly allowed
+Python script, rather than being described as read-only operations.
+
+### Restricted agent routes
 
 Only these agent routes are enabled; all other methods and paths return 403:
 
@@ -107,7 +152,9 @@ No model or timeout defaults change with this opt-in role. Size the adapter HTTP
 | `LLM_TIMEOUT_MS` | `4000` | Timeout for LLM calls in milliseconds. Must be under the 5-second circuit breaker. Minimum: 500ms. |
 | `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
-| `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
+| `JEV_MODEL` | `jev-1.13.0` | Decision model; OpenRouter: `typesafe/jev-1.13-20260917` or `cloudflare/clef`. |
+| `JEV_OPENROUTER_PROVIDERS` | (unset) | Comma-separated OpenRouter provider slugs. Sets `provider.only` and disables provider fallback. Required for CLEF; use one slug for a strict pin. |
+| `JEV_MAX_INPUT_BYTES` | `0` | Maximum compact UTF-8 JSON bytes of complete state and questions; `0` disables the limit for Jev. CLEF requires a positive budget. Oversized tool calls and alignments escalate without a provider request. This is a byte budget, not a token count. |
 | `JEV_TIMEOUT_MS` | `4000` | Jev timeout in milliseconds. Minimum: 500ms. |
 | `JEV_MINIMUM_CONFIDENCE` | `0.6` | Minimum confidence for each Jev classification dimension. Lower-confidence tool calls and alignments escalate. |
 | `JEV_DECISION_QUESTION` | `true` | Keep the third Jev disposition question; set `false` only for the experimental two-axis benchmark, where Intaris derives disposition from alignment and risk. |
@@ -129,6 +176,9 @@ does not silently switch models. Jev's returned probabilities are converted
 into concise audit text and are not represented as model-generated reasoning.
 It is opt-in and **not the recommended production default**; see the
 [Jev evaluator assessment](jev-evaluator.md) for benchmark results and caveats.
+The same adapter supports `cloudflare/clef` through OpenRouter. See the
+[CLEF integration and context probe](clef-evaluator.md) for required provider
+pinning, input budgets, and measured results.
 
 Example split configuration:
 
