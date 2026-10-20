@@ -706,6 +706,48 @@ def test_origin_transport_does_not_use_background_mapping(harness):
         assert h.server.ops("open")[0]["origin"]["chat_id"] == "-100"
 
 
+@pytest.mark.parametrize("configured", [None, "1"])
+@pytest.mark.parametrize("returned", [None, 1])
+def test_general_topic_aliases_bind_and_resolve_same_fallback_message(
+    harness, monkeypatch, configured, returned
+):
+    h = harness
+    h.server.open_reply["route"]["thread_id"] = configured
+    send = h.app.bot.send_message
+
+    async def general_send(**kwargs):
+        message = await send(**kwargs)
+        message.message_thread_id = returned
+        return message
+
+    monkeypatch.setattr(h.app.bot, "send_message", general_send)
+    with pending(h, "cron-session"):
+        until(lambda: actionable(h))
+        assert h.app.bot.sends[0]["message_thread_id"] is None
+        assert h.server.ops("bind")[0]["thread_id"] == configured
+        click(h, message__message_thread_id=42).result(3)
+        assert not h.server.ops("resolve")
+        click(h, message__message_thread_id=returned).result(3)
+        assert h.server.ops("resolve")[0]["thread_id"] == configured
+
+
+def test_general_fallback_rejects_delivery_in_different_topic(harness, monkeypatch):
+    h = harness
+    h.server.open_reply["route"]["thread_id"] = None
+    send = h.app.bot.send_message
+
+    async def wrong_topic(**kwargs):
+        message = await send(**kwargs)
+        message.message_thread_id = 42
+        return message
+
+    monkeypatch.setattr(h.app.bot, "send_message", wrong_topic)
+    with pending(h, "cron-session"):
+        until(lambda: h.server.ops("close"))
+        assert not h.server.ops("bind")
+        assert not actionable(h)
+
+
 def test_cancellation_during_transport_lookup_does_not_open_lease(harness):
     h = harness
     h.server.transport_gate = threading.Event()

@@ -131,6 +131,12 @@ def _thread(value: Any) -> str | None:
     return None if value is None else _identifier(value)
 
 
+def _same_thread(actual: Any, expected: str | None) -> bool:
+    actual = _thread(actual)
+    # Telegram represents General with either no thread ID or ID 1.
+    return actual == expected or actual in (None, "1") and expected in (None, "1")
+
+
 def _approval_route(route: dict[str, Any]) -> dict[str, Any]:
     actors = frozenset(_identifier(actor) for actor in route["actor_ids"])
     if not actors or not isinstance(route["actor_ids"], list):
@@ -617,7 +623,9 @@ class NativeApprovals:
             try:
                 return await prompt.binding.bot.send_message(
                     chat_id=route["chat_id"],
-                    message_thread_id=int(thread_id) if thread_id is not None else None,
+                    message_thread_id=(
+                        None if thread_id in (None, "1") else int(thread_id)
+                    ),
                     text=prompt.text,
                     parse_mode=None,
                     reply_markup=None,
@@ -685,11 +693,9 @@ class NativeApprovals:
                 thread_id = prompt.route["thread_id"]
                 with self._lock:
                     prompt.message_id = _identifier(message.message_id)
-                    matches = (
-                        _identifier(message.chat.id, signed=True)
-                        == prompt.route["chat_id"]
-                        and _thread(message.message_thread_id) == thread_id
-                    )
+                    matches = _identifier(message.chat.id, signed=True) == prompt.route[
+                        "chat_id"
+                    ] and _same_thread(message.message_thread_id, thread_id)
                     live = self._live(prompt)
                 if not matches:
                     raise ValueError("Telegram delivered to a different route")
@@ -831,8 +837,9 @@ class NativeApprovals:
                     and message.from_user.id == bot.id
                     and _identifier(message.chat.id, signed=True)
                     == candidate.route["chat_id"]
-                    and _thread(message.message_thread_id)
-                    == candidate.route["thread_id"]
+                    and _same_thread(
+                        message.message_thread_id, candidate.route["thread_id"]
+                    )
                     and _identifier(message.message_id) == candidate.message_id
                     and actor in candidate.route["actor_ids"]
                 ):
