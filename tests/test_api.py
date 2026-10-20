@@ -2334,6 +2334,7 @@ class TestEvaluate:
         data = resp.json()
         assert data["decision"] == "approve"
         assert data["path"] == "fast"
+        assert not data.get("requires_expiration")
 
     def test_evaluate_includes_opt_in_jev_diagnostics(
         self, client_no_auth, monkeypatch
@@ -2429,7 +2430,9 @@ class TestEvaluate:
 
     def test_evaluate_waits_for_judge_auto_approve(self, client_no_auth, monkeypatch):
         """Judge-enabled escalations return final approval inline."""
+        from intaris.audit import AuditStore
         from intaris.judge import JudgeEffectiveOutcome
+        from intaris.server import _get_db
 
         headers = {"X-User-Id": "user-judge-approve"}
         _create_session(client_no_auth, "sess-judge-approve", headers)
@@ -2444,11 +2447,19 @@ class TestEvaluate:
             is_enabled = True
 
             async def review_for_evaluate(self, **kwargs):
+                record = AuditStore(_get_db()).resolve_escalation(
+                    result["call_id"],
+                    "approve",
+                    user_id="user-judge-approve",
+                    resolved_by="judge",
+                    judge_decision="approve",
+                    judge_risk="low",
+                )
                 return JudgeEffectiveOutcome(
                     decision="approve",
                     reasoning="Judge approved",
                     risk="low",
-                    record={"call_id": result["call_id"]},
+                    record=record,
                     latency_ms=7,
                 )
 
@@ -2473,6 +2484,23 @@ class TestEvaluate:
         assert data["decision"] == "approve"
         assert data["reasoning"] == "Judge approved"
         assert data["risk"] == "low"
+        assert data["requires_expiration"] is True
+        store = AuditStore(_get_db())
+        assert store.approvals_are_usable(
+            {data["call_id"]}, user_id="user-judge-approve"
+        )
+        expired = client_no_auth.post(
+            f"/api/v1/audit/{data['call_id']}/expire",
+            json={"session_id": "sess-judge-approve", "reason": "cancelled"},
+            headers=headers,
+        )
+        assert expired.status_code == 200
+        assert expired.json()["decision"] == "escalate"
+        assert expired.json()["user_decision"] == "approve"
+        assert expired.json()["expired_at"]
+        assert not store.approvals_are_usable(
+            {data["call_id"]}, user_id="user-judge-approve"
+        )
 
     def test_evaluate_waits_for_judge_auto_deny(self, client_no_auth, monkeypatch):
         """Judge-enabled escalations return final denial inline."""
@@ -2520,6 +2548,7 @@ class TestEvaluate:
         assert data["decision"] == "deny"
         assert data["reasoning"] == "Judge denied"
         assert data["risk"] == "high"
+        assert not data.get("requires_expiration")
 
     def test_evaluate_advisory_defer_returns_escalate_once(
         self, client_no_auth, monkeypatch

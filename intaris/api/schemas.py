@@ -54,6 +54,14 @@ class EvaluateResponse(BaseModel):
     """Response from tool call evaluation."""
 
     call_id: str = Field(..., description="Unique call identifier")
+    requires_expiration: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description=(
+            "The call owns an escalation that the originating client must expire "
+            "if it abandons the invocation before dispatch, including inline approvals."
+        ),
+    )
     raw_decision: str | None = Field(None, exclude_if=lambda value: value is None)
     effective_decision: str | None = Field(None, exclude_if=lambda value: value is None)
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = Field(

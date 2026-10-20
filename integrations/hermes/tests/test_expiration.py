@@ -29,6 +29,7 @@ class Transport:
     def __init__(self, *, block="poll", evaluation="escalate", poll=None):
         self.block = block
         self.evaluation = evaluation
+        self.evaluation_fields = {}
         self.poll = {"user_decision": "approve"} if poll is None else poll
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -104,6 +105,7 @@ class Transport:
                     "escalate" if self.evaluation == "suspended" else self.evaluation
                 )
                 data = {"decision": decision, "call_id": f"c{number}"}
+                data.update(self.evaluation_fields)
         elif path.startswith("/api/v1/audit/"):
             point, data = "poll", self.poll
         elif path == "/api/v1/mcp/tools":
@@ -301,11 +303,23 @@ def test_cancel_after_approved_poll_before_dispatch_retires_approval(
     assert_retired(boundary, "cancelled")
 
 
-@pytest.mark.parametrize("decision", ["approve", "deny", "escalate"])
+@pytest.mark.parametrize(
+    "decision,requires_expiration,retire",
+    [
+        ("approve", None, False),
+        ("deny", None, False),
+        ("escalate", None, True),
+        ("approve", True, True),
+        ("approve", "true", False),
+        ("deny", True, False),
+    ],
+)
 def test_late_evaluate_only_retires_known_escalation_with_captured_client(
-    adapter, host, monkeypatch, boundary, decision
+    adapter, host, monkeypatch, boundary, decision, requires_expiration, retire
 ):
     boundary.block, boundary.evaluation = "evaluate", decision
+    if requires_expiration is not None:
+        boundary.evaluation_fields["requires_expiration"] = requires_expiration
     original_client = IntarisClient(
         "http://original.test", "original-key", "original-user", "original-agent"
     )
@@ -318,7 +332,7 @@ def test_late_evaluate_only_retires_known_escalation_with_captured_client(
         adapter.profile.client = IntarisClient("http://replacement.test", "other-key")
         boundary.release.set()
         assert boundary.exited.wait(1)
-        if decision == "escalate":
+        if retire:
             req = assert_retired(boundary, "cancelled")
             assert req["url"].startswith("http://original.test/")
             assert req["headers"]["Authorization"] == "Bearer original-key"
@@ -327,7 +341,7 @@ def test_late_evaluate_only_retires_known_escalation_with_captured_client(
     drain_cleanup()
     assert not adapter.calls
     assert len(boundary.evaluations) == 1
-    if decision != "escalate":
+    if not retire:
         assert not boundary.expirations
 
 
@@ -538,10 +552,14 @@ def test_dispatched_handler_failure_is_not_reported_as_abandoned(adapter, bounda
 
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("callable_object", [False, True])
+@pytest.mark.parametrize("inline_approval", [False, True])
 def test_async_dispatch_rechecks_lifetime_before_entering_handler(
-    adapter, boundary, cancel, callable_object
+    adapter, boundary, cancel, callable_object, inline_approval
 ):
     boundary.block = "never"
+    if inline_approval:
+        boundary.evaluation = "approve"
+        boundary.evaluation_fields["requires_expiration"] = True
 
     async def original(*args, **kwargs):
         adapter.calls.append("entered")
@@ -607,10 +625,14 @@ def test_async_cancellation_after_handler_entry_keeps_native_semantics(
     assert not boundary.expirations
 
 
+@pytest.mark.parametrize("inline_approval", [False, True])
 def test_async_task_cancel_requested_during_approval_prevents_body_entry(
-    adapter, boundary, monkeypatch
+    adapter, boundary, monkeypatch, inline_approval
 ):
     boundary.block = "never"
+    if inline_approval:
+        boundary.evaluation = "approve"
+        boundary.evaluation_fields["requires_expiration"] = True
 
     async def original(*args, **kwargs):
         adapter.calls.append("entered")
@@ -622,7 +644,11 @@ def test_async_task_cancel_requested_during_approval_prevents_body_entry(
 
         def request(req, timeout):
             response = boundary(req, timeout)
-            if req.method == "GET" and "/audit/" in req.full_url:
+            if (inline_approval and req.full_url.endswith("/evaluate")) or (
+                not inline_approval
+                and req.method == "GET"
+                and "/audit/" in req.full_url
+            ):
                 loop.call_soon_threadsafe(task.cancel)
             return response
 
@@ -637,3 +663,15 @@ def test_async_task_cancel_requested_during_approval_prevents_body_entry(
     asyncio.run(run())
     assert not adapter.calls
     assert_retired(boundary, "cancelled")
+
+
+@pytest.mark.parametrize("call_id", [None, "", " "])
+def test_inline_approval_without_retirement_id_blocks_dispatch(
+    adapter, boundary, call_id
+):
+    boundary.block, boundary.evaluation = "never", "approve"
+    boundary.evaluation_fields = {"requires_expiration": True, "call_id": call_id}
+    result = json.loads(adapter.handler({}, session_id="session-A"))
+    assert "Invalid" in result["error"]
+    assert not adapter.calls
+    assert not boundary.expirations

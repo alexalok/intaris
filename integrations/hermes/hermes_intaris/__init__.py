@@ -1164,7 +1164,9 @@ def _decision_response_error(result: ApiResult) -> str | None:
         return (
             "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
         )
-    if decision == "escalate":
+    if decision == "escalate" or (
+        decision == "approve" and result.data.get("requires_expiration") is True
+    ):
         call_id = result.data.get("call_id")
         if not isinstance(call_id, str) or not call_id.strip():
             return "Invalid API response: escalation requires a non-empty call_id"
@@ -1188,7 +1190,10 @@ class _NativeApproval:
         if result.protocol_error or not isinstance(result.data, dict):
             return None
         data = result.data
-        if data.get("decision") != "escalate":
+        if data.get("decision") != "escalate" and not (
+            data.get("decision") == "approve"
+            and data.get("requires_expiration") is True
+        ):
             return None
         if isinstance(data.get("expired_at"), str) and data["expired_at"].strip():
             return None

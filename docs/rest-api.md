@@ -50,6 +50,7 @@ When judge auto-resolution is enabled and the first-pass evaluator escalates, th
 | Field | Type | Description |
 |---|---|---|
 | `call_id` | string | Unique identifier for this evaluation |
+| `requires_expiration` | boolean | When `true`, this call owns an escalation that must be expired if the originating client abandons it before dispatch, including inline judge/human approvals. Omitted for direct approvals and final denials. |
 | `decision` | string | `approve`, `deny`, or `escalate` |
 | `reasoning` | string | Explanation of the decision |
 | `risk` | string | `low`, `medium`, `high`, or `critical` |

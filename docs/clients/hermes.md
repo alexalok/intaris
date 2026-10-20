@@ -105,7 +105,11 @@ the audit retains human/judge decision history. Polling gives `expired_at`
 precedence over that history and returns a distinct **APPROVAL EXPIRED** error,
 never permission to dispatch. A late evaluation reply after cancellation is also
 retired if it identifies an escalation, using the original client and session.
-Cleanup never sends another evaluation or execution request.
+Inline judge/human approvals retain this lifecycle through the server's
+`requires_expiration: true` response field. Such approvals require a nonempty
+`call_id` and remain tracked until dispatch; direct approvals and final denials
+are not retired. Older servers without the field cannot identify inline approvals
+for cleanup. Cleanup never sends another evaluation or execution request.
 
 Reporting is best effort and nonblocking: up to 128 reports queue behind four
 daemon workers. Each report gets at most three delivery attempts, a two-second
