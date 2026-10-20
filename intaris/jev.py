@@ -426,7 +426,7 @@ class JevClient:
         if self._openrouter_providers:
             payload["provider"] = {
                 "only": self._openrouter_providers,
-                "allow_fallbacks": False,
+                "allow_fallbacks": len(self._openrouter_providers) > 1,
             }
         response = self._client.post(self._request_path, json=payload)
         response.raise_for_status()
