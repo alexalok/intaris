@@ -107,7 +107,9 @@ No model or timeout defaults change with this opt-in role. Size the adapter HTTP
 | `LLM_TIMEOUT_MS` | `4000` | Timeout for LLM calls in milliseconds. Must be under the 5-second circuit breaker. Minimum: 500ms. |
 | `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
-| `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
+| `JEV_MODEL` | `jev-1.13.0` | Decision model; OpenRouter: `typesafe/jev-1.13-20260917` or `cloudflare/clef`. |
+| `JEV_OPENROUTER_PROVIDERS` | (unset) | Comma-separated OpenRouter provider slugs. Sets `provider.only` and disables provider fallback. Required for CLEF; use one slug for a strict pin. |
+| `JEV_MAX_INPUT_BYTES` | `0` | Maximum compact UTF-8 JSON bytes of complete state and questions; `0` disables the limit for Jev. CLEF requires a positive budget. Oversized tool calls and alignments escalate without a provider request. This is a byte budget, not a token count. |
 | `JEV_TIMEOUT_MS` | `4000` | Jev timeout in milliseconds. Minimum: 500ms. |
 | `JEV_MINIMUM_CONFIDENCE` | `0.6` | Minimum confidence for each Jev classification dimension. Lower-confidence tool calls and alignments escalate. |
 | `JEV_DECISION_QUESTION` | `true` | Keep the third Jev disposition question; set `false` only for the experimental two-axis benchmark, where Intaris derives disposition from alignment and risk. |
@@ -129,6 +131,9 @@ does not silently switch models. Jev's returned probabilities are converted
 into concise audit text and are not represented as model-generated reasoning.
 It is opt-in and **not the recommended production default**; see the
 [Jev evaluator assessment](jev-evaluator.md) for benchmark results and caveats.
+The same adapter supports `cloudflare/clef` through OpenRouter. See the
+[CLEF integration and context probe](clef-evaluator.md) for required provider
+pinning, input budgets, and measured results.
 
 Example split configuration:
 
