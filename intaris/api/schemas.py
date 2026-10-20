@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Literal  # noqa: TC003
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from intaris.script_policy import is_literal_script_path
 
 # ── Evaluate ──────────────────────────────────────────────────────────
 
@@ -118,6 +120,10 @@ class SessionPolicy(BaseModel):
     allow_commands: list[str] | None = Field(
         None, description="Glob patterns for bash commands to auto-allow"
     )
+    allow_scripts: list[str] | None = Field(
+        None,
+        description="Exact absolute Python script paths to trust with literal arguments",
+    )
     deny_commands: list[str] | None = Field(
         None, description="Glob patterns for bash commands to auto-deny"
     )
@@ -143,6 +149,17 @@ class SessionPolicy(BaseModel):
     )
 
     model_config = {"extra": "ignore"}
+
+    @field_validator("allow_scripts")
+    @classmethod
+    def _validate_script_paths(cls, paths: list[str] | None) -> list[str] | None:
+        if paths is not None and any(
+            not is_literal_script_path(path) for path in paths
+        ):
+            raise ValueError(
+                "allow_scripts requires normalized absolute paths without glob patterns"
+            )
+        return paths
 
 
 class IntentionRequest(BaseModel):
