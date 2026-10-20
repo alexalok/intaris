@@ -145,6 +145,60 @@ def test_two_profiles_cannot_share_same_tenant_agent_binding():
         parse_config(raw)
 
 
+def test_shared_fallback_transport_keeps_runtime_profile_policy():
+    from intaris.notifications.hermes_peer import parse_config
+
+    raw = config()
+    profiles = raw["gateways"][0]["profiles"]
+    profiles["/home/hermes/research"] = {
+        "user_id": "owner",
+        "agent_id": "research",
+        "approver_ids": ["43"],
+        "fallback_chat_id": "-888",
+        "fallback_transport_profile": "/home/hermes/.hermes",
+    }
+    parsed = parse_config(raw)["gateways"][0]["profiles"]["/home/hermes/research"]
+    assert parsed == profiles["/home/hermes/research"]
+
+
+@pytest.mark.parametrize(
+    "target", [None, True, "default", "/home/../hermes", "/unknown"]
+)
+def test_invalid_fallback_transport_profile_rejected(target):
+    from intaris.notifications.hermes_peer import parse_config
+
+    raw = config()
+    raw["gateways"][0]["profiles"]["/home/hermes/.hermes"][
+        "fallback_transport_profile"
+    ] = target
+    with pytest.raises(ValueError):
+        parse_config(raw)
+
+
+def test_fallback_transport_cannot_reference_another_gateway():
+    from intaris.notifications.hermes_peer import parse_config
+
+    raw = config()
+    raw["gateways"][0]["profiles"]["/home/hermes/.hermes"][
+        "fallback_transport_profile"
+    ] = "/home/other"
+    raw["gateways"].append(
+        {
+            "uid": 12346,
+            "pid_file": "/run/intaris/other.pid",
+            "profiles": {
+                "/home/other": {
+                    "user_id": "other",
+                    "agent_id": "other",
+                    "approver_ids": ["44"],
+                }
+            },
+        }
+    )
+    with pytest.raises(ValueError):
+        parse_config(raw)
+
+
 def test_global_fallback_inherited_without_merging_topics_between_chats():
     from intaris.notifications.hermes_peer import parse_config
 
@@ -227,6 +281,15 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
         return json.loads(writer.output)
 
     async def exercise():
+        transport_request = {
+            "op": "fallback_transport",
+            "fallback_transport_profile": "/attacker-controlled",
+        }
+        assert not (await request(101, transport_request))["ok"]
+        assert await request(100, transport_request) == {
+            "ok": True,
+            "transport_profile": "/home/hermes/.hermes",
+        }
         body = {
             "op": "open",
             "session_id": "s",

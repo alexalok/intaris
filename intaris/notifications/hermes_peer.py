@@ -81,6 +81,7 @@ def parse_config(raw: dict) -> dict:
                     "approver_ids",
                     "fallback_chat_id",
                     "fallback_thread_id",
+                    "fallback_transport_profile",
                 }:
                     raise ValueError("Invalid profile policy")
                 for key in ("user_id", "agent_id"):
@@ -100,6 +101,12 @@ def parse_config(raw: dict) -> dict:
                 if not isinstance(actors, list) or not actors:
                     raise ValueError("Explicit Telegram approvers required")
                 policy = dict(policy)
+                if "fallback_transport_profile" in policy:
+                    transport_home = _absolute(policy["fallback_transport_profile"])
+                    if transport_home not in gateway["profiles"]:
+                        raise ValueError(
+                            "Fallback transport must belong to the same gateway"
+                        )
                 # An explicit chat override starts a new destination: never
                 # carry a topic belonging to the global fallback into it.
                 if "fallback_chat_id" not in policy:

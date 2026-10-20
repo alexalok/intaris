@@ -242,6 +242,18 @@ class HermesApprovalBridge:
 
     async def _handle(self, policy: dict, profile: str, request: dict) -> dict:
         op = request["op"]
+        if op == "fallback_transport":
+            # The socket has authenticated the gateway and runtime profile.
+            # Return only its operator-selected transport, never request hints
+            # or another profile's tenant/agent/approver policy. No lease yet.
+            return {
+                "ok": True,
+                "transport_profile": (
+                    policy.get("fallback_transport_profile", profile)
+                    if policy.get("fallback_chat_id")
+                    else None
+                ),
+            }
         if op == "open":
             record = self._record(policy, request)
             with self._db.cursor() as cur:

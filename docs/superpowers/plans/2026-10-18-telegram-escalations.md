@@ -46,3 +46,27 @@ Concurrent calls in one topic; shared bot across runtime profiles; stale callbac
 - Verification is local. Linux peer authentication uses mocked kernel
   credentials in tests; live Linux/Telegram delivery remains untested.
 - No deployment, service restart, or real Telegram message was performed.
+
+## Shared-bot background fallback follow-up (2026-10-20)
+
+The user approved explicitly mapping runtime profiles to an existing shared bot
+for background approvals. `fallback_transport_profile` now names an absolute
+bot-owning profile home in the same attested gateway. The authenticated socket
+returns this operator policy before native transport selection; missing or
+ambiguous bindings leave the bounded UI wait. Runtime tenant, agent, destination,
+approvers, and callback ownership remain scoped to the requesting profile.
+Correlated Telegram sessions keep their receiving transport. Separate-process
+cron workers still require a worker-to-gateway relay and remain out of this
+mapping change's scope.
+
+- Reproduced missing shared-bot prompts before the fix, then verified mapped cron
+  and webhook sessions and their callbacks, mapping precedence, invalid/foreign
+  mappings, ambiguous/missing bots, origin preservation, and cancellation during
+  lookup.
+- Full verification: 2,687 server tests passed (68 external E2E cases deselected)
+  and 810 Hermes adapter tests passed against the same pinned host revision.
+  The first server run used a `DATA_DIR` without `.intaris`, failing
+  `TestConfigDefaults.test_db_defaults`; correcting that test environment made
+  the complete rerun pass. No product change was needed for that failure.
+- Ruff and diff checks passed; a fresh independent review found no actionable
+  issues. Live deployment and Telegram delivery remain untested.

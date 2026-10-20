@@ -425,9 +425,18 @@ class NativeApprovals:
                         origin = None
                     return candidates[0], origin
                 return candidates[0], None
-        # Only the operator service can choose a fallback destination. A native
-        # application still needs an exact profile owner; never pick a session.
-        candidates = [b for b in bindings if b.home == self.home]
+        # Background work may have no Telegram session/transport. The isolated
+        # operator service explicitly selects the bot-owning profile; never
+        # infer it from another session, a unique bot, or plugin configuration.
+        response = self._rpc("fallback_transport")
+        home = response.get("transport_profile")
+        if (
+            response.get("ok") is not True
+            or not isinstance(home, str)
+            or not _valid_socket_path(home)
+        ):
+            raise _Unroutable("Fallback transport policy unavailable")
+        candidates = [b for b in bindings if b.home == home]
         if len(candidates) != 1:
             raise _Unroutable("Fallback transport ambiguous or unavailable")
         self._retain_transport(candidates[0])
@@ -473,7 +482,9 @@ class NativeApprovals:
                 enabled = self.enabled and not self._disposed
             if enabled:
                 try:
-                    binding, origin = self._route(session_id)
+                    binding, origin = invocation.request(
+                        lambda: self._route(session_id)
+                    )
                     remaining = invocation.remaining_seconds
                     if not math.isfinite(remaining) or remaining <= 0:
                         raise WaitStopped("APPROVAL WAIT TIMEOUT (native approval)")

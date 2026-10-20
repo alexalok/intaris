@@ -101,6 +101,37 @@ def decide(bridge, lease, **extra):
     return run(bridge, **fields)
 
 
+@pytest.mark.parametrize("mapped", [False, True])
+def test_fallback_transport_comes_only_from_operator_policy(bridge, mapped):
+    if mapped:
+        bridge.profile["fallback_transport_profile"] = "/profiles/shared"
+    result = run(
+        bridge,
+        op="fallback_transport",
+        fallback_transport_profile="/profiles/attacker",
+    )
+    assert result == {
+        "ok": True,
+        "transport_profile": "/profiles/shared" if mapped else "/profiles/a",
+    }
+    with bridge.db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS count FROM hermes_approval_leases")
+        assert cur.fetchone()["count"] == 0
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        is None
+    )
+
+
+def test_disabled_fallback_does_not_offer_a_transport(bridge):
+    bridge.profile["fallback_transport_profile"] = "/profiles/shared"
+    bridge.profile["fallback_chat_id"] = None
+    assert run(bridge, op="fallback_transport") == {
+        "ok": True,
+        "transport_profile": None,
+    }
+
+
 def test_origin_preserves_topic_and_actor_and_deduplicates(bridge):
     origin = {"chat_id": "-123", "thread_id": "7", "user_id": "42"}
     lease = open_call(bridge, origin=origin)

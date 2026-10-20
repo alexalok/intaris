@@ -172,10 +172,24 @@ class Server:
         }
         self.fallback_gate = None
         self.fallback_started = threading.Event()
+        self.transport_profiles = {}
+        self.transport_ok = True
+        self.transport_gate = None
+        self.transport_started = threading.Event()
 
     def request(self, path, payload):
         self.requests.append(payload)
         op = payload["op"]
+        if op == "fallback_transport":
+            self.transport_started.set()
+            if self.transport_gate:
+                assert self.transport_gate.wait(3)
+            return {
+                "ok": self.transport_ok,
+                "transport_profile": self.transport_profiles.get(
+                    payload["profile"], payload["profile"]
+                ),
+            }
         if op == "open":
             self.open_started.set()
             if self.open_gate:
@@ -590,6 +604,135 @@ def test_shared_bot_routes_routed_profile_and_dispatches_its_callback(
             assert h.server.ops("resolve")[0]["profile"] == "/profiles/beta"
     finally:
         beta.dispose()
+
+
+@pytest.mark.parametrize("source", ["cron", "webhook"])
+def test_shared_fallback_transport_routes_background_profile_and_callback(
+    harness, source
+):
+    h = harness
+    beta = native_module().NativeApprovals("/profiles/beta", Context())
+    h.server.transport_profiles["/profiles/beta"] = "/profiles/alpha"
+    h.server.open_reply["route"]["actor_ids"] = ["8", "9"]
+    if source == "webhook":
+        h.source.platform.value = "webhook"
+    try:
+        with beta.pending(
+            "hermes-root" if source == "webhook" else "cron-session",
+            "audit-beta",
+            h.budget,
+            intaris_session_id="hm-beta",
+        ):
+            until(lambda: actionable(h))
+            assert h.server.ops("fallback_transport") == [
+                {"op": "fallback_transport", "profile": "/profiles/beta"}
+            ]
+            opened = h.server.ops("open")[0]
+            assert opened["profile"] == "/profiles/beta"
+            assert opened["session_id"] == "hm-beta"
+            assert opened["call_id"] == "audit-beta"
+            assert "origin" not in opened
+            click(h, actor="8").result(3)
+            assert h.server.ops("resolve")[0]["profile"] == "/profiles/beta"
+    finally:
+        beta.dispose()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unmapped", "missing", "ambiguous", "invalid", "disabled", "refused"]
+)
+def test_shared_fallback_does_not_guess_transport(harness, fault):
+    h = harness
+    beta = native_module().NativeApprovals("/profiles/beta", Context())
+    if fault == "missing":
+        h.server.transport_profiles["/profiles/beta"] = "/profiles/missing"
+    elif fault == "invalid":
+        h.server.transport_profiles["/profiles/beta"] = "alpha"
+    elif fault == "disabled":
+        h.server.transport_profiles["/profiles/beta"] = None
+    elif fault == "refused":
+        h.server.transport_profiles["/profiles/beta"] = "/profiles/alpha"
+        h.server.transport_ok = False
+    elif fault == "ambiguous":
+        h.server.transport_profiles["/profiles/beta"] = "/profiles/alpha"
+
+        async def install():
+            h.ctx.factories[0](Application(h.loop), object())
+
+        asyncio.run_coroutine_threadsafe(install(), h.loop).result(3)
+    try:
+        with beta.pending(
+            "cron-session", "audit-beta", h.budget, intaris_session_id="hm-beta"
+        ):
+            assert not h.server.ops("open")
+            assert not h.app.bot.sends
+    finally:
+        beta.dispose()
+
+
+def test_explicit_mapping_wins_over_runtime_profiles_own_bot(harness, monkeypatch):
+    h = harness
+    ctx = Context()
+    beta = native_module().NativeApprovals("/profiles/beta", ctx)
+    beta_app = Application(h.loop)
+    monkeypatch.setattr(native_module(), "_home", lambda: "/profiles/beta")
+
+    async def install():
+        ctx.factories[0](beta_app, object())
+
+    asyncio.run_coroutine_threadsafe(install(), h.loop).result(3)
+    h.server.transport_profiles["/profiles/beta"] = "/profiles/alpha"
+    try:
+        with beta.pending(
+            "cron-session", "audit-beta", h.budget, intaris_session_id="hm-beta"
+        ):
+            until(lambda: actionable(h))
+            assert len(h.app.bot.sends) == 1
+            assert not beta_app.bot.sends
+            # A later policy lookup must not move a live prompt or its callback.
+            h.server.transport_profiles["/profiles/beta"] = "/profiles/beta"
+            click(h).result(3)
+            assert h.server.ops("resolve")[0]["profile"] == "/profiles/beta"
+    finally:
+        beta.dispose()
+
+
+def test_origin_transport_does_not_use_background_mapping(harness):
+    h = harness
+    h.server.transport_profiles["/profiles/alpha"] = "/profiles/unavailable"
+    with pending(h):
+        until(lambda: actionable(h))
+        assert not h.server.ops("fallback_transport")
+        assert h.server.ops("open")[0]["origin"]["chat_id"] == "-100"
+
+
+def test_cancellation_during_transport_lookup_does_not_open_lease(harness):
+    h = harness
+    h.server.transport_gate = threading.Event()
+    done = threading.Event()
+    errors = []
+
+    def run():
+        try:
+            with pending(h, "cron-session"):
+                pass
+        except WaitStopped as exc:
+            errors.append(str(exc))
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert h.server.transport_started.wait(1)
+        h.budget.ended.set()
+        assert done.wait(1), "transport lookup must observe cancellation promptly"
+        assert errors and errors[0].startswith("CANCELLED")
+    finally:
+        h.server.transport_gate.set()
+        worker.join(3)
+    assert not h.server.ops("open")
+    assert not h.app.bot.sends
 
 
 def test_shared_transport_survives_unload_of_transport_profile(harness, monkeypatch):

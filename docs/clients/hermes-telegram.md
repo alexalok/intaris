@@ -74,6 +74,12 @@ object like this (replace all IDs, paths, and UID):
           "user_id": "operator",
           "agent_id": "hermes",
           "approver_ids": ["123456789"]
+        },
+        "/home/hermes/.hermes/profiles/research": {
+          "user_id": "operator",
+          "agent_id": "hermes-research",
+          "approver_ids": ["123456789"],
+          "fallback_transport_profile": "/home/hermes/.hermes"
         }
       }
     }
@@ -91,6 +97,23 @@ overriding the chat never inherits a topic from the global chat. An explicit
 profile `fallback_chat_id: null` disables its fallback. Omit both global fallback
 fields to disable fallback globally, or omit only `fallback_thread_id` for an
 ordinary fallback chat. The selected existing bot must have access to that chat.
+
+`fallback_transport_profile` selects the bot-owning profile for background work
+without a correlated Telegram session transport. Set it to that profile's
+absolute resolved Hermes home, listed under the **same gateway**. In the example,
+research webhook and in-process cron approvals use the default profile's existing
+Telegram bot and the global fallback chat/topic. The default profile must load
+the Intaris native handler on that bot. Every runtime profile retains its own
+tenant, agent, approvers, and fallback destination; only the bot connection is
+shared. The mapping is direct, not a chain through another profile's fallback.
+
+Omitting `fallback_transport_profile` keeps the runtime profile's own bot as the
+fallback transport. The gateway obtains this selection from the peer-authenticated
+Intaris socket, not Hermes plugin settings or tool arguments. A missing or
+ambiguous bot, disabled fallback, or failed lookup leaves the existing UI wait;
+the gateway never guesses another profile's bot. Correlated Telegram sessions
+keep their receiving bot, including a fallback after an unavailable origin topic.
+This mapping does not change ordinary cron/webhook result delivery settings.
 
 Create `/run/intaris-native` with Intaris ownership, dedicated gateway-access
 group, and mode `0750`. The Intaris service must use that group for the socket.
@@ -171,6 +194,10 @@ fails closed; existing leases expire rather than creating duplicate alerts.
 The initial integration targets the verified Hermes API contracts at commit
 `63d0b94120027d487c9a5235b9ec64b696af1b26`. It needs in-process native handler
 registration; Hermes isolated plugin hosts currently do not expose that API.
+Separate-process cron workers also cannot use the native bridge: the attestation
+authorizes only the gateway process, and workers have neither that peer identity
+nor its bot client. They retain the existing Intaris UI/notification path; an
+explicit fallback transport mapping does not supply a worker-to-gateway relay.
 The guarded native-tool path is supported. The optional Intaris MCP proxy keeps
 its existing manual escalation/retry behavior; it does not gain automatic remote
 tool replay through this feature.
