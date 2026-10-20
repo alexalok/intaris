@@ -276,7 +276,9 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
         )
         reader.feed_eof()
         writer = Writer(pid)
-        await server._accept(reader, writer)
+        task = server._accept(reader, writer)
+        if task is not None:
+            await task
         assert writer.closed
         return json.loads(writer.output)
 

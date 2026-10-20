@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ from intaris.notifications.hermes_bridge import HermesApprovalBridge, telegram_i
 
 logger = logging.getLogger(__name__)
 _LIMIT = 65536
+_MAX_CONNECTIONS = 32
 
 
 def _absolute(value: Any) -> str:
@@ -188,17 +191,23 @@ def process_start_time(pid: int) -> str:
     return data.rsplit(")", 1)[1].split()[19]
 
 
+def _is_gateway_process(gateway: dict, *, pid: int, uid: int) -> bool:
+    if gateway["uid"] != uid:
+        return False
+    try:
+        expected_pid, start = read_attestation(gateway["pid_file"], uid)
+        return expected_pid == pid and process_start_time(pid) == start
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def authorize_peer(cfg: dict, *, pid: int, uid: int, profile: str) -> dict:
     """Return exactly one operator policy for this kernel-authenticated peer."""
     for gateway in cfg["gateways"]:
-        if gateway["uid"] != uid or profile not in gateway["profiles"]:
-            continue
-        try:
-            expected_pid, start = read_attestation(gateway["pid_file"], uid)
-            if expected_pid == pid and process_start_time(pid) == start:
-                return gateway["profiles"][profile]
-        except (OSError, ValueError, IndexError):
-            pass
+        if profile in gateway["profiles"] and _is_gateway_process(
+            gateway, pid=pid, uid=uid
+        ):
+            return gateway["profiles"][profile]
     raise PermissionError("Gateway process/profile is not authorized")
 
 
@@ -212,6 +221,8 @@ class HermesApprovalSocket:
         self._sweeper: asyncio.Task | None = None
         self._connections: set[asyncio.Task] = set()
         self._socket_identity: tuple[int, int] | None = None
+        self._staged_path: Path | None = None
+        self._closing = False
 
     async def start(self) -> None:
         """Start without deleting a pre-existing socket or weakening permissions."""
@@ -224,13 +235,75 @@ class HermesApprovalSocket:
             raise RuntimeError(
                 "Native approval socket already exists; verify its owner before removal"
             )
-        self._server = await asyncio.start_unix_server(
-            self._accept, path=path, limit=_LIMIT
-        )
-        os.chmod(path, 0o660)
-        info = path.stat()
-        self._socket_identity = (info.st_dev, info.st_ino)
-        self._sweeper = asyncio.create_task(self._sweep())
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._closing = False
+        try:
+            # Do not publish the configured path until metadata and permissions
+            # are known. Even a failed first lstat cannot strand that path.
+            # A short sibling name fits Linux sockaddr_un with the 100-byte
+            # configured-path limit. bind never removes an existing entry.
+            # Finite, stable slots also bound debris if metadata cannot be read.
+            # Unidentified entries are never removed or reused automatically.
+            name = hashlib.sha256(os.fsencode(path)).hexdigest()[:6]
+            for slot in range(4):
+                staged = path.with_name(f".{name}{slot}")
+                try:
+                    listener.bind(str(staged))
+                    break
+                except OSError as exc:
+                    if exc.errno != errno.EADDRINUSE:
+                        raise
+            else:
+                raise OSError(
+                    errno.EADDRINUSE,
+                    "Native socket staging paths occupied; verify owners before removal",
+                )
+            self._staged_path = staged
+            info = staged.lstat()
+            self._socket_identity = (info.st_dev, info.st_ino)
+            os.chmod(staged, 0o660)
+            # A hard link publishes the same inode without replacing a path
+            # created by another listener after the initial existence check.
+            os.link(staged, path, follow_symlinks=False)
+            # Passing a socket avoids asyncio's implicit stale-path deletion.
+            self._server = await asyncio.start_unix_server(
+                self._accept,
+                sock=listener,
+                limit=_LIMIT,
+                backlog=_MAX_CONNECTIONS,
+                start_serving=False,
+            )
+            self._unlink_owned_socket(staged)
+            self._staged_path = None
+            await self._server.start_serving()
+            self._sweeper = asyncio.create_task(self._sweep())
+        except BaseException:
+            listener.close()
+            if self._staged_path and self._socket_identity is None:
+                # Without an inode identity, unlinking could delete a foreign
+                # replacement. No configured public socket is left behind.
+                logger.warning(
+                    "Cannot identify unpublished native socket %s; leaving it untouched",
+                    self._staged_path,
+                )
+            try:
+                await self.close()
+            except Exception:
+                logger.exception("Native approval startup cleanup failed")
+            raise
+
+    def _unlink_owned_socket(self, path: Path) -> None:
+        if self._socket_identity is None:
+            return
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISSOCK(info.st_mode)
+            and (info.st_dev, info.st_ino) == self._socket_identity
+        ):
+            path.unlink()
 
     async def _sweep(self) -> None:
         while True:
@@ -240,16 +313,51 @@ class HermesApprovalSocket:
                 logger.exception("Native approval expiry sweep failed")
             await asyncio.sleep(1)
 
-    async def _accept(
+    def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        task = asyncio.current_task()
-        self._connections.add(task)
+    ) -> asyncio.Task | None:
+        # Admission is synchronous: pending callbacks cannot reserve unlimited
+        # tasks before the first handler runs, and no untrusted peer waits for
+        # a newline. The listener backlog bounds each event-loop accept batch.
         try:
+            if self._closing or len(self._connections) >= _MAX_CONNECTIONS:
+                raise PermissionError("Native approval connection limit reached")
             sock = writer.get_extra_info("socket")
             pid, uid, _gid = struct.unpack(
                 "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             )
+            if not any(
+                _is_gateway_process(gateway, pid=pid, uid=uid)
+                for gateway in self._config["gateways"]
+            ):
+                raise PermissionError("Gateway process is not authorized")
+        except Exception:
+            with contextlib.suppress(Exception):
+                writer.write(
+                    b'{"ok":false,"error":"Native approval request refused"}\n'
+                )
+            writer.close()
+            return None
+        task = asyncio.create_task(self._handle(reader, writer, pid=pid, uid=uid))
+        self._connections.add(task)
+
+        def finished(task: asyncio.Task) -> None:
+            # Also runs if close() cancels a task before _handle starts.
+            writer.close()
+            self._connections.discard(task)
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _handle(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        pid: int,
+        uid: int,
+    ) -> None:
+        try:
             raw = await asyncio.wait_for(reader.readline(), timeout=2)
             if not raw.endswith(b"\n") or len(raw) > _LIMIT:
                 raise ValueError("Invalid frame")
@@ -266,30 +374,33 @@ class HermesApprovalSocket:
         except Exception:
             result = {"ok": False, "error": "Native approval request refused"}
         finally:
-            if not task.cancelled() and "result" in locals():
+            if "result" in locals():
                 with contextlib.suppress(Exception):
                     writer.write(json.dumps(result).encode() + b"\n")
                     await asyncio.wait_for(writer.drain(), timeout=2)
             writer.close()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(writer.wait_closed(), timeout=2)
-            self._connections.discard(task)
 
     async def close(self) -> None:
         """Close this listener and only unlink the socket inode it created."""
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        self._closing = True
+        server, self._server = self._server, None
+        if server:
+            server.close()
         if self._sweeper:
             self._sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper
+            self._sweeper = None
         for task in list(self._connections):
             task.cancel()
         if self._connections:
             await asyncio.gather(*self._connections, return_exceptions=True)
-        path = Path(self._config["socket_path"])
-        if self._socket_identity and path.exists():
-            info = path.stat()
-            if (info.st_dev, info.st_ino) == self._socket_identity:
-                path.unlink()
+        if server:
+            await server.wait_closed()
+        self._unlink_owned_socket(Path(self._config["socket_path"]))
+        if self._staged_path:
+            self._unlink_owned_socket(self._staged_path)
+            self._staged_path = None
+        self._socket_identity = None
