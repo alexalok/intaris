@@ -8,6 +8,87 @@
  * - ws: shared WebSocket connection for real-time updates
  */
 
+// ── Approval lifecycle helpers (shared across all audit views) ──────
+
+/** Read explicit server expiration; historical decisions are never rewritten. */
+function approvalExpiration(record) {
+  return Alpine.store('nav')?.approvalExpirations?.[record?.call_id]
+    || (record?.expired_at ? {
+      expired_at: record.expired_at,
+      expiration_reason: record.expiration_reason,
+    } : null);
+}
+
+function isApprovalExpired(record) {
+  return !!approvalExpiration(record);
+}
+
+/** Remember terminal state so an older REST response cannot restore actions. */
+function mergeApprovalExpiration(record) {
+  if (!record) return record;
+  const nav = Alpine.store('nav');
+  if (record.expired_at && record.call_id && !nav.approvalExpirations[record.call_id]) {
+    nav.approvalExpirations[record.call_id] = {
+      expired_at: record.expired_at,
+      expiration_reason: record.expiration_reason,
+    };
+  }
+  const expiration = approvalExpiration(record);
+  return expiration ? { ...record, ...expiration } : record;
+}
+
+function approvalStatusLabel(record) {
+  if (isApprovalExpired(record)) return 'Expired';
+  return record?.decision || '';
+}
+
+function approvalStatusClass(record) {
+  return 'badge badge-' + (isApprovalExpired(record)
+    ? 'low' : (record?.decision || 'low'));
+}
+
+function approvalExpirationReason(record) {
+  const reason = approvalExpiration(record)?.expiration_reason;
+  return { timeout: 'Timed out', cancelled: 'Cancelled', abandoned: 'Abandoned' }[reason]
+    || reason || 'Unknown reason';
+}
+
+function canResolveApproval(record) {
+  return record?.decision === 'escalate' && !record?.user_decision
+    && !isApprovalExpired(record);
+}
+
+/** Apply lifecycle events without treating expiration as a human resolution. */
+function updateApprovalRecords(data, records, expandedRecord) {
+  if (!data.call_id) return expandedRecord;
+  let updates;
+  if (data.type === 'expired' && data.expired_at) {
+    updates = { expired_at: data.expired_at, expiration_reason: data.expiration_reason };
+    mergeApprovalExpiration({ call_id: data.call_id, ...updates });
+  } else if (data.type === 'approval_refreshed' && data.record) {
+    updates = mergeApprovalExpiration(data.record);
+  } else if (data.type === 'decided') {
+    // A late decision is historical; refresh the row before changing its history.
+    if (isApprovalExpired({ call_id: data.call_id })) return expandedRecord;
+    updates = {
+      user_decision: data.user_decision,
+      effective_decision: data.user_decision,
+      user_note: data.user_note,
+      resolved_by: data.resolved_by,
+      ...(data.resolved_at ? { resolved_at: data.resolved_at } : {}),
+    };
+  } else {
+    return expandedRecord;
+  }
+  for (const record of records) {
+    if (record.source !== 'event' && record.call_id === data.call_id) {
+      Object.assign(record, updates, approvalExpiration(record));
+    }
+  }
+  return expandedRecord?.source !== 'event' && expandedRecord?.call_id === data.call_id
+    ? mergeApprovalExpiration({ ...expandedRecord, ...updates }) : expandedRecord;
+}
+
 // ── Risk score helpers (shared across all tabs) ──────────────────────
 // Maps numeric risk scores (1-10) to named bands and CSS classes.
 // Mirrors the Python risk_band() function in analyzer.py.
@@ -476,6 +557,12 @@ document.addEventListener('alpine:init', () => {
           : e.message || `Connection failed`;
       } finally {
         this.loading = false;
+        if (this.authenticated) {
+          window.dispatchEvent(new CustomEvent('intaris:user-changed', {
+            detail: { userId: this.selectedUser },
+          }));
+          Alpine.store('nav').handleDeepLink();
+        }
       }
     },
 
@@ -551,6 +638,41 @@ document.addEventListener('alpine:init', () => {
     selectedAgent: '',
     agents: [],
     pendingApprovals: 0,
+    approvalExpirations: {},
+    _pendingCountRequest: 0,
+    _approvalRecordRequests: {},
+    _approvalRecordSequence: 0,
+
+    async refreshApprovalRecord(callId) {
+      if (!callId) return;
+      const request = ++this._approvalRecordSequence;
+      this._approvalRecordRequests[callId] = request;
+      try {
+        const record = await IntarisAPI.getAuditRecord(callId);
+        if (this._approvalRecordRequests[callId] !== request) return;
+        const data = { type: 'approval_refreshed', call_id: callId, record: mergeApprovalExpiration(record) };
+        this.sessionModalAuditRecord = updateApprovalRecords(data, this.sessionModalAudit, this.sessionModalAuditRecord);
+        window.dispatchEvent(new CustomEvent('intaris:approval-refreshed', { detail: data }));
+      } catch (_) {
+        // Explicit expiration remains terminal even if the history refresh fails.
+      } finally {
+        if (this._approvalRecordRequests[callId] === request) delete this._approvalRecordRequests[callId];
+      }
+    },
+
+    async refreshPendingApprovals() {
+      const request = ++this._pendingCountRequest;
+      const params = { decision: 'escalate', resolved: false, limit: 1 };
+      if (this.selectedAgent) params.agent_id = this.selectedAgent;
+      try {
+        const result = await IntarisAPI.listAudit(params);
+        if (request === this._pendingCountRequest) {
+          this.pendingApprovals = result.total ?? 0;
+        }
+      } catch (_) {
+        // Keep the last known count until the next refresh/reconnect.
+      }
+    },
     deepLinkHandled: false,
 
     // Session modal state
@@ -636,7 +758,7 @@ document.addEventListener('alpine:init', () => {
           })),
         ]);
         this.sessionModal = { ...session, _detailsExpanded: false, _policyExpanded: false };
-        this.sessionModalAudit = audit.items || [];
+        this.sessionModalAudit = (audit.items || []).map(mergeApprovalExpiration);
         this.sessionModalChildren = children.items || [];
         // Parse summaries — same logic as sessions.js
         const intarisSummaries = (summaries.intaris_summaries || []).map(s => ({
@@ -661,6 +783,19 @@ document.addEventListener('alpine:init', () => {
         return;
       }
       this.sessionModalLoading = false;
+    },
+
+    async refreshSessionModalAudit() {
+      const sessionId = this.sessionModal?.session_id;
+      if (!sessionId) return;
+      try {
+        const audit = await IntarisAPI.listAudit({ session_id: sessionId, limit: 20 });
+        if (this.sessionModal?.session_id !== sessionId) return;
+        this.sessionModalAudit = (audit.items || []).map(mergeApprovalExpiration);
+        await this.refreshApprovalRecord(this.sessionModalAuditExpandedId);
+      } catch (_) {
+        // The next reconnect or modal open will retry.
+      }
     },
 
     closeSessionModal() {
@@ -718,7 +853,7 @@ document.addEventListener('alpine:init', () => {
       }
       this.sessionModalAuditExpandedId = record.call_id;
       try {
-        this.sessionModalAuditRecord = await IntarisAPI.getAuditRecord(record.call_id);
+        this.sessionModalAuditRecord = mergeApprovalExpiration(await IntarisAPI.getAuditRecord(record.call_id));
       } catch (e) {
         this.sessionModalAuditRecord = record;
       }
@@ -727,10 +862,15 @@ document.addEventListener('alpine:init', () => {
     async resolveModalEscalation(callId, decision) {
       if (!callId || !decision) return;
       if (this.sessionModalResolving[callId]) return;
+      const records = [...this.sessionModalAudit, this.sessionModalAuditRecord];
+      const expired = () => isApprovalExpired({ call_id: callId })
+        || records.some(r => r?.call_id === callId && isApprovalExpired(r));
+      if (expired()) return;
       this.sessionModalResolving = { ...this.sessionModalResolving, [callId]: true };
       try {
         const note = this.sessionModalNoteText[callId] || null;
         await IntarisAPI.resolveDecision(callId, decision, note);
+        if (expired()) return;
         Alpine.store('notify').success(
           `Call ${decision === 'approve' ? 'approved' : 'denied'}`
         );
@@ -747,6 +887,8 @@ document.addEventListener('alpine:init', () => {
       } finally {
         const { [callId]: _, ...rest } = this.sessionModalResolving;
         this.sessionModalResolving = rest;
+        this.refreshPendingApprovals();
+        await this.refreshApprovalRecord(callId);
       }
     },
 
@@ -814,12 +956,25 @@ document.addEventListener('alpine:init', () => {
           this.connected = true;
           this._reconnectAttempts = 0;
           this._reconnectDelay = 1000;
+          Alpine.store('nav').refreshPendingApprovals();
+          Alpine.store('nav').refreshSessionModalAudit();
+          window.dispatchEvent(new CustomEvent('intaris:ws-connected'));
         },
         onMessage: (data) => {
-          // Track pending approvals count globally
           const nav = Alpine.store('nav');
+          nav.sessionModalAuditRecord = updateApprovalRecords(
+            data, nav.sessionModalAudit, nav.sessionModalAuditRecord
+          );
+          if (data.type === 'expired' || data.type === 'decided') {
+            nav.refreshApprovalRecord(data.call_id);
+          }
+          // Reconcile with the server: expiry of an approved call, duplicate
+          // events and late decisions must not decrement unrelated approvals.
+          if (data.type === 'expired' || data.type === 'decided'
+              || (data.type === 'evaluated' && data.decision === 'escalate')) {
+            nav.refreshPendingApprovals();
+          }
           if (data.type === 'evaluated' && data.decision === 'escalate') {
-            nav.pendingApprovals = Math.max(0, (nav.pendingApprovals || 0) + 1);
             if (this.notifyOnEscalation) {
               this._showBrowserNotification({
                 title: `Approval needed${data.risk ? ` [${data.risk}]` : ''}`,
@@ -837,8 +992,6 @@ document.addEventListener('alpine:init', () => {
                 tab: 'sessions',
               });
             }
-          } else if (data.type === 'decided') {
-            nav.pendingApprovals = Math.max(0, (nav.pendingApprovals || 0) - 1);
           } else if (data.type === 'session_status_changed' && data.status === 'suspended') {
             if (this.notifyOnSuspend) {
               this._showBrowserNotification({
@@ -858,6 +1011,7 @@ document.addEventListener('alpine:init', () => {
         onClose: () => {
           this.connected = false;
           this.ws = null;
+          window.dispatchEvent(new CustomEvent('intaris:ws-disconnected'));
           this._scheduleReconnect();
         },
         onError: () => {
@@ -955,10 +1109,24 @@ document.addEventListener('alpine:init', () => {
 
   // Auto-connect/disconnect WebSocket based on auth state
   window.addEventListener('intaris:user-changed', () => {
+    const nav = Alpine.store('nav');
+    nav.approvalExpirations = {};
+    nav._approvalRecordRequests = {};
+    nav.pendingApprovals = 0;
+    nav._pendingCountRequest++;
+    nav.refreshPendingApprovals();
     Alpine.store('ws').disconnect();
     Alpine.store('ws').connect();
   });
+  window.addEventListener('intaris:agent-changed', () => {
+    Alpine.store('nav').refreshPendingApprovals();
+  });
   window.addEventListener('intaris:logout', () => {
+    const nav = Alpine.store('nav');
+    nav.approvalExpirations = {};
+    nav._approvalRecordRequests = {};
+    nav.pendingApprovals = 0;
+    nav._pendingCountRequest++;
     Alpine.store('ws').disconnect();
   });
 
@@ -970,11 +1138,7 @@ document.addEventListener('alpine:init', () => {
       Alpine.store('ws').connect();
       Alpine.store('nav').handleDeepLink();
       // Fetch initial pending approvals count
-      IntarisAPI.listAudit({ decision: 'escalate', resolved: false, limit: 1 })
-        .then(result => {
-          Alpine.store('nav').pendingApprovals = result.total || 0;
-        })
-        .catch(() => {});
+      Alpine.store('nav').refreshPendingApprovals();
     } else if (!auth.loading && !auth.authenticated) {
       clearInterval(_checkAuth);
     }

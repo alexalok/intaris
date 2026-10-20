@@ -85,14 +85,14 @@ def _apply_authoritative_user_precedent(
     args_redacted: dict[str, Any] | None,
     risk: str | None,
     user_decisions: list[dict[str, Any]],
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str | None]:
     """Apply final human precedent to low/medium-risk judge outputs."""
     if (risk or "").lower() not in ("low", "medium"):
-        return decision, confidence, reasoning
+        return decision, confidence, reasoning, None
 
     precedent = find_authoritative_precedent(tool, args_redacted or {}, user_decisions)
     if not precedent:
-        return decision, confidence, reasoning
+        return decision, confidence, reasoning, None
 
     note = str(precedent.get("user_note") or "").strip()
     prior_tool = str(precedent.get("tool") or "").strip()
@@ -104,7 +104,7 @@ def _apply_authoritative_user_precedent(
         updated_reasoning += f" Prior approved tool: {prior_tool}."
     if note:
         updated_reasoning += f' User note: "{note}".'
-    return "approve", "high", updated_reasoning
+    return "approve", "high", updated_reasoning, precedent.get("call_id")
 
 
 @dataclass(frozen=True)
@@ -257,6 +257,16 @@ def _effective_outcome_from_record(
     fallback_event_type: str | None = None,
 ) -> JudgeEffectiveOutcome:
     """Map a persisted audit row to the public/effective decision."""
+
+    if record.get("expired_at"):
+        return JudgeEffectiveOutcome(
+            decision="deny",
+            reasoning="Approval expired; the originating invocation was abandoned.",
+            risk=record.get("risk"),
+            record=record,
+            latency_ms=latency_ms,
+            notification_event_type=None,
+        )
 
     persisted_decision = str(record.get("user_decision") or "").strip().lower()
     if persisted_decision in {"approve", "deny"}:
@@ -812,7 +822,13 @@ def _build_judge_prompt(
 
             decision_label = record.get("decision", "?")
             user_decision = record.get("user_decision")
-            if decision_label == "escalate" and user_decision:
+            if record.get("expired_at") and user_decision != "deny":
+                decision_label = "expired"
+            elif record.get("approval_source_call_id") and user_decision == "approve":
+                # The source is represented separately as current human guidance.
+                # Never turn a dependent judge grant into independent permission.
+                decision_label = "derived judge approval; not independent permission"
+            elif decision_label == "escalate" and user_decision:
                 decision_label = f"escalate→user:{user_decision}"
                 user_note = record.get("user_note")
                 if user_note:
@@ -1083,6 +1099,7 @@ async def resolve_with_side_effects(
     judge_reasoning: str | None = None,
     judge_decision: str | None = None,
     judge_risk: str | None = None,
+    approval_source_call_id: str | None = None,
     audit_store: Any,
     evaluator: Any | None = None,
     intention_barrier: Any | None = None,
@@ -1116,6 +1133,7 @@ async def resolve_with_side_effects(
         judge_reasoning: Judge's reasoning (when resolved_by="judge").
         judge_decision: Historical judge recommendation.
         judge_risk: Historical judge risk assessment.
+        approval_source_call_id: Human source for a mechanically derived grant.
         audit_store: AuditStore instance.
         evaluator: Evaluator instance (for path learning).
         intention_barrier: IntentionBarrier for note-triggered scope refresh.
@@ -1159,6 +1177,7 @@ async def resolve_with_side_effects(
         judge_reasoning=judge_reasoning,
         judge_decision=judge_decision,
         judge_risk=judge_risk,
+        approval_source_call_id=approval_source_call_id,
     )
 
     # Look up the full record for downstream processing
@@ -1167,6 +1186,12 @@ async def resolve_with_side_effects(
         record = audit_store.get_by_call_id(call_id, user_id=user_id)
     except ValueError:
         pass
+
+    # Expiration can win immediately after the atomic decision. Keep the
+    # decision as history, but do not publish an actionable resolution or learn
+    # permissions from an invocation that the client has already abandoned.
+    if record is not None and record.get("expired_at"):
+        return record
 
     # Log and count judge overrides
     if is_judge_override:
@@ -1550,8 +1575,8 @@ class JudgeReviewer:
             logger.debug("Judge skipping non-tool_call record: %s", call_id)
             return
 
-        # Guard: already resolved (human beat judge)
-        if record.get("user_decision") is not None:
+        # Guard: the client retired this invocation or a human beat the judge.
+        if record.get("expired_at") or record.get("user_decision") is not None:
             logger.info(
                 "Judge skipping already-resolved call_id=%s (decision=%s)",
                 call_id,
@@ -1744,15 +1769,26 @@ class JudgeReviewer:
         reasoning = str(result.get("reasoning", "No reasoning provided"))
         judge_risk = _normalize_judge_risk(result.get("risk"), record.get("risk"))
         confidence = str(result.get("confidence", "low"))
+        approval_source_call_id = None
         if record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW:
-            decision, confidence, reasoning = _apply_authoritative_user_precedent(
-                decision=decision,
-                confidence=confidence,
-                reasoning=reasoning,
-                tool=record.get("tool", ""),
-                args_redacted=record.get("args_redacted") or {},
-                risk=judge_risk,
-                user_decisions=user_decisions,
+            # Do not apply a grant that expired while inference was running.
+            if user_decisions:
+                user_decisions = await asyncio.to_thread(
+                    self._audit.get_user_decisions,
+                    session_id,
+                    user_id=user_id,
+                    limit=5,
+                )
+            decision, confidence, reasoning, approval_source_call_id = (
+                _apply_authoritative_user_precedent(
+                    decision=decision,
+                    confidence=confidence,
+                    reasoning=reasoning,
+                    tool=record.get("tool", ""),
+                    args_redacted=record.get("args_redacted") or {},
+                    risk=judge_risk,
+                    user_decisions=user_decisions,
+                )
             )
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
@@ -1807,6 +1843,7 @@ class JudgeReviewer:
                 judge_reasoning=reasoning,
                 judge_decision=decision,
                 judge_risk=judge_risk,
+                approval_source_call_id=approval_source_call_id,
                 audit_store=self._audit,
                 evaluator=self._evaluator,
                 intention_barrier=self._intention_barrier,
@@ -1926,6 +1963,7 @@ class JudgeReviewer:
                     judge_reasoning=reasoning,
                     judge_decision=decision,
                     judge_risk=judge_risk,
+                    approval_source_call_id=approval_source_call_id,
                     audit_store=self._audit,
                     evaluator=self._evaluator,
                     intention_barrier=self._intention_barrier,
@@ -2034,6 +2072,14 @@ class JudgeReviewer:
                 ``"judge_error"`` for LLM failures.
         """
         if self._notification_dispatcher is None:
+            return
+
+        # A deferral or LLM failure may complete after the adapter timed out.
+        # Avoid sending an actionable notification for a retired invocation.
+        record = await asyncio.to_thread(
+            self._audit.get_by_call_id, call_id, user_id=user_id
+        )
+        if record.get("expired_at"):
             return
 
         from intaris.notifications.providers import Notification

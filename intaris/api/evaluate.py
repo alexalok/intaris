@@ -166,6 +166,9 @@ async def evaluate(
         judge_waited = False
 
         if result.get("decision") == "escalate":
+            # The public decision may become approve after inline review, but
+            # the originating invocation still owns this persisted escalation.
+            result["requires_expiration"] = True
             if (
                 judge_reviewer is not None
                 and judge_reviewer.is_enabled
@@ -188,6 +191,7 @@ async def evaluate(
                         "Unattended Judge review did not resolve the evaluation"
                     )
                 result["decision"] = outcome.decision
+                result["requires_expiration"] = outcome.decision != "deny"
                 if result.get("maximum_outcome") is not None:
                     result["effective_decision"] = outcome.decision
                     result["outcome_override"] = outcome.record.get("outcome_override")

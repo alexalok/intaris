@@ -13,7 +13,9 @@ from intaris.api.schemas import (
     AuditRecord,
     DecisionRequest,
     DecisionResponse,
+    ExpireApprovalRequest,
 )
+from intaris.audit import ApprovalExpiredError, ApprovalNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,51 @@ async def get_audit_record(
         )
 
 
+@router.post("/audit/{call_id}/expire", response_model=AuditRecord)
+async def expire_approval(
+    call_id: str,
+    request: ExpireApprovalRequest,
+    http_request: Request,
+    ctx: SessionContext = Depends(get_session_context),
+) -> AuditRecord:
+    """Record explicit abandonment, without treating it as a human denial.
+
+    Clients must only report calls they will no longer dispatch or retry.
+    This endpoint does not infer expiration from elapsed time or session state.
+    """
+    from intaris.audit import AuditStore
+    from intaris.server import _get_db
+
+    try:
+        record = await asyncio.to_thread(
+            AuditStore(_get_db()).expire_escalation,
+            call_id,
+            user_id=ctx.user_id,
+            session_id=request.session_id,
+            reason=request.reason,
+        )
+        event_bus = getattr(http_request.app.state, "event_bus", None)
+        if event_bus is not None:
+            event_bus.publish(
+                {
+                    "type": "expired",
+                    "user_id": ctx.user_id,
+                    "session_id": record["session_id"],
+                    "call_id": call_id,
+                    "expired_at": record["expired_at"],
+                    "expiration_reason": record["expiration_reason"],
+                }
+            )
+        return AuditRecord(**record)
+    except ApprovalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Error expiring approval")
+        raise HTTPException(status_code=500, detail="Internal error expiring approval")
+
+
 @router.post("/decision", response_model=DecisionResponse)
 async def resolve_decision(
     request: DecisionRequest,
@@ -145,6 +192,8 @@ async def resolve_decision(
         )
 
         return DecisionResponse(ok=True)
+    except ApprovalExpiredError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception:

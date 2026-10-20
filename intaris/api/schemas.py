@@ -56,6 +56,14 @@ class EvaluateResponse(BaseModel):
     """Response from tool call evaluation."""
 
     call_id: str = Field(..., description="Unique call identifier")
+    requires_expiration: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description=(
+            "The call owns an escalation that the originating client must expire "
+            "if it abandons the invocation before dispatch, including inline approvals."
+        ),
+    )
     raw_decision: str | None = Field(None, exclude_if=lambda value: value is None)
     effective_decision: str | None = Field(None, exclude_if=lambda value: value is None)
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = Field(
@@ -232,6 +240,13 @@ class SessionResponse(BaseModel):
 # ── Decision ──────────────────────────────────────────────────────────
 
 
+class ExpireApprovalRequest(BaseModel):
+    """The originating client reports that a guarded invocation was abandoned."""
+
+    session_id: str = Field(min_length=1)
+    reason: Literal["timeout", "cancelled", "abandoned"]
+
+
 class DecisionRequest(BaseModel):
     """Request to resolve an escalated tool call."""
 
@@ -289,6 +304,8 @@ class AuditRecord(BaseModel):
     injection_detected: bool = False
     user_decision: str | None = None
     user_note: str | None = None
+    expired_at: str | None = None
+    expiration_reason: str | None = None
     resolved_at: str | None = None
     resolved_by: str | None = None
     judge_reasoning: str | None = None

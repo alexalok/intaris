@@ -146,7 +146,26 @@ def scripted_http(monkeypatch, host):
             response.status = 200
             responses.append(response)
         transport = mock.Mock(side_effect=responses)
-        monkeypatch.setattr("urllib.request.urlopen", transport)
+
+        def request(req, **kwargs):
+            # Cleanup is independent from the scripted evaluation/poll sequence.
+            if req.full_url.endswith("/expire"):
+                body = json.loads(req.data)
+                response = io.BytesIO(
+                    json.dumps(
+                        {
+                            "call_id": req.full_url.split("/")[-2],
+                            "session_id": body["session_id"],
+                            "expired_at": "2026-10-18T10:00:00Z",
+                            "expiration_reason": body["reason"],
+                        }
+                    ).encode()
+                )
+                response.status = 200
+                return response
+            return transport(req, **kwargs)
+
+        monkeypatch.setattr("urllib.request.urlopen", request)
         return transport
 
     return script

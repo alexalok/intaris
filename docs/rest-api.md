@@ -50,6 +50,7 @@ When judge auto-resolution is enabled and the first-pass evaluator escalates, th
 | Field | Type | Description |
 |---|---|---|
 | `call_id` | string | Unique identifier for this evaluation |
+| `requires_expiration` | boolean | When `true`, this call owns an escalation that must be expired if the originating client abandons it before dispatch, including inline judge/human approvals. Omitted for direct approvals and final denials. |
 | `decision` | string | `approve`, `deny`, or `escalate` |
 | `reasoning` | string | Explanation of the decision |
 | `risk` | string | `low`, `medium`, `high`, or `critical` |
@@ -209,7 +210,7 @@ compatibility; the management UI requests the unified timeline.
 | `tool` | (all) | Filter by tool name |
 | `path` | (all) | Filter by evaluation path |
 | `record_type` | (all) | Filter by record type: `tool_call`, `reasoning`, `checkpoint`, `summary` |
-| `resolved` | (all) | Filter escalations: `true` (resolved), `false` (pending) |
+| `resolved` | (all) | Filter escalations: `true` (resolved or expired), `false` (pending) |
 | `event_type` | (all) | Event-only filter: `tool_call` or `tool_result` |
 | `event_source` | (all) | Event-only filter for the recording source, for example `cognis` |
 | `from` | (all) | Inclusive ISO 8601 lower timestamp bound |
@@ -266,6 +267,57 @@ Important: `audit_log.decision` is the raw evaluator output, not necessarily the
 ### GET /audit/{call_id}
 
 Get a single audit record by call ID.
+
+### POST /audit/{call_id}/expire
+
+The originating client reports that it has abandoned a guarded invocation and
+will not execute or retry it. This endpoint requires the normal tenant identity
+and is available to restricted agent credentials. It does not grant approval.
+
+```json
+{"session_id": "hm-example", "reason": "timeout"}
+```
+
+`reason` is `timeout`, `cancelled`, or `abandoned`. The call must be an escalated
+tool call belonging to the authenticated tenant and supplied session. The first
+successful report sets `expired_at` (server UTC time) and `expiration_reason`;
+repeated reports return the same audit record. Responses: `200` with the updated
+audit record, `404` for a missing call or scope mismatch, `400` for an ineligible
+record, and `422` for invalid input.
+
+Expiration is a lifecycle fact, separate from evaluation or human denial.
+`decision`, `reasoning`, `user_decision`, `resolved_by`, and `resolved_at` remain
+intact. If a decision races with expiration, expiration is terminal: a decision
+that already won remains historical, but neither approval retries nor further
+resolution may use it. `POST /decision` returns `409` for expired calls.
+Consumers must check `expired_at` before interpreting a stored approval as
+usable. An approval records permission; it is never evidence of execution.
+
+Audit filtering treats `resolved=false` as actionable pending and `resolved=true`
+as closed history, including expiration. WebSocket subscribers receive an
+`expired` event containing `call_id`, `session_id`, `expired_at`, and
+`expiration_reason`, routed to the authenticated tenant. Refresh from the audit
+API after reconnect or racing events.
+
+Expired approvals cannot supply executable precedent or cached path permission.
+Path caches retain their originating approval IDs and validate those grants in
+the database before reuse, including grants learned by another server worker.
+Judge approvals derived mechanically from human precedent retain a one-hop
+source in storage; future retries and cached permissions require that source to
+remain usable. A previously issued judge approval still serves its own active
+waiter. A later direct human approval establishes an independent grant.
+Historical human refusals remain negative guidance. Expiration does not erase
+previous decisions, undo already-started execution, or create an atomic claim
+between approval validation and tool execution.
+
+Clients should retire a call only with invocation-specific evidence. Old age,
+a completed session, or an MCP response asking the caller to obtain approval and
+retry does not establish abandonment. Existing clients and legacy records keep
+their current behavior; no automatic age-based migration runs. Deploy the server
+before upgrading reporting clients. An old server may reject the new endpoint;
+clients must still stop local execution. Abrupt process loss or undelivered
+reports cannot be inferred safely by this explicit protocol and may leave
+pending records requiring evidence-based reconciliation.
 
 ### POST /decision
 

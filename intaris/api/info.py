@@ -100,7 +100,7 @@ def _compute_stats(
             cur.execute(
                 "SELECT COUNT(*) FROM audit_log "
                 "WHERE user_id = ? AND decision = 'escalate' "
-                "AND user_decision IS NULL "
+                "AND user_decision IS NULL AND expired_at IS NULL "
                 f"AND (outcome_override IS NULL OR outcome_override != ?){audit_agent_cond}",
                 (ctx.user_id, UNATTENDED_JUDGE_REVIEW, *audit_agent_params),
             )

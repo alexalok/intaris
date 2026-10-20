@@ -58,6 +58,8 @@ class EvaluationResult:
     reasoning: str
     decision: str  # "approve", "deny", "escalate"
     metadata: dict[str, Any] | None = None
+    # Internal provenance for cached permissions; never serialized as API metadata.
+    approval_call_id: str | None = None
 
 
 @dataclass
@@ -69,6 +71,8 @@ class Decision:
     reasoning: str
     path: str  # "fast", "critical", "llm"
     metadata: dict[str, Any] | None = None
+    # Internal provenance for cached permissions; never serialized as API metadata.
+    approval_call_id: str | None = None
 
     @property
     def is_approved(self) -> bool:

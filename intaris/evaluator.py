@@ -133,6 +133,7 @@ def _apply_authoritative_user_precedent(
         reasoning=reasoning,
         decision="approve",
         metadata=evaluation.metadata,
+        approval_call_id=precedent.get("call_id"),
     )
 
 
@@ -282,6 +283,10 @@ class Evaluator:
         # Prefixes are merged when they share a deep common ancestor.
         self._approved_paths: dict[tuple[str, str], list[str]] = {}
         self._approved_paths_lock = threading.Lock()
+        # Merged prefixes depend on every approval that contributed to them.
+        # Validate sources in the DB so another worker can expire a grant.
+        self._approved_path_sources: dict[tuple[str, str], set[str]] = {}
+        self._approved_path_versions: dict[tuple[str, str], object] = {}
 
     async def wait_for_alignment(self, user_id: str, session_id: str) -> None:
         """Let MCP metadata calls observe pending alignment checks before evaluation."""
@@ -846,6 +851,7 @@ class Evaluator:
                     and record.get("args_hash") == args_hash
                     and record.get("decision") == "escalate"
                     and record.get("user_decision") == "approve"
+                    and not record.get("expired_at")
                     and record.get("resolved_by") == "user"
                 )
                 if not approved:
@@ -856,6 +862,7 @@ class Evaluator:
                 decision.decision = "approve"
                 decision.reasoning = f"User approved call {approval_call_id}."
                 outcome_override = "human_approval"
+                decision.approval_call_id = approval_call_id
             else:
                 if approved and raw_decision == "deny":
                     decision.decision = "deny"
@@ -905,7 +912,12 @@ class Evaluator:
             for rp in resolved_paths:
                 if not is_path_within(rp, working_directory):
                     prefix = _compute_path_prefix(rp, working_directory)
-                    self._approve_path_prefix(user_id, session_id, prefix)
+                    self._approve_path_prefix(
+                        user_id,
+                        session_id,
+                        prefix,
+                        approval_call_id=decision.approval_call_id,
+                    )
                     logger.info(
                         "Learned approved path prefix: %s (session %s)",
                         prefix,
@@ -1103,6 +1115,7 @@ class Evaluator:
                     f"{_ESCALATION_RETRY_TTL_MINUTES} minutes"
                 ),
                 path="fast",
+                approval_call_id=prior_call_id,
             )
 
         return None
@@ -1130,8 +1143,21 @@ class Evaluator:
         """
         key = (user_id, session_id)
         with self._approved_paths_lock:
-            # Copy under lock to avoid TOCTOU with concurrent modifications
             prefixes = list(self._approved_paths.get(key, []))
+            sources = set(self._approved_path_sources.get(key, set()))
+            version = self._approved_path_versions.get(key)
+
+        if sources:
+            # Pool acquisition / DB I/O must not block other sessions' caches.
+            usable = self._audit.approvals_are_usable(sources, user_id=user_id)
+            with self._approved_paths_lock:
+                if self._approved_path_versions.get(key) is not version:
+                    return False
+                if not usable:
+                    self._approved_paths.pop(key, None)
+                    self._approved_path_sources.pop(key, None)
+                    self._approved_path_versions.pop(key, None)
+                    return False
 
         for rp in resolved_paths:
             if is_path_within(rp, working_directory):
@@ -1146,6 +1172,8 @@ class Evaluator:
         user_id: str,
         session_id: str,
         prefix: str,
+        *,
+        approval_call_id: str | None = None,
     ) -> None:
         """Add an approved path prefix for a session.
 
@@ -1162,12 +1190,25 @@ class Evaluator:
             user_id: Tenant identifier.
             session_id: Session identifier.
             prefix: Normalized directory prefix to approve.
+            approval_call_id: Originating grant, if approval-derived.
         """
         key = (user_id, session_id)
         norm_prefix = os.path.normpath(prefix)
         with self._approved_paths_lock:
+            sources = self._approved_path_sources.setdefault(key, set())
+            if approval_call_id:
+                if (
+                    approval_call_id not in sources
+                    and len(sources) >= _MAX_APPROVED_PATHS_PER_SESSION
+                ):
+                    # Discard merged permissions before forgetting dependencies.
+                    self._approved_paths.pop(key, None)
+                    sources.clear()
+                sources.add(approval_call_id)
+            self._approved_path_versions[key] = object()
             prefixes = self._approved_paths.setdefault(key, [])
 
+            # Record provenance before containment and merge early returns.
             # Check if already covered by an existing prefix
             if any(is_path_within(norm_prefix, p) for p in prefixes):
                 return
@@ -1196,6 +1237,8 @@ class Evaluator:
         Args:
             record: Audit record dict from the resolved escalation.
         """
+        if record.get("expired_at") or not record.get("call_id"):
+            return
         if (
             record.get("resolved_by") != "user"
             and record.get("raw_decision") == "deny"
@@ -1231,7 +1274,12 @@ class Evaluator:
         for resolved in resolved_paths:
             if not is_path_within(resolved, working_directory):
                 prefix = _compute_path_prefix(resolved, working_directory)
-                self._approve_path_prefix(user_id, session_id, prefix)
+                self._approve_path_prefix(
+                    user_id,
+                    session_id,
+                    prefix,
+                    approval_call_id=record["call_id"],
+                )
                 logger.info(
                     "Learned path prefix from user approval: %s (session %s)",
                     prefix,
@@ -1251,6 +1299,8 @@ class Evaluator:
         key = (user_id, session_id)
         with self._approved_paths_lock:
             self._approved_paths.pop(key, None)
+            self._approved_path_sources.pop(key, None)
+            self._approved_path_versions.pop(key, None)
 
     def sweep_approved_paths(self, active_keys: set[tuple[str, str]]) -> int:
         """Remove approved paths for sessions no longer active.
@@ -1269,6 +1319,8 @@ class Evaluator:
             stale = [k for k in self._approved_paths if k not in active_keys]
             for k in stale:
                 del self._approved_paths[k]
+                self._approved_path_sources.pop(k, None)
+                self._approved_path_versions.pop(k, None)
         return len(stale)
 
     def _llm_evaluate(
@@ -1375,6 +1427,12 @@ class Evaluator:
                     reasoning=str(result.get("reasoning", "No reasoning provided")),
                     decision=str(result.get("decision", "escalate")),
                 )
+            # Inference can outlive an approval. Refresh before applying a
+            # deterministic grant from the prompt's earlier snapshot.
+            if user_decisions:
+                user_decisions = self._audit.get_user_decisions(
+                    session_id, user_id=user_id, limit=5
+                )
             evaluation = _apply_authoritative_user_precedent(
                 evaluation,
                 tool=tool,
@@ -1392,6 +1450,7 @@ class Evaluator:
 
             decision = apply_decision_matrix(evaluation)
             decision.metadata = evaluation.metadata
+            decision.approval_call_id = evaluation.approval_call_id
             return decision
 
         except Exception:

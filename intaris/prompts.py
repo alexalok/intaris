@@ -397,7 +397,13 @@ def build_evaluation_user_prompt(
             decision_label = record.get("decision", "?")
             # Show user override for resolved escalations
             user_decision = record.get("user_decision")
-            if decision_label == "escalate" and user_decision:
+            if record.get("expired_at") and user_decision != "deny":
+                decision_label = "expired"
+            elif record.get("approval_source_call_id") and user_decision == "approve":
+                # The source is represented separately as current human guidance.
+                # Never turn a dependent judge grant into independent permission.
+                decision_label = "derived judge approval; not independent permission"
+            elif decision_label == "escalate" and user_decision:
                 decision_label = f"escalate→user:{user_decision}"
                 # Include user note as authoritative scope guidance
                 user_note = record.get("user_note")
@@ -413,6 +419,8 @@ def build_evaluation_user_prompt(
             is_user_approved = (
                 record.get("user_decision") == "approve"
                 and record.get("decision") == "escalate"
+                and not record.get("expired_at")
+                and not record.get("approval_source_call_id")
             )
             args_limit = 200 if is_user_approved else 100
             line = (

@@ -1476,3 +1476,41 @@ def test_agent_search_stdin_remains_fast(client, tool, command, arguments):
     audit = client.get(f"/api/v1/audit/{result['call_id']}", headers=AGENT).json()
     assert audit["classification"] == "read"
     assert audit["tool"] == tool
+
+
+def test_restricted_agent_can_expire_but_cannot_resolve(client):
+    from intaris.audit import AuditStore
+    from intaris.server import _get_db
+
+    create(client)
+    store = AuditStore(_get_db())
+    store.insert(
+        call_id="expiring",
+        user_id="owner",
+        session_id="s",
+        tool="terminal",
+        agent_id="hermes",
+        args_redacted={},
+        classification="write",
+        evaluation_path="llm",
+        decision="escalate",
+        risk="medium",
+        reasoning="Wait",
+        latency_ms=1,
+    )
+    response = client.post(
+        "/api/v1/audit/expiring/expire",
+        headers=AGENT,
+        json={"session_id": "s", "reason": "cancelled"},
+    )
+    assert response.status_code == 200
+    assert response.json()["expired_at"]
+    assert response.json()["user_decision"] is None
+    assert (
+        client.post(
+            "/api/v1/decision",
+            headers=AGENT,
+            json={"call_id": "expiring", "decision": "approve"},
+        ).status_code
+        == 403
+    )

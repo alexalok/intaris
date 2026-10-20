@@ -395,6 +395,9 @@ class Database:
             "maximum_outcome",
             "minimum_outcome",
             "outcome_override",
+            "expired_at",
+            "expiration_reason",
+            "approval_source_call_id",
         ):
             if not self._sqlite_column_exists(conn, "audit_log", column):
                 conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} TEXT")
@@ -996,6 +999,9 @@ class Database:
                 ("audit_log", "judge_reasoning", "TEXT"),
                 ("audit_log", "judge_decision", "TEXT"),
                 ("audit_log", "judge_risk", "TEXT"),
+                ("audit_log", "expired_at", "TEXT"),
+                ("audit_log", "expiration_reason", "TEXT"),
+                ("audit_log", "approval_source_call_id", "TEXT"),
                 ("audit_log", "raw_decision", "TEXT"),
                 ("audit_log", "effective_decision", "TEXT"),
                 ("audit_log", "maximum_outcome", "TEXT"),

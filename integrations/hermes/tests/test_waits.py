@@ -91,7 +91,18 @@ class Transport:
     @contextmanager
     def __call__(self, req, timeout):
         path = urlsplit(req.full_url).path
-        if path == "/api/v1/evaluate":
+        if path.endswith("/expire"):
+            body = json.loads(req.data)
+            point, data = (
+                "expire",
+                {
+                    "call_id": path.split("/")[-2],
+                    "session_id": body["session_id"],
+                    "expired_at": "2026-10-18T10:00:00Z",
+                    "expiration_reason": body["reason"],
+                },
+            )
+        elif path == "/api/v1/evaluate":
             self.evaluations += 1
             point = "evaluate" if self.evaluations == 1 else "reevaluate"
             data = {"decision": self.redecision, "call_id": "c2"}
@@ -455,7 +466,7 @@ def test_exception_unwinds_human_wait_accounting(adapter, host, monkeypatch):
     transport = Transport(block="never")
 
     def request(req, timeout):
-        if "/audit/" in req.full_url:
+        if req.method == "GET" and "/audit/" in req.full_url:
             raise TransportStopped("test transport stopped")
         return transport(req, timeout)
 
