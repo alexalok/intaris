@@ -187,6 +187,63 @@ The plugin resolves that exact session regardless of session insertion order or 
 
 Host paths that omit `session_id` are also blocked. For example, the nested `execute_code` RPC and kernel dispatchers in Hermes revision `63d0b94120027d487c9a5235b9ec64b696af1b26` forward only `task_id`. Those paths need the host to propagate the originating session identity before their nested tool calls can run through this guard.
 
+### Human Decision Notes
+
+When a pending native tool call is approved or denied in Intaris, its optional
+human note is returned to the waiting model with that invocation's tool response.
+Approval still executes the tool once; denial executes nothing and retains the
+evaluator's reasoning separately. This also applies when session reactivation
+leads to a new escalation.
+
+Ordinary JSON object results retain their existing fields and gain `_intaris_approval`
+as the first field, keeping the note visible in previews of large outputs:
+
+```json
+{
+  "_intaris_approval": {
+    "source": "human",
+    "call_id": "the-resolved-audit-call-id",
+    "decision": "approve",
+    "user_note": "Use staging only."
+  },
+  "output": "tool output",
+  "exit_code": 0
+}
+```
+
+If the tool already uses that field name, underscores are appended until a free
+name is found. JSON arrays and scalar results are retained under `tool_result`.
+Plain text gets a labeled `Intaris human decision note` prefix. Plain-text
+`Error` responses are kept in a JSON `error` field to preserve failure detection.
+Metadata values matching Hermes' raw failure tokens use equivalent JSON escapes,
+so human guidance cannot mark a successful result as failed.
+When native output already contains a failure token in Hermes' first 500-character
+scan, the annotation starts with an adapter-computed `native_failure_signal`.
+This preserves detection even with long notes or call IDs. Native JSON spelling
+and whitespace are retained for ordinary JSON to avoid introducing new failure tokens.
+Native MCP text envelopes (`result`, optional `structuredContent` and object `_meta`)
+keep their pageable shape: guidance prefixes the result text and is also stored
+under `_meta._intaris_approval`, preserving provider metadata and avoiding key
+collisions. Large documents still spill as readable lines with guidance in previews.
+Multimodal results retain their media and prefix each text part and any cached
+`text_summary` with the note. This retains bounded text-only summaries and keeps
+guidance visible when Hermes replaces a large summary with a text-part preview.
+Results without text parts gain a note part. Provider-owned objects are not
+mutated. Native output and context limits still apply.
+
+The native dispatch finalizer also includes notes when Hermes converts a
+handler exception or unsupported return value into an error. Its error
+sanitization and normal tool failure fields are preserved. Upgrading from the
+previous dispatch coordinator requires a Hermes process restart; an existing
+in-process coordinator is rejected rather than silently dropping notes.
+
+Notes are carried by the individual invocation, never queued on shared session
+or profile state. Cancelled or expired waits discard late resolutions. Missing,
+empty, whitespace-only, or non-text notes leave the response unchanged. Explicit
+judge resolutions are not presented as human guidance; legacy responses without
+resolver identity remain supported. Intaris's server-side note storage, safety
+context, and approval-driven intention refresh are unchanged.
+
 ### Hook Flow
 
 1. **`on_session_start`**: Creates an Intaris session via `POST /api/v1/intention`
