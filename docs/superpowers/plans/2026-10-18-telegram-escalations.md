@@ -94,3 +94,25 @@ Final local verification: 2,723 server tests passed (68 external E2E cases
 deselected), 815 Hermes adapter tests passed, and Ruff/diff checks passed.
 Actual Unix socket publication/connect/cleanup ran on macOS; Linux peer
 credentials and Telegram delivery remain mocked. No deployment or live messages.
+
+## Deadline and retention review follow-up (2026-10-20)
+
+Bugbot passed commit `a0e6854`; Codex identified three further lifecycle findings.
+Each was reproduced and fixed:
+
+- Native profile disposal shares the existing teardown deadline across all lease
+  closes. Local callbacks retire even when the remaining IPC budget is exhausted;
+  actual Unix-socket tests verify the earlier aggregate deadline is enforced.
+- Terminal leases with durable tenant/call audit verdicts are purged one hour
+  after their original deadline. Unfinished withdrawals remain recoverable, raw
+  audit history remains intact, and late requests cannot recreate a settled call.
+- Telegram send/edit/acknowledgement operations use the pinned Hermes
+  `agent.deadline.run_bounded_async` primitive with an eight-second cap.
+  Cancellation-shielded I/O is abandoned without waiting indefinitely; late
+  messages and button updates trigger withdrawal rather than becoming actionable.
+
+Verification: 2,734 server tests passed (68 external E2E cases deselected) and
+822 Hermes adapter tests passed. After making local callback invalidation
+immediate on delivery failure, all 105 native tests passed again. The deadline
+regressions execute the real pinned Hermes primitive. Ruff and diff checks pass.
+No deployment or live Telegram message was performed.

@@ -198,12 +198,21 @@ human precedent, path learning, session alignment overrides, or intention update
 It is also excluded from later evaluator and judge model history, including
 prior judge outcomes; raw audit records remain available in the UI.
 Failed withdrawal writes remain recoverable and are retried by the server sweep.
+Settled leases with durable audit verdicts are removed one hour after their
+original deadline. The audit verdict remains, so late requests cannot reopen a
+settled call. Unfinished or unresolved withdrawals are retained for recovery.
 
 Resolution or withdrawal removes buttons and updates the original message when
 Telegram is reachable. If editing fails, the server still rejects stale buttons.
 There is no automatic replay of a tool after reconnect/restart, and no retry of
 an ambiguous notification send. Native prompt state lost on gateway restart
 fails closed; existing leases expire rather than creating duplicate alerts.
+Telegram send, edit, and callback acknowledgements use Hermes' wall-clock deadline
+primitive with an eight-second cap, including cancellation-shielded requests.
+Late sends are retired without buttons; a late button edit triggers another
+removal. Profile unload shares its existing teardown deadline across all native
+lease closes. Once that budget expires, remaining local callbacks stay inactive
+and server leases expire under their original deadline.
 
 The initial integration targets the verified Hermes API contracts at commit
 `63d0b94120027d487c9a5235b9ec64b696af1b26`. It needs in-process native handler
