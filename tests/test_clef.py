@@ -51,14 +51,28 @@ def _reply(request: httpx.Request) -> httpx.Response:
     )
 
 
-def test_clef_requests_pin_provider_for_tools_and_alignment() -> None:
+@pytest.mark.parametrize(
+    "providers, expected_routing",
+    [
+        (["deepinfra"], {"only": ["deepinfra"], "allow_fallbacks": False}),
+        (
+            ["deepinfra", "cloudflare"],
+            {"only": ["deepinfra", "cloudflare"], "allow_fallbacks": True},
+        ),
+    ],
+)
+def test_clef_requests_allow_fallbacks_only_within_provider_selection(
+    providers, expected_routing
+) -> None:
     requests = []
 
     def respond(request):
         requests.append(json.loads(request.content))
         return _reply(request)
 
-    client = JevClient(_config(), transport=httpx.MockTransport(respond))
+    client = JevClient(
+        _config(openrouter_providers=providers), transport=httpx.MockTransport(respond)
+    )
     try:
         result = client.evaluate_tool_call(
             state={"tool": "write", "arguments": {"path": "README.md"}},
@@ -76,7 +90,7 @@ def test_clef_requests_pin_provider_for_tools_and_alignment() -> None:
     assert len(requests) == 2
     for body in requests:
         assert body["model"] == "cloudflare/clef"
-        assert body["provider"] == {"only": ["deepinfra"], "allow_fallbacks": False}
+        assert body["provider"] == expected_routing
 
 
 @pytest.mark.parametrize("operation", ["tool", "alignment"])
