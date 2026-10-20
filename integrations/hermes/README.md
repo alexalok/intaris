@@ -217,6 +217,10 @@ Plain text gets a labeled `Intaris human decision note` prefix. Plain-text
 `Error` responses are kept in a JSON `error` field to preserve failure detection.
 Metadata values matching Hermes' raw failure tokens use equivalent JSON escapes,
 so human guidance cannot mark a successful result as failed.
+When native output already contains a failure token in Hermes' first 500-character
+scan, the annotation starts with an adapter-computed `native_failure_signal`.
+This preserves detection even with long notes or call IDs. Native JSON spelling
+and whitespace are retained to avoid introducing new failure tokens.
 Multimodal results retain their media and prefix each text part and any cached
 `text_summary` with the note. This retains bounded text-only summaries and keeps
 guidance visible when Hermes replaces a large summary with a text-part preview.

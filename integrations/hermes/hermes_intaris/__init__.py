@@ -1285,6 +1285,14 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
         "user_note": resolution.user_note,
     }
     fields = []
+    if isinstance(result, str):
+        # Hermes' fallback scans only the first 500 raw characters. Retain
+        # an existing signal before arbitrarily long call IDs/human notes.
+        # This is adapter-computed compatibility data, not human guidance.
+        for signal in ("error", "failed"):
+            if f'"{signal}"' in result[:500].lower():
+                fields.append(f'"native_failure_signal": "{signal}"')
+                break
     for name, value in note.items():
         encoded = json.dumps(value, ensure_ascii=False)
         # Hermes scans raw result text for quoted "error"/"failed". Escape
@@ -1303,10 +1311,12 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
                 # Hermes recognizes this plain-text prefix as a tool failure.
                 # Preserve that signal when our note moves ahead of the text.
                 data = {"error": result}
+                result = json.dumps(data, ensure_ascii=False)
             else:
                 return annotation + "\n\n" + result
         if not isinstance(data, dict):
             data = {"tool_result": data}
+            result = '{"tool_result": ' + result + "}"
         # Preserve JSON status/error fields used by Hermes, and never
         # overwrite a provider's field even if it uses our metadata name.
         key = "_intaris_approval"
@@ -1314,8 +1324,12 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
             key += "_"
         # Keep guidance at the front of Hermes' previews for large results.
         prefix = "{" + json.dumps(key) + ": " + encoded_note
-        return prefix + (
-            ", " + json.dumps(data, ensure_ascii=False)[1:] if data else "}"
+        # Retain native JSON spelling/whitespace: decoding and re-encoding
+        # could turn escaped words into new raw failure tokens. Preserve
+        # leading whitespace after our field so native tokens only move later.
+        opening = result.index("{")
+        return (
+            prefix + (", " if data else "") + result[:opening] + result[opening + 1 :]
         )
     if (
         isinstance(result, dict)

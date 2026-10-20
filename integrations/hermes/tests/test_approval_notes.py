@@ -92,6 +92,7 @@ def test_resolution_note_reaches_model_without_replacing_result(
         result = asyncio.run(result)
     data = json.loads(result)
     assert data.pop("_intaris_approval") == {
+        **({"native_failure_signal": "error"} if decision == "deny" else {}),
         "source": "human",
         "call_id": "call-A",
         "decision": decision,
@@ -427,6 +428,98 @@ def test_plain_text_error_keeps_hermes_failure_signal(runtime, host, scripted_ht
     assert _detect_tool_failure("note_test", original)[0] is True
     assert _detect_tool_failure("note_test", result)[0] is True
     assert json.loads(result)["error"] == original
+
+
+@pytest.mark.parametrize(
+    ("original", "failed"),
+    [
+        (
+            '{"status":"error","output":"","tool_calls_made":0,'
+            '"kernel":{"remote":true,"ended":true,"state_lost":true,'
+            '"note":"Remote kernel protocol failure; kernel killed, state lost."}}',
+            True,
+        ),
+        ('{"kernel":{"status":"failed"}}', True),
+        ('Native response: "ERROR"', True),
+        ('["failed"]', True),
+        ('"error"', True),
+        ("Error: native backend unavailable", True),
+        ('{"output":"' + "x" * 510 + '","status":"error"}', False),
+        ('{   "output":"' + "x" * 480 + '","status":"error"}', False),
+        ('{"status":"err\\u006fr"}', False),
+        ('"err\\u006fr"', False),
+        ('{"output":"ok"}', False),
+    ],
+    ids=[
+        "kernel-error",
+        "nested-failed",
+        "plain-error",
+        "array",
+        "scalar",
+        "error-prefix",
+        "late-token",
+        "whitespace",
+        "escaped-status",
+        "escaped-scalar",
+        "success",
+    ],
+)
+@pytest.mark.parametrize(
+    ("note", "call_id"),
+    [
+        (NOTE, "call-A"),
+        ("Use staging only. " * 40, "call-A"),
+        (NOTE, "call-" + "x" * 600),
+    ],
+    ids=["short", "long-note", "long-call-id"],
+)
+def test_long_note_preserves_native_failure_detection(
+    runtime, host, original, failed, note, call_id
+):
+    if not os.environ.get("HERMES_SOURCE"):
+        pytest.skip("set HERMES_SOURCE for native failure classification")
+    from agent.display import _detect_tool_failure
+
+    result = plugin._with_approval_note(
+        original, plugin._HumanPollResult("approve", note), call_id
+    )
+    assert _detect_tool_failure("execute_code", original)[0] is failed
+    assert _detect_tool_failure("execute_code", result)[0] is failed
+    try:
+        native = json.loads(original)
+    except ValueError:
+        if not original.startswith("Error"):
+            annotation, _, output = result.partition("\n\n")
+            assert output == original
+            assert json.loads(annotation.split("\n", 1)[1])["user_note"] == note
+            return
+        native = {"error": original}
+    enriched = json.loads(result)
+    assert enriched.pop("_intaris_approval")["user_note"] == note
+    assert enriched == (native if isinstance(native, dict) else {"tool_result": native})
+
+
+@pytest.mark.parametrize(
+    ("tool", "original"),
+    [
+        ("terminal", '{"exit_code":0,"output":"error"}'),
+        ("write_file", '{"bytes_written":1,"error":null}'),
+        ("patch", '{"success":true,"status":"failed"}'),
+        ("read_file", '{"guardrail_refusal":true,"error":"Do not retry"}'),
+    ],
+)
+def test_native_success_overrides_still_win_with_failure_hint(
+    runtime, host, tool, original
+):
+    if not os.environ.get("HERMES_SOURCE"):
+        pytest.skip("set HERMES_SOURCE for native failure classification")
+    from agent.display import _detect_tool_failure
+
+    result = plugin._with_approval_note(
+        original, plugin._HumanPollResult("approve", "Guidance. " * 100), "call-A"
+    )
+    assert _detect_tool_failure(tool, original)[0] is False
+    assert _detect_tool_failure(tool, result)[0] is False
 
 
 @pytest.mark.parametrize(
