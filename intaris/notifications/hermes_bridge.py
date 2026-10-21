@@ -20,6 +20,7 @@ from typing import Any
 from intaris.audit import AuditStore
 from intaris.db import Database
 from intaris.judge import resolve_with_side_effects
+from intaris.notifications.telegram_presentation import approval_presentation
 from intaris.session import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -240,14 +241,36 @@ class HermesApprovalBridge:
             f"Reason: {(record.get('judge_reasoning') or record.get('reasoning') or '')[:800]}\n"
             "Approve applies only to this pending call. Silence does not approve."
         )
-        return {
+        response = {
             "ok": True,
             "lease_id": lease["lease_id"],
             "new": new,
             "expires_at": lease["expires_at"],
             "route": lease["route"],
             "text": text,
+            "presentation": approval_presentation(record),
         }
+        # The peer serializes with json.dumps defaults and a trailing newline.
+        # Budget the complete frame, including Unicode escapes and legacy text;
+        # never slice the rich HTML, which must remain structurally valid.
+        if len(json.dumps(response).encode()) + 1 > 65536:
+            response["text"] = ""
+            available = 65536 - len(json.dumps(response).encode()) - 1
+            suffix = (
+                "\n[truncated; full record available in Intaris audit.]\n"
+                "Approve applies only to this pending call. Silence does not approve."
+            )
+            if len(json.dumps(suffix)) - 2 > available:
+                raise ValueError("Native approval metadata exceeds response limit")
+            low, high = 0, len(text)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if len(json.dumps(text[:mid] + suffix)) - 2 <= available:
+                    low = mid
+                else:
+                    high = mid - 1
+            response["text"] = text[:low] + suffix
+        return response
 
     async def handle(self, policy: dict, profile: str, request: dict) -> dict:
         """Process one request from an already authenticated gateway/profile."""

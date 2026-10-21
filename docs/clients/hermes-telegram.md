@@ -10,6 +10,32 @@ laptop tunnel is needed. The plugin registers a namespaced callback handler on
 Hermes' existing Telegram application. Buttons approve only one pending Intaris
 call, never a session or a permanent tool permission.
 
+## Message layout
+
+Approval prompts use Telegram Rich Messages. The pending card shows the tool,
+a short command excerpt, the reason, and the existing Approve / Deny buttons.
+**Read more** opens a native, initially collapsed details block with the full
+command, nested argument/configuration lists, evaluation reason, and audit IDs.
+Strings are displayed as text or code, so commands do not acquire JSON quoting
+or escaping. The source remains the redacted audit record.
+
+After approval, denial, cancellation, or expiry, the same message shows only its
+status and a short command excerpt. All other details stay behind **Read more**,
+and the action buttons are removed. Large or deeply nested records have explicit
+truncation notices; the complete record remains in the Intaris audit UI.
+
+This uses Bot API Rich Messages (`sendRichMessage` and `editMessageText` with
+`rich_message`), including native `<details>` and nested lists. The Hermes bot's
+existing PTB client sends these through its public `do_api_request` method
+(PTB 20.8+), so a newer SDK is not required. Telegram Bot API 10.1+ and a client
+that displays Rich Messages are required. Upgrade both Intaris and the Hermes
+plugin for this layout; an older bridge's text-only response retains the legacy
+presentation. Existing prompts already held by an older gateway are not migrated.
+
+References: [Telegram Rich Messages](https://core.telegram.org/bots/features#rich-messages),
+[rich HTML details](https://core.telegram.org/bots/api#rich-message-formatting-options),
+[PTB API escape hatch](https://docs.python-telegram-bot.org/en/stable/telegram.bot.html#telegram.Bot.do_api_request).
+
 ## Routing and authorization
 
 The gateway derives an origin from its admitted message source and exact Hermes

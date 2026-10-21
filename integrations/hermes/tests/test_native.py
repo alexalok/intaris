@@ -82,6 +82,7 @@ class Bot:
         self.sends = []
         self.edits = []
         self.answers = []
+        self.api_requests = []
         self.send_started = threading.Event()
         self.send_gate = None
         self.edit_gate = None
@@ -124,6 +125,18 @@ class Bot:
     async def answer_callback_query(self, **kwargs):
         self.check_loop()
         self.answers.append(kwargs)
+
+    async def do_api_request(self, endpoint, api_kwargs, return_type=None, **timeouts):
+        self.check_loop()
+        self.api_requests.append((endpoint, api_kwargs, timeouts))
+        if endpoint == "sendRichMessage":
+            assert return_type is not None
+            return await self.send_message(**api_kwargs, **timeouts)
+        assert endpoint == "editMessageText"
+        kwargs = {**api_kwargs, **timeouts}
+        if kwargs.get("reply_markup") == {"inline_keyboard": []}:
+            kwargs["reply_markup"] = None
+        return await self.edit_message_text(**kwargs)
 
 
 class Application:
@@ -218,15 +231,25 @@ def until(predicate):
         time.sleep(0.005)
 
 
-@pytest.fixture
-def harness(monkeypatch):
+@pytest.fixture(params=["legacy", "rich"])
+def harness(monkeypatch, request):
     native = native_module()
     exchange = native._exchange
     monkeypatch.setenv("INTARIS_NATIVE_APPROVAL_SOCKET", "/run/intaris/native.sock")
     monkeypatch.setattr(native, "_trusted_socket", lambda path: True)
     server = Server()
+    if request.param == "rich":
+        details = (
+            "<details><summary>Read more</summary>"
+            "<p>Redacted audit description</p></details>"
+        )
+        server.open_reply["presentation"] = {
+            "pending": "<p>Intaris approval required</p><pre>echo safe</pre>" + details,
+            "retired": "<pre>echo safe</pre>" + details,
+        }
     monkeypatch.setattr(native, "_exchange", server.request)
     telegram = types.ModuleType("telegram")
+    telegram.Message = types.SimpleNamespace
     telegram.InlineKeyboardButton = lambda text, callback_data: types.SimpleNamespace(
         text=text, callback_data=callback_data
     )
@@ -408,6 +431,40 @@ def click(h, *, actor="9", decision="a", **changes):
 
 def actionable(h):
     return bool(h.app.bot.edits and h.app.bot.edits[-1].get("reply_markup"))
+
+
+def edited_content(h):
+    payload = h.app.bot.edits[-1]
+    return payload.get("rich_message", {}).get("html") or payload["text"]
+
+
+def test_rich_prompt_uses_native_details_and_compact_retirement(harness):
+    h = harness
+    if "presentation" not in h.server.open_reply:
+        return
+    with pending(h):
+        until(lambda: actionable(h))
+        assert h.app.bot.api_requests, "structured presentation sent as plain text"
+        endpoint, payload, timeouts = h.app.bot.api_requests[0]
+        assert endpoint == "sendRichMessage"
+        assert "text" not in payload and "parse_mode" not in payload
+        assert payload["rich_message"]["skip_entity_detection"] is True
+        assert "<details>" in payload["rich_message"]["html"]
+        assert payload["chat_id"] == "-100" and payload["message_thread_id"] == 42
+        assert set(timeouts) == {
+            "read_timeout",
+            "write_timeout",
+            "connect_timeout",
+            "pool_timeout",
+        }
+        click(h, actor="8").result(3)
+        assert not h.server.ops("resolve")
+    until(lambda: not actionable(h))
+    retired = edited_content(h)
+    assert "No longer actionable" in retired
+    assert retired.index("No longer actionable") < retired.index("<details>")
+    assert "Redacted audit description" not in retired.split("<details>")[0]
+    assert h.app.bot.api_requests[-1][1]["reply_markup"] == {"inline_keyboard": []}
 
 
 def test_disabled_without_process_env_never_reads_settings(monkeypatch):
@@ -1131,7 +1188,7 @@ def test_callback_one_use_and_server_is_only_resolver(harness):
             "message_id": "77",
         }
     until(lambda: not actionable(h))
-    assert "Approved" in h.app.bot.edits[-1]["text"]
+    assert "Approved" in edited_content(h)
 
 
 def test_callback_claim_cannot_resolve_after_wait_closed(harness):
@@ -1301,7 +1358,7 @@ def test_ui_resolution_status_comes_from_close_reply(harness):
         until(lambda: actionable(h))
         h.server.status = "deny"
     until(lambda: not actionable(h))
-    assert "Denied" in h.app.bot.edits[-1]["text"]
+    assert "Denied" in edited_content(h)
     assert h.server.ops("close")[0]["reason"] == "completed"
 
 
@@ -1312,7 +1369,7 @@ def test_failed_close_cannot_display_approval(harness):
         h.server.close_ok = False
         h.server.status = "approve"
     until(lambda: not actionable(h))
-    assert "No longer actionable" in h.app.bot.edits[-1]["text"]
+    assert "No longer actionable" in edited_content(h)
 
 
 def test_unclassified_delivery_failure_never_retries(harness):
