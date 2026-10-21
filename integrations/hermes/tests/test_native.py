@@ -250,8 +250,8 @@ def harness(monkeypatch, request):
     monkeypatch.setattr(native, "_exchange", server.request)
     telegram = types.ModuleType("telegram")
     telegram.Message = types.SimpleNamespace
-    telegram.InlineKeyboardButton = lambda text, callback_data: types.SimpleNamespace(
-        text=text, callback_data=callback_data
+    telegram.InlineKeyboardButton = lambda text, callback_data, **kwargs: (
+        types.SimpleNamespace(text=text, callback_data=callback_data, **kwargs)
     )
     telegram.InlineKeyboardMarkup = lambda rows: types.SimpleNamespace(
         inline_keyboard=rows

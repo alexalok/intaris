@@ -804,16 +804,19 @@ class NativeApprovals:
                     with self._lock:
                         live = self._live(prompt)
                     if live:
+                        # Keep button styles compatible with SDKs before PTB 22.7.
                         keyboard = InlineKeyboardMarkup(
                             [
                                 [
                                     InlineKeyboardButton(
                                         "Approve",
                                         callback_data=f"intaris:a:{prompt.lease_id}",
+                                        api_kwargs={"style": "success"},
                                     ),
                                     InlineKeyboardButton(
                                         "Deny",
                                         callback_data=f"intaris:d:{prompt.lease_id}",
+                                        api_kwargs={"style": "danger"},
                                     ),
                                 ]
                             ]
