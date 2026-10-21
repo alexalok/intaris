@@ -79,6 +79,11 @@ class HermesApprovalBridge:
             """)
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_hermes_approval_expiry
                 ON hermes_approval_leases(state, expires_at)""")
+            # Immutable mode also supports existing lease DBs. Presentation loss
+            # must not decide the original invocation's still-pending audit.
+            cur.execute("""CREATE TABLE IF NOT EXISTS hermes_approval_presentations (
+                lease_id TEXT PRIMARY KEY REFERENCES hermes_approval_leases(lease_id) ON DELETE CASCADE
+            )""")
 
     def _record(self, policy: dict, request: dict) -> dict:
         record = self._audit.get_by_call_id(
@@ -195,6 +200,17 @@ class HermesApprovalBridge:
                     return status
             self._state(lease, decision)
             return decision
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT lease_id FROM hermes_approval_presentations WHERE lease_id = ?",
+                (lease["lease_id"],),
+            )
+            presentation_only = cur.fetchone() is not None
+        if presentation_only:
+            # Keep a terminal lease as a no-replay fence while the original
+            # invocation continues its own audit poll and deadline checks.
+            self._state(lease, reason)
+            return reason
         if reason == "failed":
             # Losing presentation does not withdraw the invoking tool's human
             # wait. Keep the audit available to the UI, but never reopen or
@@ -300,7 +316,7 @@ class HermesApprovalBridge:
                     else None
                 ),
             }
-        if op == "open":
+        if op in ("open", "open_presentation"):
             record = self._record(policy, request)
             with self._db.cursor() as cur:
                 cur.execute(
@@ -325,7 +341,9 @@ class HermesApprovalBridge:
                 or remaining <= 0
             ):
                 raise ValueError("Invalid approval deadline")
-            route = self._route(policy, request.get("origin"))
+            route = self._route(
+                policy, None if op == "open_presentation" else request.get("origin")
+            )
             if route is None:
                 return {"ok": True, "lease_id": None}
             lease = dict(
@@ -362,6 +380,11 @@ class HermesApprovalBridge:
                         json.dumps(route),
                     ),
                 )
+                if op == "open_presentation":
+                    cur.execute(
+                        "INSERT INTO hermes_approval_presentations (lease_id) VALUES (?)",
+                        (lease["lease_id"],),
+                    )
             return self._opened(lease, record, new=True)
 
         lease = self._get(policy["user_id"], profile, request["lease_id"])

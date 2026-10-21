@@ -1386,14 +1386,25 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
         "user_note": resolution.user_note,
     }
     fields = []
+    native_failure_signal = None
     if isinstance(result, str):
-        # Hermes' fallback scans only the first 500 raw characters. Retain
-        # an existing signal before arbitrarily long call IDs/human notes.
+        # Keep the host's raw failure verdict before arbitrarily long guidance.
+        # Newer hosts ignore empty error fields and match tokens starting before
+        # character 500 even if the token ends beyond that boundary.
         # This is adapter-computed compatibility data, not human guidance.
-        for signal in ("error", "failed"):
-            if f'"{signal}"' in result[:500].lower():
-                fields.append(f'"native_failure_signal": "{signal}"')
-                break
+        head = result[:500].lower()
+        try:
+            from agent.tool_result_classification import has_failure_marker
+        except ImportError:
+            pass  # Older Hermes uses a raw first-500-character token scan.
+        else:
+            head = result[:600].lower() if has_failure_marker(result) else ""
+        native_failure_signal = next(
+            (signal for signal in ("error", "failed") if f'"{signal}"' in head),
+            None,
+        )
+        if native_failure_signal is not None:
+            fields.append(f'"native_failure_signal": "{native_failure_signal}"')
     for name, value in note.items():
         encoded = json.dumps(value, ensure_ascii=False)
         # Hermes scans raw result text for quoted "error"/"failed". Escape
@@ -1416,8 +1427,11 @@ def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str)
             else:
                 return annotation + "\n\n" + result
         if not isinstance(data, dict):
+            # Newer Hermes judges JSON objects by top-level shape. Carry the
+            # original non-object failure verdict across our wrapper.
             data = {"tool_result": data}
-            result = '{"tool_result": ' + result + "}"
+            status = ', "status": "error"' if native_failure_signal else ""
+            result = '{"tool_result": ' + result + status + "}"
         if (
             set(data) <= {"result", "structuredContent", "_meta"}
             and isinstance(data.get("result"), str)

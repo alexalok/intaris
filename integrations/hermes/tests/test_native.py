@@ -203,7 +203,7 @@ class Server:
                     payload["profile"], payload["profile"]
                 ),
             }
-        if op == "open":
+        if op in ("open", "open_presentation"):
             self.open_started.set()
             if self.open_gate:
                 assert self.open_gate.wait(3)

@@ -224,6 +224,7 @@ class _Prompt:
     timer: threading.Timer | None = None
     # Constructed on the application loop, used to serialize button edits.
     io_lock: asyncio.Lock | None = None
+    presentation_only: bool = False
 
 
 class NativeApprovals:
@@ -241,6 +242,8 @@ class NativeApprovals:
         self._parents: dict[str, str | None] = {}
         self._prompts: set[_Prompt] = set()
         self._leases: dict[str, _Prompt] = {}
+        self._cron = getattr(ctx, "cron_approvals", None)
+        self._cron_execution = getattr(ctx, "current_cron_execution", lambda: None)
         # Deliberately process launch config, never profile/plugin config or secrets.
         self._socket = os.environ.get("INTARIS_NATIVE_APPROVAL_SOCKET", "")
         # Hermes may start before the bridge. Keep hooks ready for subsequent
@@ -251,6 +254,8 @@ class NativeApprovals:
         with _hub_lock:
             _instances.add(self)
         try:
+            if self._cron is not None:
+                self._handles.append(self._cron.register_presenter(self.present_cron))
             for name, callback in (
                 ("pre_gateway_dispatch", self._capture_gateway),
                 ("post_gateway_admission", self._admit),
@@ -398,12 +403,14 @@ class NativeApprovals:
                 binding, asyncio.to_thread(owner._finish, prompt, "cancelled")
             )
 
-    def _route(self, session_id: str) -> tuple[_Binding, dict[str, Any] | None]:
+    def _route(
+        self, session_id: str, *, policy_fallback: bool = False
+    ) -> tuple[_Binding, dict[str, Any] | None]:
         from gateway.session_identity import identity_of
 
         with self._lock:
             seen = set()
-            while session_id in self._parents:
+            while not policy_fallback and session_id in self._parents:
                 if session_id in seen or self._parents[session_id] is None:
                     raise _Unroutable("Ambiguous child session")
                 seen.add(session_id)
@@ -422,7 +429,7 @@ class NativeApprovals:
         gateways = list(gateways_by_id.values())
         bindings = list(bindings_by_id.values())
         matches = []
-        for gateway in gateways:
+        for gateway in () if policy_fallback else gateways:
             entry = gateway.session_store.lookup_by_session_id(session_id)
             if entry is not None:
                 if entry.session_id != session_id or not entry.session_key:
@@ -527,6 +534,46 @@ class NativeApprovals:
         *,
         intaris_session_id: str,
     ) -> Iterator[None]:
+        """Present within the current cron scope or admitted interactive session."""
+        if self._cron_execution() is not None:
+            if self._cron is None:
+                invocation.check()
+                yield
+                invocation.check()
+            else:
+                with self._cron.pending(
+                    session_id=session_id,
+                    external_session_id=intaris_session_id,
+                    call_id=call_id,
+                    deadline=invocation.deadline,
+                    check=invocation.check,
+                ):
+                    yield
+            return
+        with self._pending_local(
+            session_id,
+            call_id,
+            invocation,
+            intaris_session_id=intaris_session_id,
+        ):
+            yield
+
+    def present_cron(self, request: Any, lifetime: Any) -> Any:
+        """Present a canonical cron wait through operator fallback policy."""
+        from .cron import present_cron
+
+        return present_cron(self, request, lifetime)
+
+    @contextmanager
+    def _pending_local(
+        self,
+        session_id: str,
+        call_id: str,
+        invocation: Invocation,
+        *,
+        intaris_session_id: str,
+        policy_fallback: bool = False,
+    ) -> Iterator[None]:
         """Present an escalation while the caller continues its ordinary audit poll."""
         prompt = None
         reason = "completed"
@@ -537,12 +584,18 @@ class NativeApprovals:
             if enabled:
                 try:
                     binding, origin = invocation.request(
-                        lambda: self._route(session_id)
+                        lambda: (
+                            self._route(session_id, policy_fallback=True)
+                            if policy_fallback
+                            else self._route(session_id)
+                        )
                     )
                     remaining = invocation.remaining_seconds
                     if not math.isfinite(remaining) or remaining <= 0:
                         raise WaitStopped("APPROVAL WAIT TIMEOUT (native approval)")
-                    prompt = _Prompt(invocation, binding, origin)
+                    prompt = _Prompt(
+                        invocation, binding, origin, presentation_only=policy_fallback
+                    )
                     with self._lock:
                         if self._disposed or binding not in self._bindings:
                             raise _Unroutable("Native transport disposed or superseded")
@@ -586,7 +639,11 @@ class NativeApprovals:
         }
         if prompt.origin is not None:
             fields["origin"] = prompt.origin
-        response = self._rpc("open", **fields)
+        # Older bridges reject this distinct operation before creating a lease.
+        # Never fall back to a withdrawal lease for a supervised cron wait.
+        response = self._rpc(
+            "open_presentation" if prompt.presentation_only else "open", **fields
+        )
         if response.get("ok") is not True or response.get("new") is not True:
             return
         lease_id = response.get("lease_id")
@@ -662,6 +719,7 @@ class NativeApprovals:
             or prompt.reason is not None
             or prompt.binding not in self._bindings
             or prompt.binding.application.bot is not prompt.binding.bot
+            or getattr(prompt.binding.application, "running", True) is False
         ):
             return False
         if time.time() >= prompt.expires_at or time.monotonic() >= prompt.deadline:

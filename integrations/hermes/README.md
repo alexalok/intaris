@@ -218,6 +218,8 @@ as the first field, keeping the note visible in previews of large outputs:
 
 If the tool already uses that field name, underscores are appended until a free
 name is found. JSON arrays and scalar results are retained under `tool_result`.
+When that wrapper would hide a native failure, an adapter-computed top-level
+`status: error` preserves the host verdict without changing the original payload.
 Plain text gets a labeled `Intaris human decision note` prefix. Plain-text
 `Error` responses are kept in a JSON `error` field to preserve failure detection.
 Metadata values matching Hermes' raw failure tokens use equivalent JSON escapes,

@@ -58,6 +58,49 @@ The general chat is used only when explicitly configured as the fallback.
 Timeouts and ambiguous sends are not retried, avoiding duplicate prompts.
 Missing, identical, or unavailable fallback destinations never approve a call.
 
+## Cron approvals
+
+Current Hermes runs cron agents inside the gateway's canonical session owner.
+External scheduler workers submit and observe execution; they do not run the
+agent. A profile can use its own Telegram bot, or `fallback_transport_profile`
+can select a shared bot under the same gateway. Cron has no admitted
+Telegram sender: approval destination and approvers always come from that runtime
+profile's operator fallback policy. Job `origin`, model/tool arguments, and session
+ID collisions are never routing proof.
+
+Enable the Intaris plugin for that runtime profile in the serving gateway.
+Secondary profiles normally require `gateway.multiplex_profiles: true` so the
+gateway discovers their plugins. A profile whose cron store is merely ticked,
+but whose gateway plugins are not loaded, retains the ordinary Intaris UI wait.
+`fallback_transport_profile` selects a transport; it does not discover plugins or
+create a bot connection.
+
+This requires the companion Hermes `ctx.cron_approvals` API and this adapter/server
+change together. Hermes binds presentation to the original invocation's in-memory
+execution scope, actual agent session, runtime profile, and plugin generation.
+Presentation uses the existing private Intaris socket and configured UID/profile
+authorization. It adds no worker channel or process-attestation requirement.
+
+The adapter selects the cron path using `ctx.current_cron_execution()`, never
+`ctx.cron_approvals.available`. Availability can become false during cancellation
+or drain; that must not send a cron invocation through interactive routing.
+Missing presentation keeps the original bounded audit wait.
+
+The `open_presentation` operation persists an immutable presentation-only marker
+in `hermes_approval_presentations`, alongside the existing lease. Callbacks still
+resolve one exact call, with the existing actor/bot/chat/topic/message checks.
+Closing or expiring this lease retires native buttons and preserves a still-pending
+audit. A still-live invocation can continue its original bounded Intaris UI wait
+after presentation loss. Terminal leases remain no-replay fences until the audit
+settles; restarting either service cannot turn a retired lease into a new prompt.
+
+Older Intaris servers reject `open_presentation` before creating a lease; the adapter
+keeps the original audit wait. It never falls back to an ordinary withdrawal lease.
+Ordinary interactive native approvals retain their existing withdrawal semantics.
+Unloading a plugin or losing one presentation cannot execute or automatically retry
+a tool. Only the original invocation's poll and final cancellation checks permit
+execution. Gateway restart cannot reconstruct the in-memory presentation authority.
+
 ## Local trust boundary
 
 The native bridge requires Linux and separate Intaris/gateway service users.
@@ -238,11 +281,13 @@ and server leases expire under their original deadline.
 The initial integration targets the verified Hermes API contracts at commit
 `63d0b94120027d487c9a5235b9ec64b696af1b26`. It needs in-process native handler
 registration; Hermes isolated plugin hosts currently do not expose that API.
-Separate-process cron workers still need gateway integration for presentation:
-sharing the configured UID does not provide the gateway's bot client or native
-handler API. They retain the existing Intaris UI/notification path; an explicit
-fallback transport mapping does not supply that integration. Canonical cron
-presentation support is a separate companion change.
+Cron presentation additionally requires the canonical-owner API merged in
+[Hermes PR #1](https://github.com/alexalok/hermes-agent/pull/1), verified at
+`e4ee1687a6f799b7f21f2b173138f910e862ee94`. A compatible Hermes gateway and this
+Intaris adapter/server must be installed together. Older versions that execute
+cron agents in separate processes retain the existing Intaris UI/notification
+path: sharing a configured UID does not provide the gateway's bot client or
+native handler API. A fallback transport mapping does not supply that integration.
 The guarded native-tool path is supported. The optional Intaris MCP proxy keeps
 its existing manual escalation/retry behavior; it does not gain automatic remote
 tool replay through this feature.

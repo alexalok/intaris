@@ -461,24 +461,28 @@ def test_plain_text_error_keeps_hermes_failure_signal(runtime, host, scripted_ht
 
 
 @pytest.mark.parametrize(
-    ("original", "failed"),
+    "original",
     [
-        (
-            '{"status":"error","output":"","tool_calls_made":0,'
-            '"kernel":{"remote":true,"ended":true,"state_lost":true,'
-            '"note":"Remote kernel protocol failure; kernel killed, state lost."}}',
-            True,
-        ),
-        ('{"kernel":{"status":"failed"}}', True),
-        ('Native response: "ERROR"', True),
-        ('["failed"]', True),
-        ('"error"', True),
-        ("Error: native backend unavailable", True),
-        ('{"output":"' + "x" * 510 + '","status":"error"}', False),
-        ('{   "output":"' + "x" * 480 + '","status":"error"}', False),
-        ('{"status":"err\\u006fr"}', False),
-        ('"err\\u006fr"', False),
-        ('{"output":"ok"}', False),
+        '{"status":"error","output":"","tool_calls_made":0,'
+        '"kernel":{"remote":true,"ended":true,"state_lost":true,'
+        '"note":"Remote kernel protocol failure; kernel killed, state lost."}}',
+        '{"kernel":{"status":"failed"}}',
+        'Native response: "ERROR"',
+        '["failed"]',
+        '"error"',
+        "Error: native backend unavailable",
+        '{"output":"' + "x" * 510 + '","status":"error"}',
+        '{   "output":"' + "x" * 480 + '","status":"error"}',
+        '{"status":"err\\u006fr"}',
+        '"err\\u006fr"',
+        '[{"error":null}]',
+        '[{"error":"boom"}]',
+        '[{"failed":0}]',
+        '["' + "x" * 510 + '","error"]',
+        'Native response: "error": null',
+        'Native response: "failed": 0',
+        "x" * 498 + '"error"',
+        '{"output":"ok"}',
     ],
     ids=[
         "kernel-error",
@@ -491,6 +495,13 @@ def test_plain_text_error_keeps_hermes_failure_signal(runtime, host, scripted_ht
         "whitespace",
         "escaped-status",
         "escaped-scalar",
+        "empty-error-array",
+        "nonempty-error-array",
+        "empty-failed-array",
+        "late-array-marker",
+        "empty-error-text",
+        "empty-failed-text",
+        "boundary-text-marker",
         "success",
     ],
 )
@@ -504,7 +515,7 @@ def test_plain_text_error_keeps_hermes_failure_signal(runtime, host, scripted_ht
     ids=["short", "long-note", "long-call-id"],
 )
 def test_long_note_preserves_native_failure_detection(
-    runtime, host, original, failed, note, call_id
+    runtime, host, original, note, call_id
 ):
     if not os.environ.get("HERMES_SOURCE"):
         pytest.skip("set HERMES_SOURCE for native failure classification")
@@ -513,7 +524,9 @@ def test_long_note_preserves_native_failure_detection(
     result = plugin._with_approval_note(
         original, plugin._HumanPollResult("approve", note), call_id
     )
-    assert _detect_tool_failure("execute_code", original)[0] is failed
+    # Hermes versions differ in failure parsing; adding guidance must preserve
+    # the actual host verdict, including success-shaped payloads with error text.
+    failed = _detect_tool_failure("execute_code", original)[0]
     assert _detect_tool_failure("execute_code", result)[0] is failed
     try:
         native = json.loads(original)
@@ -526,6 +539,8 @@ def test_long_note_preserves_native_failure_detection(
         native = {"error": original}
     enriched = json.loads(result)
     assert enriched.pop("_intaris_approval")["user_note"] == note
+    if not isinstance(native, dict):
+        assert enriched.pop("status", None) == ("error" if failed else None)
     assert enriched == (native if isinstance(native, dict) else {"tool_result": native})
 
 
@@ -667,14 +682,14 @@ def persist_multimodal():
 
 
 @pytest.mark.parametrize(
-    ("original", "failed"),
+    "original",
     [
-        ('{"result":"native output\\n"}', False),
-        ('{"result":"native output\\n","_meta":{"status":"failed"}}', True),
-        ('{"result":"native output\\n","_meta":{"status":"err\\u006fr"}}', False),
+        '{"result":"native output\\n"}',
+        '{"result":"native output\\n","_meta":{"status":"failed"}}',
+        '{"result":"native output\\n","_meta":{"status":"err\\u006fr"}}',
     ],
 )
-def test_mcp_note_preserves_native_failure_detection(runtime, host, original, failed):
+def test_mcp_note_preserves_native_failure_detection(runtime, host, original):
     if not os.environ.get("HERMES_SOURCE"):
         pytest.skip("set HERMES_SOURCE for native failure classification")
     from agent.display import _detect_tool_failure
@@ -684,7 +699,9 @@ def test_mcp_note_preserves_native_failure_detection(runtime, host, original, fa
     result = plugin._with_approval_note(
         original, plugin._HumanPollResult("approve", note), "call-A"
     )
-    assert _detect_tool_failure("mcp_document", original)[0] is failed
+    # Hermes versions differ in failure parsing; adding guidance must preserve
+    # the actual host verdict, including success-shaped payloads with error text.
+    failed = _detect_tool_failure("mcp_document", original)[0]
     assert _detect_tool_failure("mcp_document", result)[0] is failed
     data = json.loads(result)
     assert data["_meta"].pop("_intaris_approval")["user_note"] == note
