@@ -1,0 +1,34 @@
+[Unit]
+Description=Refresh Intaris native approval identity for Hermes
+StartLimitIntervalSec=0
+After=systemd-tmpfiles-setup.service user@@HERMES_UID@.service
+Wants=user@@HERMES_UID@.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/intaris-attest-hermes --watch
+Restart=always
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID
+# Retain UID-drop capability across sandbox setup on this host.
+AmbientCapabilities=CAP_SETUID
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/intaris-native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

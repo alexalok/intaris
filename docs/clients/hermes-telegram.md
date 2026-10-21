@@ -134,8 +134,12 @@ Hermes may start before Intaris: hooks remain registered, and subsequent human
 waits can use the bridge once its trusted socket is available. A failed current
 presentation is not retried automatically; its ordinary audit wait continues.
 
-After the gateway starts, an operator or privileged service hook must write its
-main PID and Linux process birth ticks into the attestation file. The format is:
+After the gateway starts, an operator or privileged service must write its main
+PID and Linux process birth ticks into the attestation file. For Linux systemd
+user gateways, the optional [automatic attestation service](../../integrations/hermes/systemd/README.md)
+tracks restarts every two seconds and removes the need for manual refresh.
+It trusts the gateway and its user unit while keeping the identity file protected
+from ordinary tool subprocesses. The format is:
 
 ```text
 1234 987654
@@ -167,8 +171,9 @@ PY
 ```
 
 Never let the gateway write this attestation itself. Refresh it after every
-gateway restart; a reused PID with a different start time is rejected. The
-bridge reads the file on each request, so re-attestation needs no Intaris
+gateway restart, automatically with the service above or through your own
+privileged lifecycle integration; a reused PID with a different start time is
+rejected. The bridge reads the file on each request, so re-attestation needs no Intaris
 restart. Until valid attestation exists, native presentation is unavailable and
 ordinary Intaris UI approval remains available. Normal Intaris shutdown removes
 its socket; after a crash, verify no listener remains before removing a stale
