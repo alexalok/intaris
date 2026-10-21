@@ -98,6 +98,14 @@ class Invocation:
         self._closed.set()
 
     @property
+    def deadline(self) -> float:
+        """Established monotonic deadline for the presentation lifetime."""
+        self.check()
+        if self._deadline is None:
+            raise WaitStopped("Native approval requires an active human-wait window")
+        return self._deadline
+
+    @property
     def remaining_seconds(self) -> float:
         """Remaining established human-wait budget; never grant a new window."""
         self.check()
