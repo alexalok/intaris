@@ -1,142 +1,74 @@
-# Automatic gateway attestation
+# Native approval runtime directory
 
-This optional Linux/systemd service refreshes the trusted Hermes gateway identity
-used by [native Telegram approvals](../../../docs/clients/hermes-telegram.md).
-It replaces manual PID/start-time updates after gateway restarts. It does not
-install the Hermes plugin, configure Telegram destinations, or restart Hermes.
+Native Hermes Telegram approvals use a protected Unix socket and operator-owned
+UID/profile configuration. See the [native approval guide](../../../docs/clients/hermes-telegram.md)
+for the trust boundary and complete setup. No gateway PID attestation, root
+watcher, process polling, or restart hook is required.
 
-## Requirements and trust
+## Runtime directory setup
 
-- Python 3.11+ at `/usr/bin/python3`, systemd, and unified cgroup v2.
-- Separate `hermes` and `intaris` service users; the Intaris service uses group
-  `intaris`. These account names and the paths below are fixed in this helper.
-- Hermes runs `hermes-gateway.service` in its user manager, with the actual
-  gateway as `MainPID`. A launcher must `exec` the gateway rather than remain
-  as a parent process. Supported unit types are `simple`, `exec`, `notify`, and
-  `notify-reload`, with `NotifyAccess=none` or `main`.
-- The Hermes user manager is available at boot. Enable lingering if gateway
-  setup has not already done so: `sudo loginctl enable-linger hermes`.
-- Intaris native bridge configuration points to
-  `/run/intaris-native/hermes-gateway.pid` and uses the Hermes UID. The socket
-  and gateway launch environment are configured as described in the linked guide.
+The provided tmpfiles entry assumes service user `intaris` and gateway-access
+group `hermes`. Adjust these names if the installation differs. It creates
+`/run/intaris-native` as `intaris:hermes`, mode `2750`. The setgid bit gives new
+socket files the gateway-access group without making the directory writable by
+that group. Keep the Intaris and Hermes service UIDs distinct.
 
-This deployment trusts the gateway, its source, and its user-owned systemd unit.
-It does not pin a source revision or defend against deliberately replacing the
-gateway. It certifies the process that the trusted user manager identifies as
-the gateway. Ordinary tool subprocesses have different PIDs and cannot pass
-Intaris's peer-process check or write the protected attestation file.
-
-The helper itself must remain root-owned and outside the Hermes checkout. It
-executes only `/usr/bin/systemctl` as the unprivileged Hermes user, with a fixed
-unit name, clean environment, and three-second timeout. It never imports Hermes
-code, accepts a caller-supplied PID, or reads bot tokens and Intaris credentials.
-
-## Install
-
-Run these commands from the repository root after configuring the native bridge.
-Review existing files before replacing an installation. The UID substitution
-targets the existing `hermes` account; do not install the `.service.in` template
-without rendering it.
+Run from the repository root after reviewing any existing installation:
 
 ```sh
-set -eu
-hermes_uid="$(id -u hermes)"
-test "$hermes_uid" -gt 0
-test "$(id -u intaris)" -ne "$hermes_uid"
-
-attest_unit="$(mktemp)"
-sed "s/@HERMES_UID@/$hermes_uid/g" \
-  integrations/hermes/systemd/intaris-hermes-attestation.service.in > "$attest_unit"
-
-sudo install -o root -g root -m 0755 \
-  integrations/hermes/systemd/attest_gateway.py \
-  /usr/local/sbin/intaris-attest-hermes
 sudo install -o root -g root -m 0644 \
   integrations/hermes/systemd/intaris-native.conf \
   /etc/tmpfiles.d/intaris-native.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/intaris-native.conf
-sudo install -o root -g root -m 0644 "$attest_unit" \
-  /etc/systemd/system/intaris-hermes-attestation.service
-rm -f "$attest_unit"
+```
 
-sudo systemd-analyze verify /etc/systemd/system/intaris-hermes-attestation.service
+The socket itself is mode `0660`. Set
+`INTARIS_NATIVE_APPROVAL_SOCKET=/run/intaris-native/telegram.sock` in the gateway
+launch environment and configure `INTARIS_TELEGRAM_BRIDGE` in the Intaris service.
+A gateway restart under the same UID requires no Intaris configuration update.
+
+## Migration from the removed watcher
+
+The previous optional `intaris-hermes-attestation.service` and
+`intaris-attest-hermes` helper belonged to this Intaris integration, not Hermes.
+Removing them changes the trust boundary: **all processes under each configured
+Hermes UID, including tool subprocesses, can submit approval actions.** Numeric
+Telegram actor and message checks do not isolate the bridge from that trusted
+local user. Review the native approval guide before migrating.
+
+1. Back up the current Intaris deployment/config and watcher installation.
+2. Remove `pid_file` from every `INTARIS_TELEGRAM_BRIDGE.gateways` entry. Combine
+   gateway entries sharing a UID into one entry with all their profiles. Deploy
+   the new Intaris version with this config in the same maintenance operation;
+   the old version requires `pid_file`, and the new version rejects it.
+3. Verify the native listener starts with the intended UID and profile mappings.
+   Keep the existing bot, fallback destination, approvers, runtime directory,
+   socket permissions, and gateway launch environment.
+4. Stop and uninstall the obsolete watcher only after migration succeeds:
+
+```sh
+sudo systemctl disable --now intaris-hermes-attestation.service
+sudo rm -f /etc/systemd/system/intaris-hermes-attestation.service \
+  /usr/local/sbin/intaris-attest-hermes
 sudo systemctl daemon-reload
-sudo systemctl enable --now intaris-hermes-attestation.service
+sudo rm -f /run/intaris-native/hermes-gateway.pid \
+  /run/intaris-native/.attestation.lock
 ```
 
-On upgrades, restart the watcher after installing the updated files and
-reloading systemd:
-
-```sh
-sudo systemctl restart intaris-hermes-attestation.service
-```
-
-The runtime directory is `intaris:hermes`, mode `2750`. It must not become
-group-writable. The resulting identity file is `root:intaris`, mode `0640`.
-The helper uses a protected lock and atomic replacement; Intaris can read the
-file while the watcher updates it. No Intaris restart is required.
-
-The service uses filesystem isolation, a read-only home view, Unix sockets
-only, and a limited capability set. `AmbientCapabilities=CAP_SETUID` retains
-the capability needed to drop to the Hermes user after systemd sandbox setup
-with `NoNewPrivileges=yes`; the child loses its permitted, effective, and
-ambient capabilities when it changes UID. See
-[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
-for capability and sandbox settings.
-
-## Behavior and operations
-
-The watcher polls every two seconds and validates systemd's main PID against
-the kernel UID, cgroup and process birth ticks before publishing it. A changed
-identity is checked twice. An unchanged identity does not rewrite the file.
-
-A stopped or invalid gateway clears the record. A transient systemd query
-failure preserves the existing PID/start-time record and logs the failure;
-Intaris continues checking that exact process identity on each connection.
-A new process, including a reused PID with different birth ticks, cannot use
-the old record. The watcher retries failed checks, and systemd restarts it
-after a crash without a permanent start-limit lockout.
-
-```sh
-systemctl status intaris-hermes-attestation.service
-journalctl -u intaris-hermes-attestation.service --since '-10 minutes'
-systemctl is-enabled intaris-hermes-attestation.service
-```
-
-After a normal gateway restart, expect `Attested gateway PID=... start=...`
-in the watcher journal and matching values in
-`/run/intaris-native/hermes-gateway.pid`. Verify Telegram reconnects and the
-gateway receives `INTARIS_NATIVE_APPROVAL_SOCKET`. The file tracks process
-identity; it is not evidence that the Telegram connection or plugin is healthy.
-Native presentation can be unavailable during startup and the next poll;
-ordinary Intaris UI approval remains available.
-
-No manual command is needed in normal operation. For an explicit root
-diagnostic, `/usr/local/sbin/intaris-attest-hermes --once` performs one refresh;
-`--confirm-current` remains a compatibility alias. Do not give the Hermes user
-sudo access to this helper or permission to write the attestation directory.
-
-Stopping or disabling the watcher leaves the current record valid until that
-gateway process exits. Future gateway processes then need an explicit root
-refresh. To revoke the current record as well, stop the watcher before removing
-the PID file so it cannot recreate it.
+Run watcher-removal commands only on hosts where those files were installed by
+this integration. Do not remove `/run/intaris-native`, `telegram.sock`, or the
+tmpfiles entry. Do not disable the watcher while the old Intaris version still
+requires its identity file. A rollback to that version must restore its
+`pid_file` config and watcher/helper, then refresh the identity.
 
 ## Verification
 
-The helper has standard-library behavioral tests, included in the normal
-repository test discovery:
-
 ```sh
-python3 -m unittest -v tests.test_hermes_attestation
-uv run pytest tests/test_hermes_attestation.py tests/test_hermes_peer.py \
-  tests/test_hermes_socket.py -q
+uv run pytest tests/test_hermes_peer.py tests/test_hermes_socket.py \
+  tests/test_hermes_bridge.py -q
 ```
 
-They cover process identity, UID/cgroup mismatch, stopped gateways, PID reuse,
-atomic refresh, unchanged files, transient errors, permissions, and symlink
-rejection. Live Linux verification of the deployed helper also covered its
-exact service sandbox, a normal gateway restart, successful Intaris reads,
-cleared child capabilities, Telegram reconnection, and rejection of a separate
-process with the Hermes UID. These checks did not send or click a Telegram
-approval. Machine-specific receipts and backups are operator artifacts, not
-required runtime files.
+Tests cover UID/profile isolation, rejection of identity fields spoofed in a
+request, use by another process with the trusted UID, old-config migration,
+protected socket directories, bounded admission, callback binding, and approval
+lifecycle behavior. They do not send live Telegram messages.

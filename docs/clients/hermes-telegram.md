@@ -35,27 +35,32 @@ Missing, identical, or unavailable fallback destinations never approve a call.
 ## Local trust boundary
 
 The native bridge requires Linux and separate Intaris/gateway service users.
-Intaris exposes a private Unix socket. Kernel `SO_PEERCRED` identifies the caller;
-Intaris compares its UID, PID and process start time against a protected operator
-attestation. Agent tool subprocesses share the gateway UID but have different
-PIDs and cannot submit decisions. The bridge has no HTTP route and does not
-accept Intaris agent API keys.
-Unattested processes are rejected before request framing. At most 32 admitted
-connections can wait for or process a request; excess connections are refused.
+Intaris exposes a private Unix socket. Kernel `SO_PEERCRED` identifies the
+caller's Unix UID; Intaris accepts only configured UIDs and their explicitly
+mapped profiles. PID files, process start-time checks, privileged helpers, and
+restart attestation are not required. Processes under other UIDs are rejected
+before request framing. At most 32 admitted connections can wait for or process
+a request; excess connections are refused.
 
-The gateway process and installed plugin code are trusted host components. This
-does not sandbox arbitrary malicious Python already running inside the gateway,
-nor protect a gateway that the agent can debug, inject into, replace, or restart
-with modified code. Protect gateway code/service files and process-debugging
-access with the host's normal security boundary. Keep restricted
-`INTARIS_AGENT_API_KEYS` on the agent side; never substitute an administrative
-Intaris key.
+**The configured Hermes Unix user is trusted, including all tool subprocesses
+running under that UID.** Such a process can submit native approval actions and
+claim an allowed Telegram actor. Actor/message/session/call checks still apply,
+but they do not prove a human clicked Telegram when the trusted local user is
+malicious. Native audit attribution relies on the local peer's report. This mode
+is for deployments that already trust Hermes and its tools;
+it is not an isolation boundary against them. Use separate Unix users for
+separate gateway trust boundaries. Profiles under one UID share that trust even
+though their operator-defined tenant, agent, and routing policies remain distinct.
 
-The socket's parent directories and PID attestation must be root/Intaris-owned,
-not writable by the gateway or other users, and must not contain symlinks. The
-socket itself is mode `0660`; give the gateway access through a dedicated group.
-Profile configuration below belongs only to the isolated Intaris service, not
-Hermes `config.yaml`, `.env`, or model-editable files.
+The bridge has no HTTP route and does not accept Intaris agent API keys.
+Keep restricted `INTARIS_AGENT_API_KEYS` on the agent side; never substitute an
+administrative Intaris key. No additional decision credential is needed.
+
+The socket's parent directories must be root/Intaris-owned, not writable by the
+gateway or other users, and must not contain symlinks. The socket itself is mode
+`0660`; give the gateway access through a dedicated group. Profile configuration
+below belongs only to the isolated Intaris service, not Hermes `config.yaml`,
+`.env`, or model-editable files.
 
 ## Operator configuration
 
@@ -70,7 +75,6 @@ object like this (replace all IDs, paths, and UID):
   "gateways": [
     {
       "uid": 1001,
-      "pid_file": "/run/intaris-native/hermes-gateway.pid",
       "profiles": {
         "/home/hermes/.hermes": {
           "user_id": "operator",
@@ -92,8 +96,9 @@ object like this (replace all IDs, paths, and UID):
 `user_id` must match the tenant bound to Hermes' restricted API key.
 `agent_id` must match both the session and evaluation agent metadata
 (`INTARIS_AGENT_ID`). Use a distinct agent ID for each configured runtime profile.
-Profile paths must be absolute resolved Hermes homes. Numeric chat/user/topic IDs
-are required; usernames are rejected. The top-level fallback applies to every
+Each gateway entry must use a distinct UID. Put all profiles for the same Unix
+user in that entry. Profile paths must be absolute resolved Hermes homes.
+Numeric chat/user/topic IDs are required; usernames are rejected. The top-level fallback applies to every
 profile. A profile can override `fallback_chat_id` and `fallback_thread_id`;
 overriding the chat never inherits a topic from the global chat. An explicit
 profile `fallback_chat_id: null` disables its fallback. Omit both global fallback
@@ -123,7 +128,8 @@ This mapping does not change ordinary cron/webhook result delivery settings.
 Create `/run/intaris-native` with Intaris ownership, dedicated gateway-access
 group, and mode `0750`. The Intaris service must use that group for the socket.
 Do not make the directory group-writable. A systemd `RuntimeDirectory` can manage
-this directory. Configure only one Intaris process to own this socket.
+this directory, or use the [tmpfiles setup](../../integrations/hermes/systemd/README.md).
+Configure only one Intaris process to own this socket.
 
 Set `INTARIS_NATIVE_APPROVAL_SOCKET=/run/intaris-native/telegram.sock` in the
 **gateway service launch environment**. The plugin deliberately ignores a
@@ -134,54 +140,27 @@ Hermes may start before Intaris: hooks remain registered, and subsequent human
 waits can use the bridge once its trusted socket is available. A failed current
 presentation is not retried automatically; its ordinary audit wait continues.
 
-After the gateway starts, an operator or privileged service must write its main
-PID and Linux process birth ticks into the attestation file. For Linux systemd
-user gateways, the optional [automatic attestation service](../../integrations/hermes/systemd/README.md)
-tracks restarts every two seconds and removes the need for manual refresh.
-It trusts the gateway and its user unit while keeping the identity file protected
-from ordinary tool subprocesses. The format is:
-
-```text
-1234 987654
-```
-
-The second value is field 22 of `/proc/1234/stat`, parsed after the final `)`
-because process names can contain spaces. For example, run this as root with
-the Intaris service group named `intaris`, after obtaining the
-gateway's **MainPID** from its actual systemd unit:
-
-```bash
-python3 - "$GATEWAY_MAIN_PID" /run/intaris-native/hermes-gateway.pid <<'PY'
-import grp
-import os
-import sys
-import tempfile
-from pathlib import Path
-
-pid = int(sys.argv[1])
-target = Path(sys.argv[2])
-start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-fd, temporary = tempfile.mkstemp(dir=target.parent)
-os.fchown(fd, 0, grp.getgrnam("intaris").gr_gid)
-os.fchmod(fd, 0o640)
-with os.fdopen(fd, "w") as output:
-    output.write(f"{pid} {start}\n")
-os.replace(temporary, target)
-PY
-```
-
-Never let the gateway write this attestation itself. Refresh it after every
-gateway restart, automatically with the service above or through your own
-privileged lifecycle integration; a reused PID with a different start time is
-rejected. The bridge reads the file on each request, so re-attestation needs no Intaris
-restart. Until valid attestation exists, native presentation is unavailable and
-ordinary Intaris UI approval remains available. Normal Intaris shutdown removes
+Gateway restarts require no Intaris-side refresh. The same configured UID can
+use the bridge as soon as the gateway reconnects. Normal Intaris shutdown removes
 its socket; after a crash, verify no listener remains before removing a stale
 socket. Startup never deletes an existing socket automatically.
 Startup publishes the configured path only after capturing the socket's inode
 and setting permissions. If even the first metadata read fails, an unidentified
 private staging socket is left untouched; there are four bounded staging slots.
 Exhausting those slots requires operator verification and cleanup before retrying.
+
+## Migration from process attestation
+
+Older deployments configured `gateways[].pid_file` and could run the optional
+`intaris-hermes-attestation.service`. These were Intaris integration components,
+not Hermes requirements. They have been removed.
+
+Existing `pid_file` configuration is rejected with a migration error rather than
+silently changing its trust boundary. After accepting the Unix-user trust model
+above, remove `pid_file` from each gateway entry and deploy the new Intaris
+version and updated config together. Then remove the obsolete watcher, helper,
+and identity file using the [migration guide](../../integrations/hermes/systemd/README.md#migration-from-the-removed-watcher).
+Keep the protected runtime directory and existing socket/profile configuration.
 
 ## Lifetime and failure behavior
 
@@ -233,10 +212,11 @@ and server leases expire under their original deadline.
 The initial integration targets the verified Hermes API contracts at commit
 `63d0b94120027d487c9a5235b9ec64b696af1b26`. It needs in-process native handler
 registration; Hermes isolated plugin hosts currently do not expose that API.
-Separate-process cron workers also cannot use the native bridge: the attestation
-authorizes only the gateway process, and workers have neither that peer identity
-nor its bot client. They retain the existing Intaris UI/notification path; an
-explicit fallback transport mapping does not supply a worker-to-gateway relay.
+Separate-process cron workers still need gateway integration for presentation:
+sharing the configured UID does not provide the gateway's bot client or native
+handler API. They retain the existing Intaris UI/notification path; an explicit
+fallback transport mapping does not supply that integration. Canonical cron
+presentation support is a separate companion change.
 The guarded native-tool path is supported. The optional Intaris MCP proxy keeps
 its existing manual escalation/retry behavior; it does not gain automatic remote
 tool replay through this feature.

@@ -1,8 +1,9 @@
 """Linux peer-authenticated Unix transport for native Hermes approval actions.
 
-The operator attests the gateway's UID, PID and process start time. Tool
-subprocesses have different PIDs even when they inherit its UID and environment.
-There is deliberately no reusable decision credential in the Hermes profile.
+The operator trusts each configured Unix user, including its tool subprocesses,
+to present native approval actions for explicitly mapped profiles. Kernel peer
+credentials identify that user; there is no per-process attestation or reusable
+decision credential in the Hermes profile.
 """
 
 from __future__ import annotations
@@ -63,13 +64,23 @@ def parse_config(raw: dict) -> dict:
         gateways = []
         profiles_seen = set()
         identities_seen = set()
+        uids_seen = set()
         for gateway in raw["gateways"]:
-            if set(gateway) != {"uid", "pid_file", "profiles"}:
+            if not isinstance(gateway, dict):
+                raise ValueError("Invalid gateway configuration")
+            if "pid_file" in gateway:
+                raise ValueError(
+                    "Gateway attestation was removed; remove pid_file only after "
+                    "accepting that all processes under the configured UID are trusted"
+                )
+            if set(gateway) != {"uid", "profiles"}:
                 raise ValueError("Invalid gateway configuration")
             uid = gateway["uid"]
             if type(uid) is not int or uid <= 0 or uid == os.getuid():
                 raise ValueError("Gateway UID must differ from the Intaris service UID")
-            pid_file = _absolute(gateway["pid_file"])
+            if uid in uids_seen:
+                raise ValueError("Each gateway must have a distinct Unix UID")
+            uids_seen.add(uid)
             profiles = {}
             if not isinstance(gateway["profiles"], dict) or not gateway["profiles"]:
                 raise ValueError("Explicit profiles required")
@@ -132,7 +143,7 @@ def parse_config(raw: dict) -> dict:
                         policy["fallback_thread_id"], positive=True
                     )
                 profiles[home] = policy
-            gateways.append({"uid": uid, "pid_file": pid_file, "profiles": profiles})
+            gateways.append({"uid": uid, "profiles": profiles})
         return {"socket_path": path, "gateways": gateways}
     except (KeyError, TypeError) as exc:
         raise ValueError("Invalid INTARIS_TELEGRAM_BRIDGE configuration") from exc
@@ -158,57 +169,12 @@ def _protected_path(path: str, gateway_uid: int, *, directory: bool = False) -> 
             )
 
 
-def read_attestation(path: str, gateway_uid: int) -> tuple[int, str]:
-    """Read an operator-owned PID/start-time attestation, never a gateway PID file."""
-    _protected_path(path, gateway_uid)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid not in (0, os.getuid())
-            or info.st_uid == gateway_uid
-            or info.st_mode & 0o022
-        ):
-            raise PermissionError("Untrusted gateway attestation")
-        raw = os.read(fd, 129)
-    finally:
-        os.close(fd)
-    fields = raw.split()
-    if len(raw) > 128 or len(fields) != 2 or not all(f.isdigit() for f in fields):
-        raise PermissionError("Malformed gateway attestation")
-    pid, start = int(fields[0]), fields[1].decode("ascii")
-    if pid <= 1 or int(start) <= 0:
-        raise PermissionError("Invalid gateway process identity")
-    return pid, start
-
-
-def process_start_time(pid: int) -> str:
-    """Read Linux process birth ticks; PID reuse cannot reuse an attestation."""
-    # comm may contain both spaces and parentheses. Fields after its final ')'
-    # start at field 3 (state), so starttime (field 22) is index 19.
-    data = Path(f"/proc/{pid}/stat").read_text()
-    return data.rsplit(")", 1)[1].split()[19]
-
-
-def _is_gateway_process(gateway: dict, *, pid: int, uid: int) -> bool:
-    if gateway["uid"] != uid:
-        return False
-    try:
-        expected_pid, start = read_attestation(gateway["pid_file"], uid)
-        return expected_pid == pid and process_start_time(pid) == start
-    except (OSError, ValueError, IndexError):
-        return False
-
-
-def authorize_peer(cfg: dict, *, pid: int, uid: int, profile: str) -> dict:
-    """Return exactly one operator policy for this kernel-authenticated peer."""
+def authorize_peer(cfg: dict, *, uid: int, profile: str) -> dict:
+    """Return exactly one operator policy for this kernel-authenticated user."""
     for gateway in cfg["gateways"]:
-        if profile in gateway["profiles"] and _is_gateway_process(
-            gateway, pid=pid, uid=uid
-        ):
+        if gateway["uid"] == uid and profile in gateway["profiles"]:
             return gateway["profiles"][profile]
-    raise PermissionError("Gateway process/profile is not authorized")
+    raise PermissionError("Gateway Unix user/profile is not authorized")
 
 
 class HermesApprovalSocket:
@@ -323,14 +289,11 @@ class HermesApprovalSocket:
             if self._closing or len(self._connections) >= _MAX_CONNECTIONS:
                 raise PermissionError("Native approval connection limit reached")
             sock = writer.get_extra_info("socket")
-            pid, uid, _gid = struct.unpack(
+            _pid, uid, _gid = struct.unpack(
                 "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             )
-            if not any(
-                _is_gateway_process(gateway, pid=pid, uid=uid)
-                for gateway in self._config["gateways"]
-            ):
-                raise PermissionError("Gateway process is not authorized")
+            if not any(gateway["uid"] == uid for gateway in self._config["gateways"]):
+                raise PermissionError("Gateway Unix user is not authorized")
         except Exception:
             with contextlib.suppress(Exception):
                 writer.write(
@@ -338,7 +301,7 @@ class HermesApprovalSocket:
                 )
             writer.close()
             return None
-        task = asyncio.create_task(self._handle(reader, writer, pid=pid, uid=uid))
+        task = asyncio.create_task(self._handle(reader, writer, uid=uid))
         self._connections.add(task)
 
         def finished(task: asyncio.Task) -> None:
@@ -354,7 +317,6 @@ class HermesApprovalSocket:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
-        pid: int,
         uid: int,
     ) -> None:
         try:
@@ -367,7 +329,7 @@ class HermesApprovalSocket:
             profile = request.get("profile")
             if not isinstance(profile, str):
                 raise ValueError("Missing profile")
-            policy = authorize_peer(self._config, pid=pid, uid=uid, profile=profile)
+            policy = authorize_peer(self._config, uid=uid, profile=profile)
             result = await self._bridge.handle(policy, profile, request)
         except asyncio.CancelledError:
             raise

@@ -1,4 +1,4 @@
-"""The native socket authenticates the gateway process, never its tool children."""
+"""The native socket trusts configured Unix users and their explicit profiles."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ def config():
         "gateways": [
             {
                 "uid": 12345,
-                "pid_file": "/run/intaris/gateway.pid",
                 "profiles": {
                     "/home/hermes/.hermes": {
                         "user_id": "owner",
@@ -38,27 +37,50 @@ def config():
     }
 
 
-def test_explicit_profile_and_process_identity_required(monkeypatch):
+def test_explicit_profile_and_unix_user_required():
     from intaris.notifications import hermes_peer as peer
 
     cfg = peer.parse_config(config())
-    monkeypatch.setattr(peer, "read_attestation", lambda path, uid: (100, "500"))
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
-    expected = config()["gateways"][0]["profiles"]["/home/hermes/.hermes"]
-    assert (
-        peer.authorize_peer(cfg, pid=100, uid=12345, profile="/home/hermes/.hermes")
-        == expected
-    )
-    for pid, uid, profile in [
-        (101, 12345, "/home/hermes/.hermes"),
-        (100, 12346, "/home/hermes/.hermes"),
-        (100, 12345, "/home/hermes/.hermes/profiles/other"),
+    policy = peer.authorize_peer(cfg, uid=12345, profile="/home/hermes/.hermes")
+    assert policy["user_id"] == "owner"
+    assert policy["agent_id"] == "hermes"
+    assert policy["approver_ids"] == ["42"]
+    for uid, profile in [
+        (0, "/home/hermes/.hermes"),
+        (12346, "/home/hermes/.hermes"),
+        (12345, "/home/hermes/.hermes/profiles/other"),
     ]:
         with pytest.raises(PermissionError):
-            peer.authorize_peer(cfg, pid=pid, uid=uid, profile=profile)
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "501")
-    with pytest.raises(PermissionError):
-        peer.authorize_peer(cfg, pid=100, uid=12345, profile="/home/hermes/.hermes")
+            peer.authorize_peer(cfg, uid=uid, profile=profile)
+
+
+def test_legacy_attestation_configuration_requires_explicit_migration():
+    from intaris.notifications.hermes_peer import parse_config
+
+    raw = config()
+    raw["gateways"][0]["pid_file"] = "/run/intaris/gateway.pid"
+    with pytest.raises(ValueError, match="remove pid_file"):
+        parse_config(raw)
+
+
+def test_same_unix_user_cannot_claim_separate_gateway_boundaries():
+    from intaris.notifications.hermes_peer import parse_config
+
+    raw = config()
+    raw["gateways"].append(
+        {
+            "uid": 12345,
+            "profiles": {
+                "/home/hermes/other": {
+                    "user_id": "owner",
+                    "agent_id": "other",
+                    "approver_ids": ["43"],
+                }
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="distinct.*UID"):
+        parse_config(raw)
 
 
 @pytest.mark.parametrize(
@@ -70,7 +92,6 @@ def test_explicit_profile_and_process_identity_required(monkeypatch):
         lambda c: c.update(fallback_chat_id="-111", fallback_thread_id=True),
         lambda c: c["gateways"][0].update(uid=os.getuid()),
         lambda c: c["gateways"][0].update(uid=True),
-        lambda c: c["gateways"][0].update(pid_file="relative.pid"),
         lambda c: c["gateways"][0]["profiles"]["/home/hermes/.hermes"].update(
             user_id="*"
         ),
@@ -100,20 +121,22 @@ def test_bad_security_configuration_fails_closed(change):
 @pytest.mark.parametrize(
     "owner,mode", [(12345, 0o600), (0, 0o666), (0, 0o620), (0, stat.S_IFLNK | 0o777)]
 )
-def test_agent_owned_writable_or_symlink_attestation_rejected(monkeypatch, owner, mode):
+def test_agent_owned_writable_or_symlink_socket_directory_rejected(
+    monkeypatch, owner, mode
+):
     from intaris.notifications import hermes_peer as peer
 
     def lstat(path):
-        if str(path) == "/run/intaris/gateway.pid":
+        if str(path) == "/run/intaris":
             return SimpleNamespace(
                 st_uid=owner,
-                st_mode=mode | (stat.S_IFREG if not stat.S_ISLNK(mode) else 0),
+                st_mode=mode | (stat.S_IFDIR if not stat.S_ISLNK(mode) else 0),
             )
         return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
 
     monkeypatch.setattr(peer.os, "lstat", lstat)
     with pytest.raises(PermissionError):
-        peer.read_attestation("/run/intaris/gateway.pid", 12345)
+        peer._protected_path("/run/intaris", 12345, directory=True)
 
 
 def test_bridge_config_is_operator_environment_only(monkeypatch):
@@ -121,18 +144,6 @@ def test_bridge_config_is_operator_environment_only(monkeypatch):
 
     monkeypatch.setenv("INTARIS_TELEGRAM_BRIDGE", json.dumps(config()))
     assert NotificationConfig().hermes_bridge == config()
-
-
-def test_process_start_time_handles_spaces_and_parentheses(monkeypatch):
-    from pathlib import Path
-
-    from intaris.notifications.hermes_peer import process_start_time
-
-    fields = ["S"] + ["0"] * 18 + ["98765"] + ["0"] * 5
-    monkeypatch.setattr(
-        Path, "read_text", lambda *a, **kw: "100 (python (gateway)) " + " ".join(fields)
-    )
-    assert process_start_time(100) == "98765"
 
 
 def test_two_profiles_cannot_share_same_tenant_agent_binding():
@@ -185,7 +196,6 @@ def test_fallback_transport_cannot_reference_another_gateway():
     raw["gateways"].append(
         {
             "uid": 12346,
-            "pid_file": "/run/intaris/other.pid",
             "profiles": {
                 "/home/other": {
                     "user_id": "other",
@@ -235,26 +245,25 @@ def test_global_fallback_inherited_without_merging_topics_between_chats():
     )
 
 
-def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
+def test_socket_protocol_trusts_unix_user_but_rejects_foreign_uid_and_spoofing(
     bridge, monkeypatch
 ):
     from intaris.notifications import hermes_peer as peer
 
     cfg = peer.parse_config(config())
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
-    monkeypatch.setattr(peer, "read_attestation", lambda *args: (100, "500"))
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
     server = peer.HermesApprovalSocket(cfg, bridge.service)
 
     class Writer:
-        def __init__(self, pid):
+        def __init__(self, pid, uid):
             self.pid = pid
+            self.uid = uid
             self.output = b""
             self.closed = False
 
         def get_extra_info(self, name):
             return SimpleNamespace(
-                getsockopt=lambda *args: struct.pack("3i", self.pid, 12345, 12345)
+                getsockopt=lambda *args: struct.pack("3i", self.pid, self.uid, self.uid)
             )
 
         def write(self, data):
@@ -269,13 +278,13 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
         async def wait_closed(self):
             pass
 
-    async def request(pid, body):
+    async def request(pid, body, *, uid=12345):
         reader = asyncio.StreamReader()
         reader.feed_data(
             json.dumps({"profile": "/home/hermes/.hermes", **body}).encode() + b"\n"
         )
         reader.feed_eof()
-        writer = Writer(pid)
+        writer = Writer(pid, uid)
         task = server._accept(reader, writer)
         if task is not None:
             await task
@@ -287,7 +296,7 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
             "op": "fallback_transport",
             "fallback_transport_profile": "/attacker-controlled",
         }
-        assert not (await request(101, transport_request))["ok"]
+        assert not (await request(101, transport_request, uid=12346))["ok"]
         assert await request(100, transport_request) == {
             "ok": True,
             "transport_profile": "/home/hermes/.hermes",
@@ -300,7 +309,7 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
             "pid": 100,
             "uid": 12345,
         }
-        assert not (await request(101, body))["ok"]
+        assert not (await request(101, body, uid=12346))["ok"]
         lease = await request(100, body)
         assert lease["new"] is True
         common = {
@@ -311,12 +320,14 @@ def test_socket_protocol_rejects_agent_child_and_accepts_exact_gateway(
         }
         assert (await request(100, {"op": "bind", **common}))["ok"]
         action = {"op": "resolve", **common, "decision": "approve", "actor_id": "42"}
-        assert not (await request(101, action))["ok"]
+        assert not (await request(101, action, uid=12346))["ok"]
         assert (
             bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
             is None
         )
-        assert (await request(100, action))["status"] == "approve"
+        # A restarted gateway, or any other process under the trusted UID,
+        # can act without refreshing process identity or server config.
+        assert (await request(200, action))["status"] == "approve"
         assert not (await request(100, action))["ok"]
 
     asyncio.run(exercise())

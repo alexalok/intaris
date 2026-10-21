@@ -165,19 +165,13 @@ def accept(server, reader, writer):
     return asyncio.create_task(result) if inspect.iscoroutine(result) else result
 
 
-@pytest.mark.parametrize(
-    "pid,uid,start", [(101, 12345, "500"), (100, 12346, "500"), (100, 12345, "501")]
-)
-def test_unattested_peer_is_closed_without_waiting_for_a_frame(
-    monkeypatch, pid, uid, start
-):
+@pytest.mark.parametrize("uid", [0, 12346])
+def test_unconfigured_uid_is_closed_without_waiting_for_a_frame(monkeypatch, uid):
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
-    monkeypatch.setattr(peer, "read_attestation", lambda *args: (100, "500"))
-    monkeypatch.setattr(peer, "process_start_time", lambda peer_pid: start)
     server = peer.HermesApprovalSocket(peer.parse_config(config()), Bridge())
 
     async def exercise():
-        writers = [Writer(pid, uid) for _ in range(128)]
+        writers = [Writer(uid=uid) for _ in range(128)]
         tasks = [accept(server, asyncio.StreamReader(), writer) for writer in writers]
         try:
             # No newline is sent. Rejection must not retain a frame-reader task.
@@ -199,8 +193,6 @@ def test_unattested_peer_is_closed_without_waiting_for_a_frame(
 def test_admission_bounds_pending_frames_and_recovers_capacity(monkeypatch):
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
     monkeypatch.setattr(peer, "_MAX_CONNECTIONS", 2, raising=False)
-    monkeypatch.setattr(peer, "read_attestation", lambda *args: (100, "500"))
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
     server = peer.HermesApprovalSocket(peer.parse_config(config()), Bridge())
 
     async def exercise():
@@ -238,17 +230,10 @@ def test_admission_bounds_pending_frames_and_recovers_capacity(monkeypatch):
 
 def test_admission_does_not_authorize_another_gateways_profile(monkeypatch):
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
-    monkeypatch.setattr(
-        peer,
-        "read_attestation",
-        lambda path, uid: (100 if path.endswith("gateway.pid") else 200, "500"),
-    )
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
     cfg = config()
     cfg["gateways"].append(
         {
-            "uid": 12345,
-            "pid_file": "/run/intaris/other.pid",
+            "uid": 12346,
             "profiles": {
                 "/home/other": {
                     "user_id": "other",
@@ -325,7 +310,7 @@ def test_published_socket_accepts_connections_and_removes_staging(socket_config)
             assert list(path.parent.iterdir()) == [path]
             reader, writer = await asyncio.open_unix_connection(str(path))
             try:
-                # This test process is not an attested gateway. A response proves
+                # This test process does not have a configured UID. A response proves
                 # the published hard link reaches the actual Unix listener.
                 result = await asyncio.wait_for(reader.readline(), timeout=1)
                 assert json.loads(result)["ok"] is False
@@ -394,8 +379,6 @@ def test_start_failure_preserves_foreign_replacement(socket_config, monkeypatch)
 
 def test_close_cancels_admitted_task_before_handler_starts(monkeypatch):
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
-    monkeypatch.setattr(peer, "read_attestation", lambda *args: (100, "500"))
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
     server = peer.HermesApprovalSocket(peer.parse_config(config()), Bridge())
 
     async def exercise():
@@ -412,19 +395,15 @@ def test_close_cancels_admitted_task_before_handler_starts(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_profile_authorization_rechecks_attestation_after_frame(monkeypatch):
+def test_profile_authorization_rechecks_policy_after_frame(monkeypatch):
     monkeypatch.setattr(peer.socket, "SO_PEERCRED", 17, raising=False)
-    attestation = SimpleNamespace(pid=100)
-    monkeypatch.setattr(
-        peer, "read_attestation", lambda *args: (attestation.pid, "500")
-    )
-    monkeypatch.setattr(peer, "process_start_time", lambda pid: "500")
-    server = peer.HermesApprovalSocket(peer.parse_config(config()), Bridge())
+    cfg = peer.parse_config(config())
+    server = peer.HermesApprovalSocket(cfg, Bridge())
 
     async def exercise():
         reader, writer = asyncio.StreamReader(), Writer()
         task = accept(server, reader, writer)
-        attestation.pid = 200
+        cfg["gateways"][0]["profiles"].clear()
         reader.feed_data(b'{"profile":"/home/hermes/.hermes"}\n')
         await task
         assert json.loads(writer.output)["ok"] is False
