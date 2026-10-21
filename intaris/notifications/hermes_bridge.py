@@ -171,6 +171,7 @@ class HermesApprovalBridge:
             user_id=lease["user_id"],
             user_decision=decision,
             user_note=note,
+            user_note_source="system",
             resolved_by="integration" if lifecycle else "user",
             audit_store=self._audit,
             pending_only=True,
@@ -193,6 +194,16 @@ class HermesApprovalBridge:
                     return status
             self._state(lease, decision)
             return decision
+        if reason == "failed":
+            # Losing presentation does not withdraw the invoking tool's human
+            # wait. Keep the audit available to the UI, but never reopen or
+            # accept buttons for this failed presentation. Its original
+            # deadline still bounds recovery, including after a restart.
+            if lease["expires_at"] > self._clock() and self._active(lease):
+                if lease["state"] != "failed":
+                    self._state(lease, "failed")
+                return "failed"
+            reason = "expired"
         # A withdrawn invocation is not a user approval. Persist denial so
         # neither a late native tap nor an identical retry can reuse it.
         # Persist withdrawal intent before the audit write. A failure or crash
@@ -419,13 +430,16 @@ class HermesApprovalBridge:
                 )
                 cur.execute(
                     """SELECT * FROM hermes_approval_leases
-                    WHERE state IN ('pending', 'resolving') OR state LIKE 'retiring:%'"""
+                    WHERE state IN ('pending', 'resolving', 'failed')
+                       OR state LIKE 'retiring:%'"""
                 )
                 rows = [dict(row) for row in cur.fetchall()]
             for lease in rows:
                 try:
                     if lease["state"].startswith("retiring:"):
                         await self._retire(lease, lease["state"].split(":", 1)[1])
+                    elif lease["state"] == "failed":
+                        await self._retire(lease, "failed")
                     elif lease["expires_at"] <= self._clock() or not self._active(
                         lease
                     ):

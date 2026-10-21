@@ -1310,6 +1310,7 @@ def _poll_human(
                 if (
                     field_name != "user_decision"
                     or result.data.get("resolved_by") not in (None, "user")
+                    or result.data.get("user_note_source") not in (None, "user")
                     or not isinstance(note, str)
                     or not note.strip()
                 ):

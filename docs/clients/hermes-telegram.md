@@ -142,12 +142,13 @@ main PID and Linux process birth ticks into the attestation file. The format is:
 ```
 
 The second value is field 22 of `/proc/1234/stat`, parsed after the final `)`
-because process names can contain spaces. For example, run this under the
-operator account that owns the protected directory, after obtaining the
+because process names can contain spaces. For example, run this as root with
+the Intaris service group named `intaris`, after obtaining the
 gateway's **MainPID** from its actual systemd unit:
 
 ```bash
 python3 - "$GATEWAY_MAIN_PID" /run/intaris-native/hermes-gateway.pid <<'PY'
+import grp
 import os
 import sys
 import tempfile
@@ -157,6 +158,8 @@ pid = int(sys.argv[1])
 target = Path(sys.argv[2])
 start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 fd, temporary = tempfile.mkstemp(dir=target.parent)
+os.fchown(fd, 0, grp.getgrnam("intaris").gr_gid)
+os.fchmod(fd, 0o640)
 with os.fdopen(fd, "w") as output:
     output.write(f"{pid} {start}\n")
 os.replace(temporary, target)
@@ -188,12 +191,17 @@ deadline still applies. Completed, suspended, and terminated sessions or parents
 make the buttons non-actionable.
 
 Duplicate taps, moved/forwarded messages, late actions, and callbacks after an
-Intaris UI or judge decision cannot override that decision. Cancellation,
-expiration, and definite notification failure retire pending leases with a
-denial attributed to `resolved_by=integration`; actual button decisions are
-attributed to `resolved_by=user` with the numeric Telegram actor in the audit
-note. Every leased call has persisted `approval_scope=call`, including resolutions
-from the Intaris UI or judge. Its verdict never enters retry approval caches,
+Intaris UI or judge decision cannot override that decision. Cancellation
+and expiration retire pending leases with a denial attributed to
+`resolved_by=integration`. Failed or ambiguous Telegram delivery disables the
+native presentation while preserving the ordinary Intaris UI wait under its
+original deadline. Failed presentations cannot reopen or accept callbacks, and
+their deadline/cancellation still retires the invocation. Actual button decisions
+are attributed to `resolved_by=user` with the numeric Telegram actor in the audit
+note. That generated note carries `user_note_source=system` and is not forwarded
+as human guidance. Actual notes entered in the Intaris UI remain available to
+the invoking model. Every leased call has persisted `approval_scope=call`,
+including resolutions from the Intaris UI or judge. Its verdict never enters retry approval caches,
 human precedent, path learning, session alignment overrides, or intention updates.
 It is also excluded from later evaluator and judge model history, including
 prior judge outcomes; raw audit records remain available in the UI.

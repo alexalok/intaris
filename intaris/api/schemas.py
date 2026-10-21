@@ -304,6 +304,7 @@ class AuditRecord(BaseModel):
     injection_detected: bool = False
     user_decision: str | None = None
     user_note: str | None = None
+    user_note_source: str | None = None
     expired_at: str | None = None
     expiration_reason: str | None = None
     resolved_at: str | None = None

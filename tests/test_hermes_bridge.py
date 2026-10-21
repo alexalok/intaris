@@ -145,6 +145,32 @@ def test_origin_preserves_topic_and_actor_and_deduplicates(bridge):
     assert "echo safe" in lease["text"]
 
 
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_native_actor_attribution_is_system_text_not_human_guidance(bridge, decision):
+    from intaris.api.schemas import AuditRecord
+
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    assert decide(bridge, lease, decision=decision)["ok"]
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record["resolved_by"] == "user"
+    assert "Telegram user 42" in record["user_note"]
+    assert record.get("user_note_source") == "system"
+    assert (
+        AuditRecord.model_validate(record).model_dump()["user_note_source"] == "system"
+    )
+
+
+def test_ui_note_on_native_call_remains_human_guidance(bridge):
+    open_call(bridge)
+    bridge.audit.resolve_escalation(
+        "call-owner", "approve", "Use staging only", user_id="owner"
+    )
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record.get("user_note_source") == "user"
+    assert record["user_note"] == "Use staging only"
+
+
 @pytest.mark.parametrize(
     "origin",
     [
@@ -305,7 +331,7 @@ def test_profile_session_and_tenant_isolation(bridge):
     assert not open_call(bridge)["ok"]
 
 
-@pytest.mark.parametrize("reason", ["cancelled", "expired", "failed", "completed"])
+@pytest.mark.parametrize("reason", ["cancelled", "expired", "completed"])
 def test_close_pending_lease_prevents_late_approval(bridge, reason):
     lease = open_call(bridge)
     bind(bridge, lease)
@@ -320,6 +346,69 @@ def test_close_pending_lease_prevents_late_approval(bridge, reason):
         bridge.audit.get_by_call_id("call-owner", user_id="owner")["resolved_by"]
         == "integration"
     )
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_failed_presentation_keeps_ui_resolution_available(bridge, decision):
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    assert run(bridge, op="close", lease_id=lease["lease_id"], reason="failed") == {
+        "ok": True,
+        "status": "failed",
+    }
+    assert not decide(bridge, lease)["ok"]
+    assert not open_call(bridge)["ok"]
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record["user_decision"] is None
+    assert record["resolved_by"] is None
+    assert record["approval_scope"] == "call"
+    bridge.audit.resolve_escalation(
+        "call-owner",
+        decision,
+        "UI decision after failed Telegram send",
+        user_id="owner",
+    )
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) == decision
+    assert not decide(bridge, lease)["ok"]
+
+
+@pytest.mark.parametrize("outcome", ["deadline", "cancelled", "client_expired"])
+def test_failed_presentation_retains_original_lifetime(bridge, outcome):
+    from intaris.notifications.hermes_bridge import HermesApprovalBridge
+
+    lease = open_call(bridge)
+    assert run(bridge, op="close", lease_id=lease["lease_id"], reason="failed")["ok"]
+    bridge.service = HermesApprovalBridge(bridge.db, clock=lambda: bridge.clock.now)
+    bridge.clock.now = lease["expires_at"] - 1
+    asyncio.run(bridge.service.sweep())
+    assert (
+        bridge.audit.get_by_call_id("call-owner", user_id="owner")["user_decision"]
+        is None
+    )
+    assert not open_call(bridge)["ok"]
+    if outcome == "cancelled":
+        assert run(bridge, op="close", lease_id=lease["lease_id"], reason="cancelled")[
+            "ok"
+        ]
+    elif outcome == "client_expired":
+        bridge.audit.expire_escalation(
+            "call-owner", user_id="owner", session_id="s", reason="cancelled"
+        )
+    else:
+        bridge.clock.now = lease["expires_at"]
+    asyncio.run(bridge.service.sweep())
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    if outcome == "client_expired":
+        assert record["expired_at"] and record["user_decision"] is None
+    else:
+        assert record["user_decision"] == "deny"
+        assert record["resolved_by"] == "integration"
+    assert not decide(bridge, lease)["ok"]
+    bridge.clock.now = lease["expires_at"] + 3600
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) is None
+    assert not open_call(bridge)["ok"]
 
 
 def test_expiry_and_sweep_deny_pending_calls(bridge):
@@ -654,7 +743,6 @@ def test_call_scoped_grant_cannot_back_a_derived_approval_or_cache(bridge):
         ("denied", "deny", "deny", "user"),
         ("cancelled", "cancelled", "deny", "integration"),
         ("expired", "expired", "deny", "integration"),
-        ("failed", "failed", "deny", "integration"),
         ("completed_pending", "cancelled", "deny", "integration"),
     ],
 )

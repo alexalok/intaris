@@ -621,6 +621,7 @@ class AuditStore:
         *,
         user_id: str,
         resolved_by: str = "user",
+        user_note_source: str | None = None,
         judge_reasoning: str | None = None,
         judge_decision: str | None = None,
         judge_risk: str | None = None,
@@ -643,6 +644,8 @@ class AuditStore:
             user_note: Optional note from the resolver.
             user_id: Tenant identifier.
             resolved_by: Who resolved: "user" (human) or "judge" (LLM judge).
+            user_note_source: "user" for human text, "system" for attribution
+                or generated text. Defaults to the resolver's source.
             judge_reasoning: Judge's reasoning (stored when judge resolves).
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
@@ -673,6 +676,10 @@ class AuditStore:
             user_decision != "deny" or not pending_only
         ):
             raise ValueError("Integration lifecycle can only deny pending escalations")
+        if user_note_source is None:
+            user_note_source = "user" if resolved_by == "user" else "system"
+        if user_note_source not in ("user", "system"):
+            raise ValueError("Invalid user_note_source")
 
         if resolved_by != "judge" or user_decision != "approve":
             approval_source_call_id = None
@@ -689,7 +696,7 @@ class AuditStore:
                 """
                 UPDATE audit_log
                 SET user_decision = ?, user_note = ?, resolved_at = ?,
-                    resolved_by = ?,
+                    resolved_by = ?, user_note_source = ?,
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
@@ -714,6 +721,7 @@ class AuditStore:
                     user_note,
                     now,
                     resolved_by,
+                    user_note_source,
                     judge_reasoning,
                     judge_decision,
                     judge_risk,

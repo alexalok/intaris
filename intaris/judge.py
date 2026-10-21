@@ -1098,6 +1098,7 @@ async def resolve_with_side_effects(
     user_decision: str,
     user_note: str | None = None,
     resolved_by: str = "user",
+    user_note_source: str | None = None,
     judge_reasoning: str | None = None,
     judge_decision: str | None = None,
     judge_risk: str | None = None,
@@ -1133,6 +1134,7 @@ async def resolve_with_side_effects(
         user_decision: "approve" or "deny".
         user_note: Optional note from the resolver.
         resolved_by: "user" or "judge".
+        user_note_source: Human text or system-generated attribution.
         judge_reasoning: Judge's reasoning (when resolved_by="judge").
         judge_decision: Historical judge recommendation.
         judge_risk: Historical judge risk assessment.
@@ -1183,6 +1185,7 @@ async def resolve_with_side_effects(
         judge_decision=judge_decision,
         judge_risk=judge_risk,
         approval_source_call_id=approval_source_call_id,
+        **({"user_note_source": user_note_source} if user_note_source else {}),
         **({"pending_only": True} if pending_only else {}),
     )
 
