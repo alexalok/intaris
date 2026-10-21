@@ -304,10 +304,12 @@ class AuditRecord(BaseModel):
     injection_detected: bool = False
     user_decision: str | None = None
     user_note: str | None = None
+    user_note_source: str | None = None
     expired_at: str | None = None
     expiration_reason: str | None = None
     resolved_at: str | None = None
     resolved_by: str | None = None
+    approval_scope: str = "reusable"
     judge_reasoning: str | None = None
     judge_decision: str | None = None
     judge_risk: str | None = None

@@ -564,6 +564,19 @@ class TestLearnFromApprovedEscalation:
         key = ("user1", "session1")
         assert key not in evaluator._approved_paths
 
+    def test_call_only_approval_does_not_learn_path(self, evaluator: Evaluator):
+        evaluator.learn_from_approved_escalation(
+            {
+                "tool": "read",
+                "args_redacted": {"filePath": "/Users/foo/private/secret.txt"},
+                "user_id": "user1",
+                "session_id": "session1",
+                "resolved_by": "user",
+                "approval_scope": "call",
+            }
+        )
+        assert not evaluator._approved_paths
+
     def test_ignores_in_project_paths(self, evaluator: Evaluator):
         """Paths within working_directory are not cached (already fast-pathed)."""
         record = {

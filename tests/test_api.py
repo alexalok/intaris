@@ -989,13 +989,37 @@ def test_maximum_outcome_validation_and_refresh(client_no_auth):
     assert record["raw_decision"] == "deny"
 
 
-def test_shutdown_flushes_buffered_session_events(env_no_auth):
+@pytest.mark.parametrize("native_failure", [None, "error", "cancelled", "slow"])
+def test_shutdown_flushes_buffered_session_events(
+    env_no_auth, monkeypatch, native_failure
+):
     """Lifespan shutdown persists events that remain below flush thresholds."""
     from intaris.config import EventStoreConfig
     from intaris.events.backend import FilesystemEventBackend
     from intaris.server import create_app
 
+    if native_failure:
+        from intaris.notifications.hermes_peer import HermesApprovalSocket
+        from intaris.server import _get_config
+
+        # Exercise real service cleanup and persistence without a live Linux socket.
+        _get_config().notification.hermes_bridge = {"socket_path": "/run/native.sock"}
+        monkeypatch.setattr(HermesApprovalSocket, "start", AsyncMock())
+
+        async def slow_close():
+            await asyncio.sleep(30)
+
+        effect = {
+            "error": OSError("native socket unlink failed"),
+            "cancelled": asyncio.CancelledError(),
+            "slow": slow_close,
+        }[native_failure]
+        monkeypatch.setattr(
+            HermesApprovalSocket, "close", AsyncMock(side_effect=effect)
+        )
+
     headers = {"X-User-Id": "shutdown-user", "X-Agent-Id": "shutdown-agent"}
+    started = time.monotonic()
     with TestClient(create_app()) as client:
         create = client.post(
             "/api/v1/intention",
@@ -1010,6 +1034,7 @@ def test_shutdown_flushes_buffered_session_events(env_no_auth):
         )
         assert append.status_code == 200
 
+    assert time.monotonic() - started < 10
     backend = FilesystemEventBackend(
         EventStoreConfig(
             backend="filesystem",
@@ -2550,8 +2575,9 @@ class TestEvaluate:
         assert data["risk"] == "high"
         assert not data.get("requires_expiration")
 
+    @pytest.mark.parametrize("notify_mode", ["always", "deny_only"])
     def test_evaluate_advisory_defer_returns_escalate_once(
-        self, client_no_auth, monkeypatch
+        self, client_no_auth, monkeypatch, notify_mode
     ):
         """Unresolved judge outcomes emit a single escalation after judge wait."""
         from intaris.judge import JudgeEffectiveOutcome
@@ -2568,7 +2594,7 @@ class TestEvaluate:
 
         class _Reviewer:
             is_enabled = True
-            notify_mode = "always"
+            notify_mode = "never"
 
             async def review_for_evaluate(self, **kwargs):
                 return JudgeEffectiveOutcome(
@@ -2580,6 +2606,7 @@ class TestEvaluate:
                     notification_event_type="judge_deferral",
                 )
 
+        _Reviewer.notify_mode = notify_mode
         monkeypatch.setattr(
             "intaris.server._get_evaluator",
             lambda: _FakeEvaluator(result),
@@ -2663,7 +2690,8 @@ class TestEvaluate:
         assert "failed" in data["reasoning"]
         time.sleep(0.02)
         assert len(webhook.sent) == 1
-        assert len(dispatcher.notifications) == 0
+        assert len(dispatcher.notifications) == 1
+        assert dispatcher.notifications[0][1].event_type == "judge_error"
 
     def test_evaluate_judge_notify_never_skips_unresolved_channel_notification(
         self, client_no_auth, monkeypatch

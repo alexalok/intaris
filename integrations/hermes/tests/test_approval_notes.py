@@ -122,6 +122,12 @@ def test_resolution_note_reaches_model_without_replacing_result(
         {"user_note": False},
         {"user_note": {"untrusted": "not text"}},
         {"user_note": "Judge (high confidence)", "resolved_by": "judge"},
+        {
+            "user_note": "Telegram user 42; native call-specific approval",
+            "resolved_by": "user",
+            "user_note_source": "system",
+        },
+        {"user_note": "Unrecognized source", "user_note_source": "unknown"},
     ],
 )
 def test_missing_or_nonhuman_note_preserves_existing_behavior(
@@ -141,10 +147,13 @@ def test_missing_or_nonhuman_note_preserves_existing_behavior(
 
 
 @pytest.mark.parametrize("resolved_by", [None, "user"])
+@pytest.mark.parametrize("user_note_source", [None, "user"])
 def test_pending_note_is_ignored_and_terminal_note_is_used(
-    adapter, scripted_http, resolved_by
+    adapter, scripted_http, resolved_by, user_note_source
 ):
-    responses = replies(user_note=NOTE, resolved_by=resolved_by)
+    responses = replies(
+        user_note=NOTE, resolved_by=resolved_by, user_note_source=user_note_source
+    )
     responses.insert(-1, {"user_decision": None, "user_note": "stale pending note"})
     scripted_http(*responses)
     result = adapter.wrap('{"result": "ok"}')({}, session_id="A")

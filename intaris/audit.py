@@ -29,6 +29,7 @@ _USABLE_APPROVAL_SOURCE = """(
           AND source.session_id = audit_log.session_id
           AND source.resolved_by = 'user' AND source.user_decision = 'approve'
           AND source.expired_at IS NULL
+          AND source.approval_scope = 'reusable'
     )
 )"""
 
@@ -451,9 +452,10 @@ class AuditStore:
     ) -> list[dict[str, Any]]:
         """Get recent final human decisions for a session.
 
-        Only final human resolutions are returned. Judge-authored decisions
-        and expired approvals are excluded so this data can be treated as
-        authoritative human guidance. Expiration never removes human denials.
+        Only reusable final human resolutions are returned. Call-only grants,
+        judge-authored decisions, and expired approvals cannot become
+        authority for another invocation. Expiration never removes human
+        denials from this guidance.
 
         Args:
             session_id: Session to query.
@@ -476,6 +478,7 @@ class AuditStore:
                   AND user_decision IS NOT NULL
                   AND (expired_at IS NULL OR user_decision = 'deny')
                   AND resolved_by = 'user'
+                  AND approval_scope = 'reusable'
                   AND COALESCE(user_note, '') != 'Resolved via notification action link'
                 ORDER BY COALESCE(resolved_at, timestamp) DESC
                 LIMIT ?
@@ -520,6 +523,7 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  AND approval_scope = 'reusable'
                   AND expired_at IS NULL
                   AND {_USABLE_APPROVAL_SOURCE}
                   AND (outcome_override IS NULL OR outcome_override != ?)
@@ -558,6 +562,7 @@ class AuditStore:
                 WHERE user_id = ? AND call_id IN ({placeholders})
                   AND record_type = 'tool_call'
                   AND user_decision = 'approve' AND expired_at IS NULL
+                  AND approval_scope = 'reusable'
                   AND {_USABLE_APPROVAL_SOURCE}
                 """,
                 (user_id, *sorted(call_ids)),
@@ -616,9 +621,11 @@ class AuditStore:
         *,
         user_id: str,
         resolved_by: str = "user",
+        user_note_source: str | None = None,
         judge_reasoning: str | None = None,
         judge_decision: str | None = None,
         judge_risk: str | None = None,
+        pending_only: bool = False,
         approval_source_call_id: str | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
@@ -637,10 +644,18 @@ class AuditStore:
             user_note: Optional note from the resolver.
             user_id: Tenant identifier.
             resolved_by: Who resolved: "user" (human) or "judge" (LLM judge).
+            user_note_source: "user" for human text, "system" for attribution
+                or generated text. Defaults to the resolver's source.
             judge_reasoning: Judge's reasoning (stored when judge resolves).
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
             approval_source_call_id: Human grant used for a derived judge approval.
+            pending_only: Resolve only an unresolved escalation, without the
+                normal human override of a prior judge verdict. Native
+                callbacks use this to make stale buttons inert.
+
+        ``resolved_by="integration"`` is reserved for pending-only lifecycle
+        denials (withdrawal/expiry), never an approval or human precedent.
 
         Returns:
             Updated audit record.
@@ -653,10 +668,18 @@ class AuditStore:
             raise ValueError(
                 f"Invalid user_decision '{user_decision}'. Must be 'approve' or 'deny'."
             )
-        if resolved_by not in ("user", "judge"):
+        if resolved_by not in ("user", "judge", "integration"):
             raise ValueError(
-                f"Invalid resolved_by '{resolved_by}'. Must be 'user' or 'judge'."
+                f"Invalid resolved_by '{resolved_by}'. Must be 'user', 'judge', or 'integration'."
             )
+        if resolved_by == "integration" and (
+            user_decision != "deny" or not pending_only
+        ):
+            raise ValueError("Integration lifecycle can only deny pending escalations")
+        if user_note_source is None:
+            user_note_source = "user" if resolved_by == "user" else "system"
+        if user_note_source not in ("user", "system"):
+            raise ValueError("Invalid user_note_source")
 
         if resolved_by != "judge" or user_decision != "approve":
             approval_source_call_id = None
@@ -673,7 +696,7 @@ class AuditStore:
                 """
                 UPDATE audit_log
                 SET user_decision = ?, user_note = ?, resolved_at = ?,
-                    resolved_by = ?,
+                    resolved_by = ?, user_note_source = ?,
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
@@ -682,6 +705,7 @@ class AuditStore:
                   AND decision IN ('escalate', 'deny')
                   AND expired_at IS NULL
                   AND (user_decision IS NULL OR resolved_by = 'judge')
+                  AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                   AND (CAST(? AS TEXT) IS NULL OR EXISTS (
                       SELECT 1 FROM audit_log AS source
@@ -689,6 +713,7 @@ class AuditStore:
                         AND source.session_id = audit_log.session_id
                         AND source.resolved_by = 'user'
                         AND source.user_decision = 'approve' AND source.expired_at IS NULL
+                         AND source.approval_scope = 'reusable'
                   ))
                 """,
                 (
@@ -696,6 +721,7 @@ class AuditStore:
                     user_note,
                     now,
                     resolved_by,
+                    user_note_source,
                     judge_reasoning,
                     judge_decision,
                     judge_risk,
@@ -703,6 +729,7 @@ class AuditStore:
                     approval_source_call_id,
                     call_id,
                     user_id,
+                    int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
                     approval_source_call_id,

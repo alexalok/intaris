@@ -313,6 +313,18 @@ SAFETY_EVALUATION_SCHEMA: dict[str, Any] = {
 }
 
 
+def filter_model_history(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Exclude call-scoped approvals from context for later model decisions.
+
+    Their notes and outcomes authorize only the original invocation, not
+    future calls. Keep the raw audit records intact for UI and audit use.
+    Records without an explicit scope retain legacy reusable behavior.
+    """
+    return [record for record in records if record.get("approval_scope") != "call"]
+
+
 def build_evaluation_user_prompt(
     *,
     intention: str,
@@ -391,6 +403,7 @@ def build_evaluation_user_prompt(
     # Recent history — wrapped in boundary tags.
     # History includes prior LLM reasoning which could be poisoned
     # (feedback loop), so we sanitize and wrap the entire block.
+    recent_history = filter_model_history(recent_history)
     if recent_history:
         history_lines = []
         for record in recent_history[:10]:
