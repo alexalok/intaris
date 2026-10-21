@@ -582,6 +582,71 @@ def lease_state(bridge, lease):
     return row["state"] if row is not None else None
 
 
+def test_client_expired_call_cannot_open_native_prompt(bridge):
+    bridge.audit.expire_escalation(
+        "call-owner", user_id="owner", session_id="s", reason="cancelled"
+    )
+    assert not open_call(bridge)["ok"]
+    with bridge.db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM hermes_approval_leases")
+        assert cur.fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("retire", ["close", "sweep"])
+def test_client_expiration_retires_and_prunes_native_lease(bridge, resolved, retire):
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    if resolved:
+        assert decide(bridge, lease)["ok"]
+    record = bridge.audit.expire_escalation(
+        "call-owner", user_id="owner", session_id="s", reason="cancelled"
+    )
+    if retire == "close":
+        assert run(
+            bridge, op="close", lease_id=lease["lease_id"], reason="completed"
+        ) == {"ok": True, "status": "expired"}
+    else:
+        asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) == "expired"
+    assert not decide(bridge, lease)["ok"]
+    assert not open_call(bridge)["ok"]
+    assert bridge.audit.get_by_call_id("call-owner", user_id="owner") == record
+    bridge.clock.now = lease["expires_at"] + 3600
+    asyncio.run(bridge.service.sweep())
+    assert lease_state(bridge, lease) is None
+    assert bridge.audit.get_by_call_id("call-owner", user_id="owner") == record
+
+
+def test_call_scoped_grant_cannot_back_a_derived_approval_or_cache(bridge):
+    lease = open_call(bridge)
+    assert bind(bridge, lease)["ok"]
+    assert decide(bridge, lease)["ok"]
+    assert not bridge.audit.approvals_are_usable({"call-owner"}, user_id="owner")
+    bridge.audit.insert(
+        call_id="derived",
+        user_id="owner",
+        session_id="s",
+        agent_id="hermes",
+        tool="terminal",
+        args_redacted={},
+        classification="WRITE",
+        decision="escalate",
+        risk="medium",
+        reasoning="Needs a human",
+        evaluation_path="llm",
+        latency_ms=1,
+    )
+    with pytest.raises(ValueError):
+        bridge.audit.resolve_escalation(
+            "derived",
+            "approve",
+            user_id="owner",
+            resolved_by="judge",
+            approval_source_call_id="call-owner",
+        )
+
+
 @pytest.mark.parametrize(
     "outcome,status,decision,resolver",
     [

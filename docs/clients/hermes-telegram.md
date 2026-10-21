@@ -198,9 +198,12 @@ human precedent, path learning, session alignment overrides, or intention update
 It is also excluded from later evaluator and judge model history, including
 prior judge outcomes; raw audit records remain available in the UI.
 Failed withdrawal writes remain recoverable and are retried by the server sweep.
-Settled leases with durable audit verdicts are removed one hour after their
-original deadline. The audit verdict remains, so late requests cannot reopen a
-settled call. Unfinished or unresolved withdrawals are retained for recovery.
+Explicit client expiration also retires native leases, including when it races
+with a human or judge verdict. It prevents new prompts and callbacks without
+overwriting that audit history. Settled leases with durable audit verdicts or
+client expiration are removed one hour after their original deadline. The audit
+record remains, so late requests cannot reopen a settled call. Unfinished or
+unresolved withdrawals are retained for recovery.
 
 Resolution or withdrawal removes buttons and updates the original message when
 Telegram is reachable. If editing fails, the server still rejects stale buttons.

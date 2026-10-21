@@ -117,6 +117,7 @@ class HermesApprovalBridge:
         return (
             record.get("decision") == "escalate"
             and record.get("user_decision") is None
+            and not record.get("expired_at")
             and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
         )
 
@@ -180,6 +181,9 @@ class HermesApprovalBridge:
         if lease["state"].startswith("retiring:"):
             reason = lease["state"].split(":", 1)[1]
         record = self._audit.get_by_call_id(lease["call_id"], user_id=lease["user_id"])
+        if record.get("expired_at"):
+            self._state(lease, "expired")
+            return "expired"
         decision = record.get("user_decision")
         if decision:
             if record.get("resolved_by") == "integration":
@@ -206,6 +210,9 @@ class HermesApprovalBridge:
                 record = self._audit.get_by_call_id(
                     lease["call_id"], user_id=lease["user_id"]
                 )
+                if record.get("expired_at"):
+                    self._state(lease, "expired")
+                    return "expired"
                 if record.get("user_decision"):
                     self._state(lease, record["user_decision"])
                     return record["user_decision"]
@@ -302,7 +309,7 @@ class HermesApprovalBridge:
                 cur.execute(
                     """UPDATE audit_log SET approval_scope = 'call'
                     WHERE call_id = ? AND user_id = ? AND decision = 'escalate'
-                      AND user_decision IS NULL""",
+                      AND user_decision IS NULL AND expired_at IS NULL""",
                     (lease["call_id"], lease["user_id"]),
                 )
                 if cur.rowcount != 1:
@@ -399,6 +406,17 @@ class HermesApprovalBridge:
         """Reconcile unfinished calls and prune settled leases after a grace period."""
         async with self._lock:
             with self._db.cursor() as cur:
+                # Client expiration is durable even when a verdict raced it.
+                # Preserve audit history and retire presentation independently.
+                cur.execute(
+                    """UPDATE hermes_approval_leases SET state = 'expired'
+                    WHERE state != 'expired' AND EXISTS (
+                        SELECT 1 FROM audit_log
+                        WHERE audit_log.user_id = hermes_approval_leases.user_id
+                          AND audit_log.call_id = hermes_approval_leases.call_id
+                          AND audit_log.expired_at IS NOT NULL
+                    )"""
+                )
                 cur.execute(
                     """SELECT * FROM hermes_approval_leases
                     WHERE state IN ('pending', 'resolving') OR state LIKE 'retiring:%'"""
@@ -432,7 +450,8 @@ class HermesApprovalBridge:
                         SELECT 1 FROM audit_log
                         WHERE audit_log.user_id = hermes_approval_leases.user_id
                           AND audit_log.call_id = hermes_approval_leases.call_id
-                          AND audit_log.user_decision IS NOT NULL
+                          AND (audit_log.user_decision IS NOT NULL
+                               OR audit_log.expired_at IS NOT NULL)
                       )""",
                     (self._clock() - _SETTLED_LEASE_GRACE_SECONDS,),
                 )

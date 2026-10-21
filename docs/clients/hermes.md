@@ -95,6 +95,42 @@ dispatch, including after reactivation and re-evaluation. Hosts without the
 required wait/interrupt APIs return an approval/retry error instead of polling.
 See [compatibility and cancellation limits](../../integrations/hermes/README.md#approval-deadlines-and-cancellation).
 
+### Approval Expiration Reporting
+
+When a native guarded invocation exits before dispatch, Hermes reports its known
+escalation ID to `POST /api/v1/audit/{call_id}/expire` with the captured Intaris
+`session_id` and a reason: `timeout`, `cancelled`, or `abandoned`. Invalid or
+rejected polling, missing safe-wait support, and a changed tool registration count
+as abandonment. Cancellation is checked again before entering an async handler.
+An explicit denial, an already-expired audit, or a handler that has started is not
+retired. Handler failures after entry retain native execution semantics.
+
+Expiration is idempotent and can supersede an approval that raced cancellation;
+the audit retains human/judge decision history. Polling gives `expired_at`
+precedence over that history and returns a distinct **APPROVAL EXPIRED** error,
+never permission to dispatch. A late evaluation reply after cancellation is also
+retired if it identifies an escalation, using the original client and session.
+Inline judge/human approvals retain this lifecycle through the server's
+`requires_expiration: true` response field. Such approvals require a nonempty
+`call_id` and remain tracked until dispatch; direct approvals and final denials
+are not retired. Older servers without the field cannot identify inline approvals
+for cleanup. Cleanup never sends another evaluation or execution request.
+
+Reporting is best effort and nonblocking: up to 128 reports queue behind four
+daemon workers. Each report gets at most three delivery attempts, a two-second
+socket timeout per attempt, and short retry delays for transport/5xx failures.
+Workers drain queued reports and exit when idle. Queue overflow, unavailable
+workers, exhausted retries, and malformed acknowledgments log that expiration is
+**not confirmed**. A `404` logs a server compatibility limitation; an older server
+may lack the endpoint. Local blocking still applies, including with fail-open
+enabled, and a failed report is never described as successfully recorded.
+
+The queue is in memory, with no durable spool or shutdown flush guarantee. A
+process crash/exit, unreachable endpoint, or sustained queue overload can leave
+server approvals pending. If evaluation never returns an identifiable call ID,
+Hermes cannot report its expiration. There is no server lease or automatic expiry
+inferred from silence. Existing approval timeout settings are unchanged.
+
 ### MCP Tool Proxy
 
 When `INTARIS_MCP_TOOLS=true` (default), the plugin:
@@ -104,6 +140,11 @@ When `INTARIS_MCP_TOOLS=true` (default), the plugin:
 3. Refreshes the cache when stale (TTL-based)
 4. Proxies tool execution through `POST /api/v1/mcp/call`
 5. Safety evaluation happens server-side -- MCP tools are not wrapped by the tool registry guard to avoid double evaluation
+
+MCP escalations return immediately with instructions to approve and retry; there
+is no waiting native invocation to retire. Returning an MCP escalation or ending
+its Hermes session does **not** expire that approval. The existing server-side
+MCP retry flow is preserved.
 
 ## Behavioral Analysis
 

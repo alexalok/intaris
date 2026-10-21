@@ -66,7 +66,7 @@ class _Reservation:
 
 
 class _DispatchCoordinator:
-    version = 1
+    version = 2
 
     def __init__(self, registry: Any, current_home: Callable[[], str]) -> None:
         saved = registry.dispatch
@@ -166,7 +166,15 @@ class _DispatchCoordinator:
         entry = owner.make_entry(source, scope)
         view = DispatchView(self.registry, entry, scope)
         # Calling the bound saved method would ignore the invocation-local view.
-        return self.saved.__func__(view, name, args, scope=scope, **kwargs)
+        result = self.saved.__func__(view, name, args, scope=scope, **kwargs)
+        # Only this invocation's transient guard may decorate the normalized
+        # result. Provider errors retain Hermes' native sanitization/shape.
+        metadata = getattr(entry.handler, "__dict__", {})
+        if metadata.get("_intaris_guard") is entry.handler:
+            finish = metadata.get("_intaris_finish_result")
+            if finish is not None:
+                result = finish(result)
+        return result
 
     def dispatch(
         self, name: str, args: dict, *, scope: str | None = None, **kwargs: Any
@@ -208,7 +216,10 @@ def install_dispatch_guard(
             coordinator = _DispatchCoordinator(registry, current_home)
             setattr(registry, _COORDINATOR_ATTR, coordinator)
             registry.dispatch = coordinator.shim
-        elif coordinator.version != 1 or registry.dispatch is not coordinator.shim:
+        elif (
+            coordinator.version != _DispatchCoordinator.version
+            or registry.dispatch is not coordinator.shim
+        ):
             raise RuntimeError("Hermes registry dispatcher changed outside Intaris")
         owner = DispatchOwner(coordinator, profile, make_entry)
         coordinator.owners.setdefault(profile.home, []).append(owner)

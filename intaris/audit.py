@@ -19,6 +19,28 @@ from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
 logger = logging.getLogger(__name__)
 
+# Judge grants mechanically derived from a human approval retain that one-hop
+# dependency for future reuse. Their original waiting invocation is unaffected.
+_USABLE_APPROVAL_SOURCE = """(
+    approval_source_call_id IS NULL OR EXISTS (
+        SELECT 1 FROM audit_log AS source
+        WHERE source.call_id = audit_log.approval_source_call_id
+          AND source.user_id = audit_log.user_id
+          AND source.session_id = audit_log.session_id
+          AND source.resolved_by = 'user' AND source.user_decision = 'approve'
+          AND source.expired_at IS NULL
+          AND source.approval_scope = 'reusable'
+    )
+)"""
+
+
+class ApprovalExpiredError(ValueError):
+    """The originating client has retired this guarded invocation."""
+
+
+class ApprovalNotFoundError(ValueError):
+    """No approval exists in the supplied tenant and session scope."""
+
 
 class AuditStore:
     """Audit log CRUD backed by SQLite.
@@ -214,6 +236,9 @@ class AuditStore:
             "latency_ms": latency_ms,
             "user_decision": None,
             "user_note": None,
+            "expired_at": None,
+            "expiration_reason": None,
+            "approval_source_call_id": None,
             "resolved_at": None,
             "resolved_by": None,
             "judge_reasoning": None,
@@ -283,10 +308,9 @@ class AuditStore:
         Args:
             user_id: Tenant identifier (always required).
             record_type: Filter by record type (tool_call, reasoning, checkpoint).
-            resolved: Filter by resolution status. ``True`` returns only
-                records with a user_decision set, ``False`` returns only
-                unresolved records (user_decision IS NULL). ``None`` (default)
-                returns all records regardless of resolution status.
+            resolved: Filter by actionable status. ``True`` includes human/judge
+                resolutions and expired invocations. ``False`` excludes both.
+                ``None`` (default) returns the complete evaluation history.
 
         Returns:
             Dict with 'items', 'total', 'page', 'pages'.
@@ -325,9 +349,9 @@ class AuditStore:
             conditions.append("timestamp <= ?")
             params.append(to_ts)
         if resolved is True:
-            conditions.append("user_decision IS NOT NULL")
+            conditions.append("(user_decision IS NOT NULL OR expired_at IS NOT NULL)")
         elif resolved is False:
-            conditions.append("user_decision IS NULL")
+            conditions.append("user_decision IS NULL AND expired_at IS NULL")
             # Judge-only provisional calls must not appear in human approvals.
             conditions.append("(outcome_override IS NULL OR outcome_override != ?)")
             params.append(UNATTENDED_JUDGE_REVIEW)
@@ -428,10 +452,10 @@ class AuditStore:
     ) -> list[dict[str, Any]]:
         """Get recent final human decisions for a session.
 
-        Only reusable final human resolutions are returned. Call-only approvals
-        never become authority for another invocation. Judge-authored decisions
-        are excluded so this data can be treated as authoritative human
-        guidance in evaluator, judge, and intention prompts.
+        Only reusable final human resolutions are returned. Call-only grants,
+        judge-authored decisions, and expired approvals cannot become
+        authority for another invocation. Expiration never removes human
+        denials from this guidance.
 
         Args:
             session_id: Session to query.
@@ -452,6 +476,7 @@ class AuditStore:
                 WHERE user_id = ? AND session_id = ?
                   AND record_type = 'tool_call'
                   AND user_decision IS NOT NULL
+                  AND (expired_at IS NULL OR user_decision = 'deny')
                   AND resolved_by = 'user'
                   AND approval_scope = 'reusable'
                   AND COALESCE(user_note, '') != 'Resolved via notification action link'
@@ -494,11 +519,13 @@ class AuditStore:
         """
         with self._db.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
                   AND approval_scope = 'reusable'
+                  AND expired_at IS NULL
+                  AND {_USABLE_APPROVAL_SOURCE}
                   AND (outcome_override IS NULL OR outcome_override != ?)
                   AND (
                       resolved_by = 'user'
@@ -518,6 +545,74 @@ class AuditStore:
             return None
         return dict(row)
 
+    def approvals_are_usable(self, call_ids: set[str], *, user_id: str) -> bool:
+        """Validate every cached permission source against current audit state.
+
+        Approval retries can cross sessions within a tenant. Missing, expired,
+        or no-longer-approved sources invalidate the dependent path cache.
+        Database failures propagate rather than authorizing a cache hit.
+        """
+        if not call_ids:
+            return True
+        placeholders = ", ".join("?" for _ in call_ids)
+        with self._db.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS total FROM audit_log
+                WHERE user_id = ? AND call_id IN ({placeholders})
+                  AND record_type = 'tool_call'
+                  AND user_decision = 'approve' AND expired_at IS NULL
+                  AND approval_scope = 'reusable'
+                  AND {_USABLE_APPROVAL_SOURCE}
+                """,
+                (user_id, *sorted(call_ids)),
+            )
+            return cur.fetchone()["total"] == len(call_ids)
+
+    def expire_escalation(
+        self,
+        call_id: str,
+        *,
+        user_id: str,
+        session_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Retire a guarded invocation on explicit evidence from its client.
+
+        Expiration is independent of the evaluation and any human/judge decision.
+        It may follow a raced approval, but never erases that decision. The first
+        expiration wins, and repeated delivery is harmless. Age or session status
+        alone cannot establish whether a client still intends to retry a call.
+        """
+        if reason not in {"timeout", "cancelled", "abandoned"}:
+            raise ValueError(
+                "Expiration reason must be timeout, cancelled, or abandoned"
+            )
+        if not session_id:
+            raise ValueError("Expiration requires the originating session_id")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE audit_log SET expired_at = ?, expiration_reason = ?
+                WHERE call_id = ? AND user_id = ? AND session_id = ?
+                  AND record_type = 'tool_call' AND decision = 'escalate'
+                  AND expired_at IS NULL
+                """,
+                (now, reason, call_id, user_id, session_id),
+            )
+            cur.execute(
+                "SELECT * FROM audit_log WHERE call_id = ? AND user_id = ? AND session_id = ?",
+                (call_id, user_id, session_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ApprovalNotFoundError("Approval not found in this session")
+            if row["decision"] != "escalate" or row["record_type"] != "tool_call":
+                raise ValueError("Only escalated tool calls can expire")
+            record = _row_to_dict(row)
+        return record
+
     def resolve_escalation(
         self,
         call_id: str,
@@ -530,6 +625,7 @@ class AuditStore:
         judge_decision: str | None = None,
         judge_risk: str | None = None,
         pending_only: bool = False,
+        approval_source_call_id: str | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -550,6 +646,7 @@ class AuditStore:
             judge_reasoning: Judge's reasoning (stored when judge resolves).
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
+            approval_source_call_id: Human grant used for a derived judge approval.
             pending_only: Resolve only an unresolved escalation, without the
                 normal human override of a prior judge verdict. Native
                 callbacks use this to make stale buttons inert.
@@ -577,6 +674,8 @@ class AuditStore:
         ):
             raise ValueError("Integration lifecycle can only deny pending escalations")
 
+        if resolved_by != "judge" or user_decision != "approve":
+            approval_source_call_id = None
         now = datetime.now(timezone.utc).isoformat()
 
         # Atomic update: conditions in WHERE prevent TOCTOU races.
@@ -594,12 +693,21 @@ class AuditStore:
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
-                    effective_decision = ?
+                    effective_decision = ?, approval_source_call_id = ?
                 WHERE call_id = ? AND user_id = ?
                   AND decision IN ('escalate', 'deny')
+                  AND expired_at IS NULL
                   AND (user_decision IS NULL OR resolved_by = 'judge')
                   AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
+                  AND (CAST(? AS TEXT) IS NULL OR EXISTS (
+                      SELECT 1 FROM audit_log AS source
+                      WHERE source.call_id = ? AND source.user_id = audit_log.user_id
+                        AND source.session_id = audit_log.session_id
+                        AND source.resolved_by = 'user'
+                        AND source.user_decision = 'approve' AND source.expired_at IS NULL
+                         AND source.approval_scope = 'reusable'
+                  ))
                 """,
                 (
                     user_decision,
@@ -610,16 +718,25 @@ class AuditStore:
                     judge_decision,
                     judge_risk,
                     user_decision,
+                    approval_source_call_id,
                     call_id,
                     user_id,
                     int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
+                    approval_source_call_id,
+                    approval_source_call_id,
                 ),
             )
             if cur.rowcount == 0:
                 # Determine why the update failed for a clear error message
                 record = self.get_by_call_id(call_id, user_id=user_id)
+                if record.get("expired_at"):
+                    raise ApprovalExpiredError(
+                        f"Call {call_id} expired; its invocation is no longer waiting"
+                    )
+                if approval_source_call_id:
+                    raise ValueError("Human approval source is no longer usable")
                 if (
                     resolved_by == "user"
                     and record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
@@ -686,6 +803,7 @@ class AuditStore:
                 WHERE call_id = ? AND user_id = ?
                   AND decision = 'escalate'
                   AND user_decision IS NULL
+                  AND expired_at IS NULL
                 """,
                 (
                     judge_reasoning,
@@ -739,12 +857,14 @@ class AuditStore:
         """Get recent explicit judge approvals/denials before a review point."""
         with self._db.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT * FROM audit_log
                 WHERE session_id = ? AND user_id = ?
                   AND record_type = 'tool_call'
                   AND resolved_by = 'judge'
                   AND judge_decision IN ('approve', 'deny')
+                  AND (expired_at IS NULL OR judge_decision = 'deny')
+                  AND (judge_decision = 'deny' OR {_USABLE_APPROVAL_SOURCE})
                   AND (
                     timestamp < ?
                     OR (timestamp = ? AND id < ?)

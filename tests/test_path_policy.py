@@ -533,6 +533,8 @@ class TestLearnFromApprovedEscalation:
     def test_learns_prefix_from_read_approval(self, evaluator: Evaluator):
         """Approving a read escalation caches the path prefix."""
         record = {
+            "call_id": "approved-read",
+            "user_decision": "approve",
             "tool": "read",
             "args_redacted": {
                 "filePath": "/Users/foo/.cache/opencode/node_modules/pkg/index.js"
@@ -550,6 +552,8 @@ class TestLearnFromApprovedEscalation:
     def test_ignores_write_tools(self, evaluator: Evaluator):
         """Write tools are not cached even if approved."""
         record = {
+            "call_id": "approved-read",
+            "user_decision": "approve",
             "tool": "write",
             "args_redacted": {"filePath": "/tmp/output.txt", "content": "data"},
             "user_id": "user1",
@@ -576,6 +580,8 @@ class TestLearnFromApprovedEscalation:
     def test_ignores_in_project_paths(self, evaluator: Evaluator):
         """Paths within working_directory are not cached (already fast-pathed)."""
         record = {
+            "call_id": "approved-read",
+            "user_decision": "approve",
             "tool": "read",
             "args_redacted": {"filePath": "/Users/foo/src/intaris/intaris/server.py"},
             "user_id": "user1",
@@ -589,6 +595,8 @@ class TestLearnFromApprovedEscalation:
     def test_ignores_missing_args(self, evaluator: Evaluator):
         """Records without args_redacted are ignored."""
         record = {
+            "call_id": "approved-read",
+            "user_decision": "approve",
             "tool": "read",
             "args_redacted": None,
             "user_id": "user1",
@@ -607,6 +615,8 @@ class TestLearnFromApprovedEscalation:
             "details": {},
         }
         record = {
+            "call_id": "approved-read",
+            "user_decision": "approve",
             "tool": "read",
             "args_redacted": {"filePath": "/tmp/file.txt"},
             "user_id": "user1",

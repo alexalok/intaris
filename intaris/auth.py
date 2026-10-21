@@ -185,7 +185,7 @@ def match_api_key(token: str, api_keys: dict[str, str]) -> str | None:
 # Native adapter surfaces only. New routes remain denied until explicitly reviewed.
 _AGENT_ROUTES = {
     "POST": re.compile(
-        r"/api/v1/(?:evaluate|intention|reasoning|checkpoint|session/[^/]+/(?:agent-summary|events|events/flush))"
+        r"/api/v1/(?:evaluate|intention|reasoning|checkpoint|audit/[^/]+/expire|session/[^/]+/(?:agent-summary|events|events/flush))"
     ),
     "GET": re.compile(r"/api/v1/(?:session/[^/]+(?:/summary)?|audit/[^/]+|profile)"),
     "PATCH": re.compile(r"/api/v1/session/[^/]+(?:/status)?"),

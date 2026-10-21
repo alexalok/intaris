@@ -41,12 +41,14 @@ Configuration via profile-scoped Hermes env/credentials and plugin settings:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -1164,11 +1166,76 @@ def _decision_response_error(result: ApiResult) -> str | None:
         return (
             "Invalid API response: expected decision 'approve', 'deny', or 'escalate'"
         )
-    if decision == "escalate":
+    if decision == "escalate" or (
+        decision == "approve" and result.data.get("requires_expiration") is True
+    ):
         call_id = result.data.get("call_id")
         if not isinstance(call_id, str) or not call_id.strip():
             return "Invalid API response: escalation requires a non-empty call_id"
     return None
+
+
+@dataclass(frozen=True)
+class _HumanPollResult:
+    """A terminal outcome and optional human note from the same audit response."""
+
+    value: str
+    user_note: str | None = None
+
+
+class _NativeApproval:
+    """Track only native escalations that have not crossed the dispatch boundary."""
+
+    def __init__(
+        self, client: IntarisClient, session_id: str, invocation: Invocation
+    ) -> None:
+        self.client = client
+        self.session_id = session_id
+        self.invocation = invocation
+        self.pending: set[str] = set()
+
+    @staticmethod
+    def escalation_id(result: ApiResult) -> str | None:
+        """Return only an explicit, identifiable, unexpired escalation."""
+        if result.protocol_error or not isinstance(result.data, dict):
+            return None
+        data = result.data
+        if data.get("decision") != "escalate" and not (
+            data.get("decision") == "approve"
+            and data.get("requires_expiration") is True
+        ):
+            return None
+        if isinstance(data.get("expired_at"), str) and data["expired_at"].strip():
+            return None
+        call_id = data.get("call_id")
+        return call_id if isinstance(call_id, str) and call_id.strip() else None
+
+    def abandon(self, result: ApiResult, reason: str) -> None:
+        """Retire a late evaluate result using its captured client/session."""
+        call_id = self.escalation_id(result)
+        if call_id is not None:
+            self.client.report_expiration(call_id, self.session_id, reason)
+
+    def evaluate(self, tool: str, args: dict, **kwargs: Any) -> ApiResult:
+        """Register a known escalation before any further pre-dispatch work."""
+        result = self.invocation.request(
+            lambda: self.client.evaluate(self.session_id, tool, args, **kwargs),
+            on_abandoned=self.abandon,
+        )
+        call_id = self.escalation_id(result)
+        if call_id is not None:
+            self.pending.add(call_id)
+        return result
+
+    def settle(self, call_id: str) -> None:
+        """Stop tracking an explicit denial, expired audit or dispatched call."""
+        self.pending.discard(call_id)
+
+    def retire(self, reason: str) -> None:
+        """Retire remaining calls on every non-dispatch exit, without waiting."""
+        pending, self.pending = self.pending, set()
+        for call_id in pending:
+            self.client.report_expiration(call_id, self.session_id, reason)
 
 
 def _poll_human(
@@ -1177,8 +1244,10 @@ def _poll_human(
     fetch: Callable[[], ApiResult],
     field_name: str,
     terminal_values: tuple[str, ...],
+    *,
     presentation: Callable | None = None,
-) -> str:
+    on_settled: Callable[[], None] | None = None,
+) -> _HumanPollResult:
     """Poll only while the originating invocation and its approval budget live."""
     backoff = [2.0, 4.0, 8.0, 16.0, 30.0]
     start = time.monotonic()
@@ -1207,20 +1276,45 @@ def _poll_human(
             attempt += 1
             result = invocation.request(fetch)
             if result.protocol_error:
-                return "invalid_response"
+                return _HumanPollResult("invalid_response")
             if result.data is None:
+                if result.status is not None and 400 <= result.status < 500:
+                    return _HumanPollResult("invalid_response")
                 continue  # Server unreachable; remain within the wait budget.
             if not isinstance(result.data, dict):
-                return "invalid_response"
+                return _HumanPollResult("invalid_response")
             value = result.data.get(field_name)
             if field_name == "user_decision":
+                expired_at = result.data.get("expired_at")
+                expiration_reason = result.data.get("expiration_reason")
+                if expired_at is not None:
+                    if not isinstance(expired_at, str) or not expired_at.strip():
+                        return _HumanPollResult("invalid_response")
+                    # Expiration takes precedence over retained human/judge history.
+                    if on_settled is not None:
+                        on_settled()
+                    return _HumanPollResult("expired")
+                if expiration_reason is not None:
+                    return _HumanPollResult("invalid_response")
                 if field_name not in result.data:
-                    return "invalid_response"
+                    return _HumanPollResult("invalid_response")
                 if value is not None and value not in terminal_values:
-                    return "invalid_response"
+                    return _HumanPollResult("invalid_response")
             if value in terminal_values:
+                if value == "deny" and on_settled is not None:
+                    on_settled()
                 logger.info("[intaris] %s: %s", label, value)
-                return value
+                note = result.data.get("user_note")
+                # Older servers may omit resolver identity. Explicit judge
+                # resolutions also use user_note, but are not human guidance.
+                if (
+                    field_name != "user_decision"
+                    or result.data.get("resolved_by") not in (None, "user")
+                    or not isinstance(note, str)
+                    or not note.strip()
+                ):
+                    note = None
+                return _HumanPollResult(value, note)
 
 
 def _poll_escalation(
@@ -1231,7 +1325,8 @@ def _poll_escalation(
     *,
     session_id: str,
     intaris_session_id: str,
-) -> str:
+    on_settled: Callable[[], None] | None = None,
+) -> _HumanPollResult:
     """Poll for escalation resolution within a Hermes human-wait window."""
     assert profile.client is not None
     client = profile.client
@@ -1253,8 +1348,8 @@ def _poll_escalation(
             if native is not None
             else None
         ),
+        on_settled=on_settled,
     )
-    # No decision yet — continue polling
 
 
 def _poll_session_status(
@@ -1269,8 +1364,137 @@ def _poll_session_status(
         lambda: client.get_session(session_id),
         "status",
         ("active", "terminated"),
-    )
-    # Still suspended — continue polling
+    ).value
+
+
+def _with_approval_note(result: Any, resolution: _HumanPollResult, call_id: str) -> Any:
+    """Add human guidance to this invocation's result without losing tool data."""
+    if resolution.user_note is None:
+        return result
+    if inspect.isawaitable(result):
+
+        async def finish() -> Any:
+            return _with_approval_note(await result, resolution, call_id)
+
+        return finish()
+
+    note = {
+        "source": "human",
+        "call_id": call_id,
+        "decision": resolution.value,
+        "user_note": resolution.user_note,
+    }
+    fields = []
+    if isinstance(result, str):
+        # Hermes' fallback scans only the first 500 raw characters. Retain
+        # an existing signal before arbitrarily long call IDs/human notes.
+        # This is adapter-computed compatibility data, not human guidance.
+        for signal in ("error", "failed"):
+            if f'"{signal}"' in result[:500].lower():
+                fields.append(f'"native_failure_signal": "{signal}"')
+                break
+    for name, value in note.items():
+        encoded = json.dumps(value, ensure_ascii=False)
+        # Hermes scans raw result text for quoted "error"/"failed". Escape
+        # matching suffixes, including a token after an embedded quote, without
+        # changing decoded guidance or native tool failure fields.
+        if value.lower().endswith(("error", "failed")):
+            encoded = f'{encoded[:-2]}\\u{ord(value[-1]):04x}"'
+        fields.append(f"{json.dumps(name)}: {encoded}")
+    encoded_note = "{" + ", ".join(fields) + "}"
+    annotation = "[Intaris human decision note]\n" + encoded_note
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (ValueError, RecursionError):
+            if result.startswith("Error"):
+                # Hermes recognizes this plain-text prefix as a tool failure.
+                # Preserve that signal when our note moves ahead of the text.
+                data = {"error": result}
+                result = json.dumps(data, ensure_ascii=False)
+            else:
+                return annotation + "\n\n" + result
+        if not isinstance(data, dict):
+            data = {"tool_result": data}
+            result = '{"tool_result": ' + result + "}"
+        if (
+            set(data) <= {"result", "structuredContent", "_meta"}
+            and isinstance(data.get("result"), str)
+            and data["result"]
+            and ("_meta" not in data or isinstance(data["_meta"], dict))
+        ):
+            # Hermes spills this exact MCP envelope as pageable document text.
+            # A new top-level key would instead archive one escaped JSON line.
+            metadata = dict(data.get("_meta", {}))
+            key = "_intaris_approval"
+            while key in metadata:
+                key += "_"
+            payload = {
+                "result": annotation + "\n\n" + data["result"],
+                **{k: v for k, v in data.items() if k not in {"result", "_meta"}},
+            }
+
+            def encode_native(value: Any) -> str:
+                # Re-encoding must not introduce raw failure tokens. The
+                # annotation already retains any original first-500 signal.
+                return re.sub(
+                    r'(error|failed)"',
+                    lambda match: match[0][:-2] + f'\\u{ord(match[0][-2]):04x}"',
+                    json.dumps(value, ensure_ascii=False),
+                    flags=re.IGNORECASE,
+                )
+
+            encoded_meta = (
+                "{"
+                + json.dumps(key)
+                + ": "
+                + encoded_note
+                + (", " + encode_native(metadata)[1:] if metadata else "}")
+            )
+            return '{"_meta": ' + encoded_meta + ", " + encode_native(payload)[1:]
+        # Preserve JSON status/error fields used by Hermes, and never
+        # overwrite a provider's field even if it uses our metadata name.
+        key = "_intaris_approval"
+        while key in data:
+            key += "_"
+        # Keep guidance at the front of Hermes' previews for large results.
+        prefix = "{" + json.dumps(key) + ": " + encoded_note
+        # Retain native JSON spelling/whitespace: decoding and re-encoding
+        # could turn escaped words into new raw failure tokens. Preserve
+        # leading whitespace after our field so native tokens only move later.
+        opening = result.index("{")
+        return (
+            prefix + (", " if data else "") + result[:opening] + result[opening + 1 :]
+        )
+    if (
+        isinstance(result, dict)
+        and result.get("_multimodal") is True
+        and isinstance(result.get("content"), list)
+    ):
+        # Hermes can replace an oversized summary with the first text part
+        # that actually spills. Prefix every text part so that preview carries
+        # guidance too, while retaining bounded summaries for text-only models.
+        parts = []
+        has_text = False
+        for part in result["content"]:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                parts.append({**part, "text": annotation + "\n\n" + part["text"]})
+                has_text = True
+            else:
+                parts.append(part)
+        if not has_text:
+            parts.insert(0, {"type": "text", "text": annotation})
+        enriched = {**result, "content": parts}
+        summary = result.get("text_summary")
+        if summary:
+            enriched["text_summary"] = annotation + "\n\n" + str(summary)
+        return enriched
+    # Leave unsupported return types to the native dispatcher's validation.
+    return result
 
 
 # ============================================================================
@@ -1287,6 +1511,7 @@ def _make_guarded_handler(
     *,
     _admission: _GuardAdmission | None = None,
     _source_check: Callable[[], None] | None = None,
+    _note_sink: Callable[[_HumanPollResult, str], None] | None = None,
 ) -> Callable:
     """Create a wrapper handler that evaluates via Intaris before dispatching."""
     wrapped = original_handler
@@ -1341,6 +1566,7 @@ def _make_guarded_handler(
             inspect.iscoroutinefunction(replacement_target),
             _admission=admission,
             _source_check=_source_check,
+            _note_sink=_note_sink,
         )
         replacements = dict(_guard_replacements.get() or {})
         replacements[replacement_target] = replacement
@@ -1364,10 +1590,24 @@ def _make_guarded_handler(
             _guard_replacements.reset(token)
 
     def evaluate_and_dispatch(
-        args: dict, state: SessionState, invocation: Invocation, **kwargs: Any
+        args: dict,
+        state: SessionState,
+        invocation: Invocation,
+        approval: _NativeApproval,
+        **kwargs: Any,
     ) -> Any:
 
-        def dispatch(call_id: str = "") -> Any:
+        def finish_resolution(
+            result: Any, resolution: _HumanPollResult, call_id: str
+        ) -> Any:
+            if _note_sink is not None:
+                _note_sink(resolution, call_id)
+                return result
+            return _with_approval_note(result, resolution, call_id)
+
+        def dispatch_now(
+            call_id: str = "", resolution: _HumanPollResult | None = None
+        ) -> Any:
             invocation.check()
             if _source_check is not None:
                 _source_check()
@@ -1384,19 +1624,36 @@ def _make_guarded_handler(
                             del state.pending_tool_results[i]
                             break
                 raise
-            return invoke_original(args, **kwargs)
+            # Handler entry owns execution even if native code raises.
+            approval.settle(call_id)
+            if resolution is not None and _note_sink is not None:
+                # Capture only after final admission. The native dispatcher
+                # owns exception sanitization and invalid-result conversion.
+                _note_sink(resolution, call_id)
+            result = invoke_original(args, **kwargs)
+            if resolution is not None and _note_sink is None:
+                return _with_approval_note(result, resolution, call_id)
+            return result
+
+        def dispatch(
+            call_id: str = "", resolution: _HumanPollResult | None = None
+        ) -> Any:
+            if is_async or inspect.iscoroutinefunction(original_handler):
+
+                async def dispatch_async() -> Any:
+                    # Process task cancellation queued while synchronous HTTP was
+                    # being awaited. Recheck host cancellation/source at body entry.
+                    await asyncio.sleep(0)
+                    result = dispatch_now(call_id, resolution)
+                    return await result if inspect.isawaitable(result) else result
+
+                return dispatch_async()
+            return dispatch_now(call_id, resolution)
 
         # Evaluate the tool call
         intention_pending = state.intention_pending
-        client = profile.client
-        result = invocation.request(
-            lambda: client.evaluate(
-                state.intaris_session_id,
-                tool_name,
-                args,
-                intention_pending=intention_pending,
-            )
-        )
+        client = approval.client
+        result = approval.evaluate(tool_name, args, intention_pending=intention_pending)
 
         # Clear intention_pending after first evaluate
         if intention_pending:
@@ -1496,11 +1753,7 @@ def _make_guarded_handler(
                         "[intaris] Session reactivated — re-evaluating %s",
                         tool_name,
                     )
-                    re_result = invocation.request(
-                        lambda: client.evaluate(
-                            state.intaris_session_id, tool_name, args
-                        )
-                    )
+                    re_result = approval.evaluate(tool_name, args)
                     response_error = _decision_response_error(re_result)
                     if response_error:
                         return json.dumps(
@@ -1522,19 +1775,31 @@ def _make_guarded_handler(
                             invocation,
                             session_id=kwargs["session_id"],
                             intaris_session_id=state.intaris_session_id,
+                            on_settled=partial(approval.settle, re_call_id),
                         )
-                        if poll_result == "invalid_response":
+                        if poll_result.value == "invalid_response":
                             return json.dumps(
                                 {
                                     "error": f"[intaris] Invalid escalation response ({re_call_id})"
                                 }
                             )
-                        if poll_result == "approve":
-                            return dispatch(re_call_id)
-                        return json.dumps(
-                            {
-                                "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
-                            }
+                        if poll_result.value == "approve":
+                            return dispatch(re_call_id, poll_result)
+                        approval.settle(re_call_id)
+                        if poll_result.value == "expired":
+                            return json.dumps(
+                                {
+                                    "error": f"[intaris] APPROVAL EXPIRED ({re_call_id}). Tool was not executed; retry in a new invocation."
+                                }
+                            )
+                        return finish_resolution(
+                            json.dumps(
+                                {
+                                    "error": f"[intaris] DENIED by user ({re_call_id}): {re_reason}"
+                                }
+                            ),
+                            poll_result,
+                            re_call_id,
                         )
                     re_reason = (
                         re_result.data.get("reasoning", "denied after reactivation")
@@ -1578,15 +1843,27 @@ def _make_guarded_handler(
                 invocation,
                 session_id=kwargs["session_id"],
                 intaris_session_id=state.intaris_session_id,
+                on_settled=partial(approval.settle, call_id),
             )
-            if poll_result == "invalid_response":
+            if poll_result.value == "invalid_response":
                 return json.dumps(
                     {"error": f"[intaris] Invalid escalation response ({call_id})"}
                 )
-            if poll_result == "approve":
-                return dispatch(call_id)
-            return json.dumps(
-                {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
+            if poll_result.value == "approve":
+                return dispatch(call_id, poll_result)
+            approval.settle(call_id)
+            if poll_result.value == "expired":
+                return json.dumps(
+                    {
+                        "error": f"[intaris] APPROVAL EXPIRED ({call_id}). Tool was not executed; retry in a new invocation."
+                    }
+                )
+            return finish_resolution(
+                json.dumps(
+                    {"error": f"[intaris] DENIED by user ({call_id}): {reasoning}"}
+                ),
+                poll_result,
+                call_id,
             )
 
         # -- APPROVE -----------------------------------------------------------
@@ -1595,6 +1872,8 @@ def _make_guarded_handler(
         return json.dumps({"error": "[intaris] Invalid evaluation response"})
 
     def stopped_result(exc: WaitStopped) -> str:
+        if _note_sink is not None:
+            _note_sink(_HumanPollResult("cancelled"), "")
         return json.dumps(
             {
                 "error": (
@@ -1699,8 +1978,11 @@ def _make_guarded_handler(
                         )
 
         invocation = admission.invocation
+        approval: _NativeApproval | None = None
 
-        def release_admission() -> None:
+        def release_admission(reason: str = "abandoned") -> None:
+            if approval is not None:
+                approval.retire(reason)
             if admission_token is None:
                 return  # Only the outer call owns this lifetime.
             invocation.close()
@@ -1723,23 +2005,32 @@ def _make_guarded_handler(
             if replacement_target is not None:
                 result = invoke_composed(args, admission, **kwargs)
             else:
+                approval = _NativeApproval(
+                    profile.client, admission.state.intaris_session_id, invocation
+                )
                 result = evaluate_and_dispatch(
-                    args, admission.state, invocation, **kwargs
+                    args, admission.state, invocation, approval, **kwargs
                 )
         except BaseException as exc:
-            release_admission()
+            reason = exc.reason if isinstance(exc, WaitStopped) else "abandoned"
+            release_admission(reason)
             if isinstance(exc, WaitStopped):
                 return stopped_result(exc)
             raise
         if inspect.isawaitable(result):
 
             async def finish() -> Any:
+                reason = "abandoned"
                 try:
                     return await result
                 except WaitStopped as exc:
+                    reason = exc.reason
                     return stopped_result(exc)
+                except asyncio.CancelledError:
+                    reason = "cancelled"
+                    raise
                 finally:
-                    release_admission()
+                    release_admission(reason)
 
             return finish()
         release_admission()
@@ -1824,6 +2115,19 @@ def _make_dispatch_entry(
     if metadata.get("_intaris_mcp_owner") is not None:
         return source  # This profile-owned handler evaluates through /mcp/call.
 
+    resolution_note: tuple[_HumanPollResult, str] | None = None
+
+    def capture_note(resolution: _HumanPollResult, call_id: str) -> None:
+        nonlocal resolution_note
+        resolution_note = (
+            (resolution, call_id) if resolution.user_note is not None else None
+        )
+
+    def finish_result(result: Any) -> Any:
+        nonlocal resolution_note
+        captured, resolution_note = resolution_note, None
+        return _with_approval_note(result, *captured) if captured else result
+
     def check_source() -> None:
         current = registry.get_entry(source.name, scope=scope)
         if current is not source or current.handler is not handler:
@@ -1836,7 +2140,9 @@ def _make_dispatch_entry(
         source.toolset,
         source.is_async,
         _source_check=check_source,
+        _note_sink=capture_note,
     )
+    guarded._intaris_finish_result = finish_result
     # Pinned ToolEntry is a dataclass; retain every metadata field. The copy
     # fallback supports older entry shapes without a partial reconstruction.
     if hasattr(source, "__dataclass_fields__"):
