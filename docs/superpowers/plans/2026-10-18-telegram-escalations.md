@@ -2,7 +2,7 @@
 
 **Goal:** Deliver Intaris human-required approvals inline through the existing Hermes Telegram bot, preserving exact session/profile/topic identity, with an operator-configured fallback.
 
-**Architecture:** Hermes owns presentation and authenticated Telegram updates. Intaris owns durable, bounded approval leases and decisions. A local Unix socket accepts requests only from the attested gateway process (kernel peer UID/PID plus process start time); agent subprocesses and ordinary agent HTTP credentials cannot approve. No additional bot poller, bot token, or administrative API key is introduced.
+**Architecture:** Hermes owns presentation and authenticated Telegram updates. Intaris owns durable, bounded approval leases and decisions. A local Unix socket accepts requests from configured Unix UIDs, including their tool subprocesses, for explicitly mapped profiles. Ordinary agent HTTP credentials cannot approve. This trusts the Hermes user rather than isolating it from its tools. No additional bot poller, bot token, or administrative API key is introduced.
 
 **Tech stack:** Existing Python/asyncio, SQLite/PostgreSQL, Hermes plugin hooks, python-telegram-bot already installed by Hermes.
 
@@ -10,28 +10,28 @@
 
 ## Trust and lifecycle contract
 
-- Operator configuration lives on the isolated Intaris service. It maps an attested gateway and absolute profile home to one tenant/agent, explicit Telegram approver IDs, and optional fallback chat/topic.
-- Root/Intaris-owned PID attestation contains gateway PID and Linux `/proc/PID/stat` start time. Gateway UID differs from Intaris service UID. No keys placed in agent configuration.
+- Operator configuration lives on the isolated Intaris service. It maps a configured gateway UID and absolute profile home to one tenant/agent, explicit Telegram approver IDs, and optional fallback chat/topic.
+- Gateway UID differs from Intaris service UID. Socket directories and profile configuration remain root/Intaris-owned. No PID attestation or decision keys are needed in agent configuration.
 - Gateway origin uses admitted source, exact Hermes session lookup, explicit child-parent hooks, and transport profile identity. Model-supplied destinations and session heuristics are ignored.
 - Origin actor must be explicitly allowed. Origin prompt binds only that actor; fallback uses configured approvers. Callback also binds bot connection, chat, topic, message, profile, session, call, random lease, and deadline.
 - One durable lease per pending call. Uncertain sends are not retried. Lost/expired/cancelled leases cannot approve. Native callback never executes tools; existing Intaris audit polling and invocation cancellation checks remain authoritative.
 - An explicit Telegram topic rejection can switch an undelivered lease once to the operator-configured fallback. The lease, deadline, and invocation remain unchanged; callbacks bind the new destination and its configured approvers.
 - Intaris resolution uses an atomic pending-only guard. Telegram actions cannot override decisions from UI or judge.
 - Missing route/transport leaves the existing bounded UI approval wait. Notification failure never grants permission.
-- Strict transport support targets the verified Hermes revision and Linux deployment. A compromised gateway process remains a trusted-host compromise; the socket specifically rejects tool subprocesses, not arbitrary code already running inside the gateway process.
+- Transport support targets the verified Hermes revision and Linux deployment. Every process running under a configured gateway UID is trusted to submit approval actions; the bridge does not authenticate a real Telegram click against a malicious local Hermes user.
 
 ## Tasks
 
 - [x] Fix judge deferral/error notification suppression under default `deny_only`, with regression tests.
-- [x] Add operator configuration parser, protected PID attestation and bounded Unix protocol. Test invalid/foreign/agent peer identities and profile isolation.
+- [x] Add operator configuration parser, kernel UID checks and bounded Unix protocol. Test invalid/foreign UID identities and profile isolation.
 - [x] Add durable leases and pending-only decisions, expiry/cancellation, exact callback identity, deduplication, and race tests.
 - [x] Add existing-bot native plugin transport and trusted origin/child correlation. Test origin/topic/fallback/no route, callback authorization, failure, late send, and cancellation.
 - [x] Connect native presentation to existing human-wait lifecycle without changing final dispatch authority. Run all adapter regression tests with pinned Hermes contracts.
-- [x] Document protected socket/PID/profile configuration and operational limits; run server suite, lint, independent reviews, fixes, and final verification.
+- [x] Document protected socket/UID/profile configuration and operational limits; run server suite, lint, independent reviews, fixes, and final verification.
 
 ## Review focus
 
-Concurrent calls in one topic; shared bot across runtime profiles; stale callback after UI resolution or session stop; delivery timeout followed by late send; gateway restart/PID reuse and agent child impersonation. Each must fail closed without duplicate execution.
+Concurrent calls in one topic; shared bot across runtime profiles; stale callback after UI resolution or session stop; delivery timeout followed by late send; gateway restart/PID reuse and foreign-UID impersonation. Each must fail closed without duplicate execution.
 
 ## Verification results
 
@@ -51,7 +51,7 @@ Concurrent calls in one topic; shared bot across runtime profiles; stale callbac
 
 The user approved explicitly mapping runtime profiles to an existing shared bot
 for background approvals. `fallback_transport_profile` now names an absolute
-bot-owning profile home in the same attested gateway. The authenticated socket
+bot-owning profile home in the same configured gateway. The authenticated socket
 returns this operator policy before native transport selection; missing or
 ambiguous bindings leave the bounded UI wait. Runtime tenant, agent, destination,
 approvers, and callback ownership remain scoped to the requesting profile.
@@ -86,7 +86,7 @@ findings were reproduced before fixing:
   publication, cleans identified sockets after failure/cancellation, and preserves
   foreign replacements. Unknown initial metadata failures use at most four
   private staging slots, requiring operator cleanup if those slots fill.
-- Socket admission rejects unattested processes before frame reads and caps
+- Socket admission rejects unconfigured UIDs before frame reads and caps
   admitted connections/backlog at 32, then rechecks profile authorization after
   framing.
 
@@ -130,3 +130,15 @@ doubles, and all 827 passed against the pinned Hermes source. Five added
 regressions cover immediate approval, interruption, session end, invocation
 closure, and rejection of unsupported cross-thread human waits. Ruff and diff
 checks pass. Server code is unchanged from its 2,734-test passing run.
+
+## Attestation removal (2026-10-21)
+
+The user chose to trust the existing Hermes Unix user, including its writable
+gateway and tools. Removed PID/start-time attestation, its privileged watcher,
+helper, and lifecycle tests. The bridge now checks kernel peer UID and explicit
+profile mapping; other users and forged identity fields remain unauthorized.
+Same-UID subprocesses are trusted and can submit approval actions. Old
+`pid_file` config requires explicit migration so upgrades cannot silently
+broaden the trust boundary. Retained socket permissions, bounded admission,
+operator routing, callback bindings, lease expiry, and approval-note behavior.
+Canonical cron presentation remains a separate companion PR.
