@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -143,6 +144,127 @@ def test_origin_preserves_topic_and_actor_and_deduplicates(bridge):
     assert again["new"] is False
     assert again["expires_at"] == 1060
     assert "echo safe" in lease["text"]
+
+
+def presentation_card(bridge, arguments, *, reason="Needs a human"):
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "UPDATE audit_log SET args_redacted = ?, reasoning = ? WHERE call_id = ?",
+            (json.dumps(arguments), reason, "call-owner"),
+        )
+    lease = open_call(bridge)
+    assert lease["ok"] is True
+    assert "presentation" in lease, "native prompt still exposes only flat JSON"
+    return lease
+
+
+def visible_card_text(root):
+    return " ".join(
+        "".join(child.itertext()) for child in root if child.tag != "details"
+    )
+
+
+def test_native_presentation_collapses_config_and_renders_nested_arguments(bridge):
+    command = "python -c 'print(\"<hello> & goodbye\")'"
+    lease = presentation_card(
+        bridge,
+        {
+            "command": command,
+            "timeout": 30,
+            "__intaris_context": {
+                "path_policy": {"target_paths": ["/tmp/report.json"], "allowed": False}
+            },
+        },
+    )
+    pending = ET.fromstring("<card>" + lease["presentation"]["pending"] + "</card>")
+    visible = visible_card_text(pending)
+    assert "python -c" in visible and "Needs a human" in visible
+    assert "__intaris_context" not in visible and "call-owner" not in visible
+    details = pending.find("details")
+    assert details is not None and "open" not in details.attrib
+    assert details.findtext("summary") == "Read more"
+    assert command in [node.text for node in details.iter("pre")]
+    assert details.find(".//ul/li/ul/li/ul") is not None
+    assert "/tmp/report.json" in "".join(details.itertext())
+    assert "false" in "".join(details.itertext())
+    assert "call-owner" in "".join(details.itertext())
+
+
+def test_native_retired_presentation_leaves_only_short_excerpt_visible(bridge):
+    command = "python /tmp/report.py " + "--long-option=value " * 100
+    lease = presentation_card(bridge, {"command": command, "timeout": 30})
+    retired = ET.fromstring("<card>" + lease["presentation"]["retired"] + "</card>")
+    visible = visible_card_text(retired)
+    assert "python /tmp/report.py" in visible and len(visible) < 180
+    assert "Needs a human" not in visible and "call-owner" not in visible
+    details = retired.find("details")
+    assert details is not None and "open" not in details.attrib
+    assert command in [node.text for node in details.iter("pre")]
+    assert "Needs a human" in "".join(details.itertext())
+
+
+def test_native_presentation_escapes_untrusted_values_and_keys(bridge):
+    command = '</pre><script>alert("x")</script><pre>'
+    lease = presentation_card(
+        bridge, {"command": command, "<img src=x>": "&value"}, reason="<b>user text</b>"
+    )
+    for html in lease["presentation"].values():
+        root = ET.fromstring("<card>" + html + "</card>")
+        assert root.find(".//script") is None and root.find(".//img") is None
+        assert command in "".join(root.itertext())
+        assert "<b>user text</b>" in "".join(root.itertext())
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["<&😀" * 40000, {str(i): "x" * 200 for i in range(2000)}],
+    ids=["unicode", "wide"],
+)
+def test_native_presentation_bounds_wire_size_without_breaking_markup(bridge, value):
+    lease = presentation_card(bridge, {"command": "echo safe", "config": value})
+    assert len(json.dumps(lease).encode()) + 1 < 65536
+    for html in lease["presentation"].values():
+        root = ET.fromstring("<card>" + html + "</card>")
+        assert "Needs a human" in "".join(root.itertext())
+        assert "truncated" in "".join(root.itertext()).lower()
+
+
+def test_native_presentation_accepts_json_encoded_arguments(bridge):
+    lease = presentation_card(
+        bridge, json.dumps({"command": "echo decoded", "timeout": 30})
+    )
+    root = ET.fromstring("<card>" + lease["presentation"]["pending"] + "</card>")
+    assert "echo decoded" in visible_card_text(root)
+    assert "echo decoded" in [node.text for node in root.iter("pre")]
+
+
+def test_native_presentation_keeps_deep_config_within_telegram_limits(bridge):
+    config = "leaf"
+    for _ in range(20):
+        config = {"nested": config}
+    lease = presentation_card(bridge, {"command": "echo safe", "config": config})
+
+    def depth(element):
+        return 1 + max((depth(child) for child in element), default=0)
+
+    for html in lease["presentation"].values():
+        root = ET.fromstring("<card>" + html + "</card>")
+        assert depth(root) - 1 <= 16
+        assert len(list(root.iter())) < 500
+        assert "truncated" in "".join(root.itertext()).lower()
+
+
+def test_native_presentation_budgets_legacy_text_and_metadata_together(bridge):
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "UPDATE audit_log SET tool = ? WHERE call_id = ?",
+            ("😀" * 1500, "call-owner"),
+        )
+    lease = presentation_card(bridge, {"command": "😀" * 1600}, reason="😀" * 800)
+    assert len(json.dumps(lease).encode()) + 1 <= 65536
+    assert "truncated" in lease["text"].lower()
+    for html in lease["presentation"].values():
+        ET.fromstring("<card>" + html + "</card>")
 
 
 @pytest.mark.parametrize("decision", ["approve", "deny"])

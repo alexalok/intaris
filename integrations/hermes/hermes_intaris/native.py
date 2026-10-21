@@ -212,6 +212,7 @@ class _Prompt:
     lease_id: str | None = None
     route: dict[str, Any] = field(default_factory=dict)
     text: str = ""
+    retired_html: str = ""
     message_id: str | None = None
     expires_at: float = 0
     deadline: float = 0
@@ -617,9 +618,22 @@ class NativeApprovals:
             text = response["text"]
             if not isinstance(text, str) or not text:
                 raise ValueError("Missing native description")
+            presentation = response.get("presentation")
+            retired_html = ""
+            if presentation is not None:
+                if not isinstance(presentation, dict) or any(
+                    not isinstance(presentation.get(key), str)
+                    or not presentation[key]
+                    or len(presentation[key]) > 24000
+                    for key in ("pending", "retired")
+                ):
+                    raise ValueError("Invalid native presentation")
+                text = presentation["pending"]
+                retired_html = presentation["retired"]
             with self._lock:
                 prompt.route = route
-                prompt.text = text[:3500]
+                prompt.text = text if retired_html else text[:3500]
+                prompt.retired_html = retired_html
                 prompt.expires_at = expiry
                 duration = min(
                     expiry - time.time(), prompt.invocation.remaining_seconds
@@ -669,16 +683,7 @@ class NativeApprovals:
             thread_id = route["thread_id"]
             try:
                 return await _telegram_call(
-                    lambda: prompt.binding.bot.send_message(
-                        chat_id=route["chat_id"],
-                        message_thread_id=(
-                            None if thread_id in (None, "1") else int(thread_id)
-                        ),
-                        text=prompt.text,
-                        parse_mode=None,
-                        reply_markup=None,
-                        **_BOT_TIMEOUTS,
-                    ),
+                    lambda: self._send_content(prompt, route),
                     label="intaris native send",
                     on_late=lambda message: self._late_message(prompt, message),
                 )
@@ -730,6 +735,37 @@ class NativeApprovals:
                     if not self._live(prompt):
                         raise ValueError("Native approval no longer active") from exc
                     prompt.route = fallback
+
+    async def _send_content(self, prompt: _Prompt, route: dict[str, Any]) -> Any:
+        thread_id = route["thread_id"]
+        fields = {
+            "chat_id": route["chat_id"],
+            "message_thread_id": None if thread_id in (None, "1") else int(thread_id),
+        }
+        if prompt.retired_html:
+            from telegram import Message
+
+            # PTB's public escape hatch supports Bot API methods newer than the
+            # host SDK, while reusing its authenticated client and connection pool.
+            return await prompt.binding.bot.do_api_request(
+                "sendRichMessage",
+                api_kwargs={
+                    **fields,
+                    "rich_message": {
+                        "html": prompt.text,
+                        "skip_entity_detection": True,
+                    },
+                },
+                return_type=Message,
+                **_BOT_TIMEOUTS,
+            )
+        return await prompt.binding.bot.send_message(
+            **fields,
+            text=prompt.text,
+            parse_mode=None,
+            reply_markup=None,
+            **_BOT_TIMEOUTS,
+        )
 
     def _capture_message(self, prompt: _Prompt, message: Any) -> None:
         with self._lock:
@@ -806,15 +842,31 @@ class NativeApprovals:
         }
 
     async def _edit(self, prompt: _Prompt, text: str, markup: Any) -> None:
-        await _telegram_call(
-            lambda: prompt.binding.bot.edit_message_text(
+        async def edit() -> Any:
+            if prompt.retired_html:
+                return await prompt.binding.bot.do_api_request(
+                    "editMessageText",
+                    api_kwargs={
+                        "chat_id": prompt.route["chat_id"],
+                        "message_id": int(prompt.message_id),
+                        "rich_message": {"html": text, "skip_entity_detection": True},
+                        "reply_markup": (
+                            markup if markup is not None else {"inline_keyboard": []}
+                        ),
+                    },
+                    **_BOT_TIMEOUTS,
+                )
+            return await prompt.binding.bot.edit_message_text(
                 chat_id=prompt.route["chat_id"],
                 message_id=int(prompt.message_id),
                 text=text,
                 reply_markup=markup,
                 parse_mode=None,
                 **_BOT_TIMEOUTS,
-            ),
+            )
+
+        await _telegram_call(
+            edit,
             label="intaris native edit",
             # A timed-out keyboard update can land after the first withdrawal.
             # Remove it again on late completion; removal never chains itself.
@@ -830,6 +882,8 @@ class NativeApprovals:
             status = {"approve": "Approved", "deny": "Denied"}.get(
                 prompt.status, "No longer actionable"
             )
+            if prompt.retired_html:
+                return f"<p><b>{status}</b></p>{prompt.retired_html}"
             return f"{prompt.text}\n\n{status}"
 
     async def _retire(self, prompt: _Prompt) -> None:
