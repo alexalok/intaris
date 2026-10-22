@@ -26,8 +26,8 @@ Date: 2026-10-22. Follow-up to the [supporting-read report](2026-10-22-supportin
 
 The model replay below is frozen at the source published as `4d39da2`. The
 first later deterministic follow-up changes launcher inspection and skill path
-retention; the second also tightens approval reuse and resolution. These later
-changes do not rerun model inference. Model prompts, thresholds, and routing
+retention; later follow-ups also tighten approval reuse, resolution, and audit
+metadata separation. These changes do not rerun model inference. Model prompts, thresholds, and routing
 are unchanged, but the recorded inference outcomes belong to the frozen source
 and are not a fresh measurement of the final branch.
 
@@ -159,9 +159,9 @@ The next Codex round identified four reproducible gaps:
 - A pending invocation could be approved after a matching structured deny rule
   was added. Every approval resolution now checks the current effective policy,
   including restricted-session adoption, before the shared atomic update. It
-  pins the invocation directory in audit-only metadata, strips appended context
-  from tool targets, and
-  rejects policy changes racing the write. PostgreSQL additionally locks the
+  pins the invocation directory in audit-only metadata and rejects policy changes
+  racing the write. The later follow-up below separates that metadata from
+  arbitrary tool argument names. PostgreSQL additionally locks the
   session row through the approval transaction; SQLite uses its atomic write.
 
 The pending-policy reproducer initially failed all six forbidden combinations
@@ -185,3 +185,39 @@ The historical inference table above was not rerun in this follow-up.
 Private test receipts, scripts, and source hashes are retained in Git-ignored
 `runs/codex-review-20261022-round4`, with directories mode 0700 and files 0600.
 Earlier evidence bundles remain unchanged.
+
+
+## Pending-policy freshness and audit collision follow-up
+
+The next Codex round found three additional deterministic gaps. All three had
+failing reproductions before the fixes:
+
+- Recursive shell inspection previously returned safe when its depth limit was
+  exceeded. Exhaustion now returns `CRITICAL`, preserving the hard prohibition
+  even with broad outer-shell allow rules. Tests cover shell strings and executed
+  heredocs at the boundary. Quoted examples remain data. Transparent prefixes and
+  unquoted substitution segments that are inspected iteratively do not consume
+  the recursive budget; both safe and destructive leaves are covered.
+- Adding or changing a free-text deny clause could leave an older pending call
+  approvable. Each evaluation now records hashes of its effective deny clauses.
+  Approval refuses new clauses, changed semantics, or missing legacy evidence;
+  removal, reordering, display-ID edits, and allow-only edits preserve review.
+  Restricted sessions snapshot server policy. Refusal leaves Deny available and
+  does not invent expiration. Existing model-judgment override semantics remain
+  separate from non-overridable deterministic prohibitions.
+- Audit metadata could replace an actual argument named `__intaris_context`.
+  The additive `evaluation_context` column now stores metadata separately, while
+  `args_redacted` preserves every original argument key. Judge reads the new
+  field with a legacy fallback. Approval checks never discard ambiguous legacy
+  arguments or trust their reserved-looking keys as server-owned evidence.
+
+Verification: 3,451 server tests and 1,198 Hermes tests passed; 68 external
+E2E tests excluded, two existing WebSocket warnings. Scoped Ruff lint/format and
+Git whitespace checks passed. Tests cover human/Judge refusal, restricted policy,
+forged client metadata, unrelated clauses, reserved arguments, Judge packets,
+and additive/idempotent SQLite migration. PostgreSQL migration SQL is covered,
+but no live PostgreSQL run occurred. No historical inference was rerun; the
+frozen-source outcomes and population-rate limitations above still apply.
+
+Private receipts, scripts, and final source hashes are retained in Git-ignored
+`runs/codex-review-20261022-round5`, with directories 0700 and files 0600.

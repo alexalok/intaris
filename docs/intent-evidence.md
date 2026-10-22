@@ -126,11 +126,19 @@ change, not a per-call approval.
 
 Pending approvals also recheck deterministic prohibitions against the current
 effective session policy when resolved, including restricted-session adoption.
-The check uses the recorded invocation directory and redacted arguments; context
-metadata is not treated as a tool target. A policy change during approval refuses
+The check uses the recorded invocation directory and redacted arguments. Audit
+metadata lives in a separate `evaluation_context` field; every actual tool
+argument remains available for policy checks, including reserved-looking keys. A policy change during approval refuses
 the grant. Unrelated deny rules still allow normal review. Refusal leaves the
 record pending and does not manufacture a human denial or a client-expiration
 event. Email actions, native callbacks, human review, and Judge share this guard.
+
+New or changed free-text deny clauses require a fresh evaluation before an old
+pending call can be approved. Clause hashes record the effective policy without
+storing its text; removing clauses, reordering them, or changing display IDs does
+not invalidate a grant. Legacy records with no snapshot must be evaluated again
+when free-text denies apply. This freshness guard does not convert natural-language
+model judgments into deterministic hard prohibitions.
 
 If redacted or compacted argument text prevents checking a relevant command or
 path deny rule, or a relative path lacks its executor directory, approval fails
@@ -146,6 +154,7 @@ operators, quoted arguments, substitutions, and heredoc data. For example:
 
 | Operation | Deterministic classification |
 |---|---|
+| More than eight recursive shell-inspection steps | Hard denial; simplify the command |
 | `sudo -n rm -rf /` | Hard denial |
 | `bash -c 'rm -rf /'` | Hard denial |
 | `if true; then reboot; fi` | Hard denial |
