@@ -1851,6 +1851,84 @@ def _unwrap_unshare_command(words: list[str]) -> list[str]:
     return words[index:] or ["sh"]
 
 
+def _unwrap_setpriv_command(words: list[str]) -> list[str]:
+    """Locate util-linux setpriv's program while preserving option operands.
+
+    Its getopt_long("+dhV") stops at the first operand. All short options
+    are informational; long values are required, either separate or with '='.
+    Privilege settings do not exempt a launched command from hard prohibitions.
+    """
+    required_long = {
+        "ruid",
+        "euid",
+        "reuid",
+        "rgid",
+        "egid",
+        "regid",
+        "groups",
+        "inh-caps",
+        "ambient-caps",
+        "bounding-set",
+        "securebits",
+        "pdeathsig",
+        "ptracer",
+        "selinux-label",
+        "apparmor-profile",
+        "landlock-access",
+        "landlock-rule",
+        "seccomp-filter",
+    }
+    flag_long = {
+        "nnp",
+        "no-new-privs",
+        "clear-groups",
+        "keep-groups",
+        "init-groups",
+        "reset-env",
+    }
+    nonexecuting_long = {
+        "dump",
+        "list-caps",
+        "landlock-support",
+        "list-landlock-access",
+        "list-landlock-rights",
+        "help",
+        "version",
+    }
+    long_options = required_long | flag_long | nonexecuting_long
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            return words[index:]
+        if token == "-" or not token.startswith("-"):
+            return words[index - 1 :]
+        if not token.startswith("--"):
+            return []  # -d/-h/-V never launch; all other short flags are invalid.
+        name, equals, _value = token[2:].partition("=")
+        if name not in long_options:
+            # GNU getopt accepts an abbreviation shared by equivalent aliases:
+            # --n selects both --nnp and --no-new-privs, with identical behavior.
+            matches = {
+                "nnp" if option == "no-new-privs" else option
+                for option in long_options
+                if option.startswith(name)
+            }
+            if len(matches) != 1:
+                return []
+            name = matches.pop()
+        if name in nonexecuting_long:
+            return []
+        if name in required_long and not equals:
+            if index >= len(words):
+                return []
+            index += 1
+        elif name in flag_long and equals:
+            return []  # No-argument options reject attached values.
+    return []  # Unlike unshare/chroot, a missing program is not a shell launch.
+
+
 def _unwrap_chroot_command(words: list[str]) -> list[str]:
     """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
     long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
@@ -1950,6 +2028,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_prlimit_command(words)
         elif head == "unshare":
             words = _unwrap_unshare_command(words)
+        elif head == "setpriv":
+            words = _unwrap_setpriv_command(words)
         elif head in {"chroot", "gchroot"}:
             words = _unwrap_chroot_command(words)
         elif head in option_values:
