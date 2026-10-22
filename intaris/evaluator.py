@@ -56,7 +56,7 @@ from intaris.decision import (
 )
 from intaris.intent_evidence import allows_legacy_precedent, collect_intent_evidence
 from intaris.llm import LLMClient, parse_json_response
-from intaris.policy import effective_policy_for_evaluator, policy_for_session
+from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import (
     SAFETY_EVALUATION_SCHEMA,
@@ -246,6 +246,9 @@ class Evaluator:
         # Validate sources in the DB so another worker can expire a grant.
         self._approved_path_sources: dict[tuple[str, str], set[str]] = {}
         self._approved_path_versions: dict[tuple[str, str], object] = {}
+        # Model-learned prefixes lack a human approval ID. Bind them to the
+        # original scope snapshot so later user decisions invalidate them too.
+        self._approved_path_scopes: dict[tuple[str, str], dict[str, int]] = {}
 
     async def wait_for_alignment(self, user_id: str, session_id: str) -> None:
         """Let MCP metadata calls observe pending alignment checks before evaluation."""
@@ -317,9 +320,10 @@ class Evaluator:
         # Get session for intention and policy (verifies ownership)
         if restricted_agent:
             self._sessions.restrict_agent_session(session_id, user_id=user_id)
-        session = self._sessions.get(session_id, user_id=user_id)
+        session = self._sessions.get_with_parent_policy(
+            session_id, user_id=user_id, agent_policy=self._agent_policy
+        )
         restricted = bool(session.get("agent_restricted"))
-        session["policy"] = policy_for_session(session, self._agent_policy)
         if restricted:
             # Prefixes have no approval provenance and can outlive agent adoption.
             # Restricted reads must use current policy or an exact human retry.
@@ -564,7 +568,7 @@ class Evaluator:
         # session's intention and their own. This prevents sub-agents
         # from escaping the parent's guardrails by declaring a narrow
         # intention that doesn't cover what they're actually doing.
-        scope_versions = {session_id: session.get("scope_version", 0)}
+        scope_versions = dict(session["_scope_versions"])
         parent_intention: str | None = None
         parent_session_id = session.get("parent_session_id")
         if parent_session_id:
@@ -573,16 +577,20 @@ class Evaluator:
             # and does not provide durable proof of successful alignment.
             trusted_readonly = False
             try:
-                parent_session = self._sessions.get(parent_session_id, user_id=user_id)
+                parent_session = session["_parent_chain"][0]
                 parent_intention = parent_session.get("intention")
-                scope_versions[parent_session_id] = parent_session.get(
-                    "scope_version", 0
-                )
 
                 # Parent lifecycle cascade: if parent is terminated or
                 # suspended, auto-suspend the child session. This prevents
                 # orphaned children from operating under a dead parent.
-                parent_status = parent_session.get("status", "active")
+                parent_status = next(
+                    (
+                        ancestor["status"]
+                        for ancestor in session["_parent_chain"]
+                        if ancestor["status"] in {"terminated", "suspended"}
+                    ),
+                    parent_session.get("status", "active"),
+                )
                 if parent_status in ("terminated", "suspended"):
                     status_reason = f"Parent session is {parent_status}"
                     try:
@@ -657,6 +665,13 @@ class Evaluator:
                     session_id,
                 )
 
+        unresolved_path_policy = bool((session_policy or {}).get("deny_paths")) and any(
+            not os.path.isabs(path)
+            for path in resolve_tool_paths(
+                tool, classification_args, working_directory or ""
+            )
+        )
+
         # Step 1-2: Classify (with path awareness via working_directory)
         classification = classify(
             tool,
@@ -692,7 +707,11 @@ class Evaluator:
                     path_reclassified = True
                     # Check approved paths cache
                     if self._check_approved_paths(
-                        user_id, session_id, outside_paths, working_directory
+                        user_id,
+                        session_id,
+                        outside_paths,
+                        working_directory,
+                        scope_versions=scope_versions,
                     ):
                         classification = Classification.READ
                         path_reclassified = False
@@ -700,6 +719,13 @@ class Evaluator:
                             "Path approved via prior evaluation: %s",
                             outside_paths,
                         )
+
+        # Semantic prohibitions need current model interpretation, including
+        # builtin reads and cached path approvals. Structured denies ran first.
+        if classification == Classification.READ and normalized_policy_clauses(
+            session_policy
+        ).get("deny_policies"):
+            classification = Classification.WRITE
 
         # Inject deterministic path-policy facts into WRITE evaluations when
         # either the project directory or explicit target paths are known.
@@ -724,7 +750,14 @@ class Evaluator:
                 )
 
         # Step 3-5: Fast paths for read-only, critical, and escalate
-        if classification == Classification.READ:
+        if unresolved_path_policy and classification != Classification.CRITICAL:
+            decision = Decision(
+                decision="deny",
+                risk="medium",
+                path="fast",
+                reasoning="Current path policy requires an executor working directory; evaluate again.",
+            )
+        elif classification == Classification.READ:
             reasoning = f"Read-only tool call: {tool}"
             allowed_script = match_allowed_script(
                 tool, classification_args, session_policy
@@ -823,6 +856,9 @@ class Evaluator:
                     and not record.get("expired_at")
                     and record.get("resolved_by") == "user"
                     and record.get("approval_scope", "reusable") == "reusable"
+                    and self._audit.approvals_are_usable(
+                        {approval_call_id}, user_id=user_id
+                    )
                 )
                 if not approved:
                     decision.decision = "deny"
@@ -870,6 +906,13 @@ class Evaluator:
             decision.decision = "deny"
             decision.approval_call_id = None
             outcome_override = "hard_stop.classifier_critical"
+
+        if unresolved_path_policy and not hard_prohibition:
+            # Neither a permissive cap nor a previous grant supplies missing
+            # executor metadata. Keep the normal non-executable API response.
+            decision.decision = "deny"
+            decision.approval_call_id = None
+            outcome_override = "hard_stop.path_context"
 
         if decision.evidence_changed and not hard_prohibition:
             decision.decision = (
@@ -966,6 +1009,7 @@ class Evaluator:
                         session_id,
                         prefix,
                         approval_call_id=decision.approval_call_id,
+                        scope_versions=scope_versions,
                     )
                     logger.info(
                         "Learned approved path prefix: %s (session %s)",
@@ -1131,11 +1175,12 @@ class Evaluator:
             prior_call_id = row["call_id"]
             if session_id is not None:
                 prior = self._audit.get_by_call_id(prior_call_id, user_id=user_id)
-                current_session = self._sessions.get(session_id, user_id=user_id)
-                current_session["policy"] = policy_for_session(
-                    current_session, self._agent_policy
+                current_session = self._sessions.get_with_parent_policy(
+                    session_id, user_id=user_id, agent_policy=self._agent_policy
                 )
-                if (current_session.get("policy") or {}).get("deny_policies"):
+                if normalized_policy_clauses(current_session.get("policy")).get(
+                    "deny_policies"
+                ):
                     # Free-text restrictions require current interpretation;
                     # an old exact grant contains no policy snapshot proof.
                     return None
@@ -1183,6 +1228,8 @@ class Evaluator:
         session_id: str,
         resolved_paths: list[str],
         working_directory: str,
+        *,
+        scope_versions: dict[str, int] | None = None,
     ) -> bool:
         """Check if all resolved paths are under an approved prefix.
 
@@ -1198,6 +1245,13 @@ class Evaluator:
         """
         key = (user_id, session_id)
         with self._approved_paths_lock:
+            bound_scope = self._approved_path_scopes.get(key)
+            if bound_scope is not None and bound_scope != scope_versions:
+                self._approved_paths.pop(key, None)
+                self._approved_path_sources.pop(key, None)
+                self._approved_path_versions.pop(key, None)
+                self._approved_path_scopes.pop(key, None)
+                return False
             prefixes = list(self._approved_paths.get(key, []))
             sources = set(self._approved_path_sources.get(key, set()))
             version = self._approved_path_versions.get(key)
@@ -1212,6 +1266,7 @@ class Evaluator:
                     self._approved_paths.pop(key, None)
                     self._approved_path_sources.pop(key, None)
                     self._approved_path_versions.pop(key, None)
+                    self._approved_path_scopes.pop(key, None)
                     return False
 
         for rp in resolved_paths:
@@ -1229,6 +1284,7 @@ class Evaluator:
         prefix: str,
         *,
         approval_call_id: str | None = None,
+        scope_versions: dict[str, int] | None = None,
     ) -> None:
         """Add an approved path prefix for a session.
 
@@ -1250,6 +1306,14 @@ class Evaluator:
         key = (user_id, session_id)
         norm_prefix = os.path.normpath(prefix)
         with self._approved_paths_lock:
+            if self._approved_path_scopes.get(key) != scope_versions:
+                # Do not merge a fresh grant with prefixes learned under old scope.
+                self._approved_paths.pop(key, None)
+                self._approved_path_sources.pop(key, None)
+            if scope_versions is None:
+                self._approved_path_scopes.pop(key, None)
+            else:
+                self._approved_path_scopes[key] = dict(scope_versions)
             sources = self._approved_path_sources.setdefault(key, set())
             if approval_call_id:
                 if (
@@ -1316,9 +1380,19 @@ class Evaluator:
         if not is_read_only(tool, args_redacted):
             return
 
-        # Get session's working_directory
-        session = self._sessions.get(session_id, user_id=user_id)
-        if not session or session.get("agent_restricted"):
+        # A delayed callback must not stamp an old grant with newer authority.
+        # Reloaded legacy records lack this transient transaction snapshot and
+        # can still use normal evaluation/exact retry, but cannot seed a cache.
+        granted_scope = record.get("_approval_scope_versions")
+        if not isinstance(granted_scope, dict) or session_id not in granted_scope:
+            return
+        session = self._sessions.get_with_parent_policy(
+            session_id, user_id=user_id, agent_policy=self._agent_policy
+        )
+        if (
+            session.get("agent_restricted")
+            or session["_scope_versions"] != granted_scope
+        ):
             return
         details = session.get("details") or {}
         working_directory = details.get("working_directory")
@@ -1338,6 +1412,7 @@ class Evaluator:
                     session_id,
                     prefix,
                     approval_call_id=record["call_id"],
+                    scope_versions=granted_scope,
                 )
                 logger.info(
                     "Learned path prefix from user approval: %s (session %s)",
@@ -1360,6 +1435,7 @@ class Evaluator:
             self._approved_paths.pop(key, None)
             self._approved_path_sources.pop(key, None)
             self._approved_path_versions.pop(key, None)
+            self._approved_path_scopes.pop(key, None)
 
     def sweep_approved_paths(self, active_keys: set[tuple[str, str]]) -> int:
         """Remove approved paths for sessions no longer active.
@@ -1380,6 +1456,7 @@ class Evaluator:
                 del self._approved_paths[k]
                 self._approved_path_sources.pop(k, None)
                 self._approved_path_versions.pop(k, None)
+                self._approved_path_scopes.pop(k, None)
         return len(stale)
 
     def _llm_evaluate(
@@ -1506,9 +1583,8 @@ class Evaluator:
                     args_redacted=args_redacted,
                     user_decisions=user_decisions,
                 )
-            current_session = self._sessions.get(session_id, user_id=user_id)
-            current_session["policy"] = policy_for_session(
-                current_session, self._agent_policy
+            current_session = self._sessions.get_with_parent_policy(
+                session_id, user_id=user_id, agent_policy=self._agent_policy
             )
             current_evidence = collect_intent_evidence(current_session, self._audit)
             if current_evidence["fingerprint"] != intent_evidence["fingerprint"]:

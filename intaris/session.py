@@ -13,8 +13,40 @@ from datetime import datetime, timezone
 from typing import Any
 
 from intaris.db import Database
+from intaris.policy import policy_for_chain
 
 logger = logging.getLogger(__name__)
+
+
+def load_session_policy_chain(
+    cur: Any, session_id: str, *, user_id: str
+) -> list[dict[str, Any]]:
+    """Read tenant-scoped child plus at most four ancestors on one cursor.
+
+    Retain raw policy text for atomic approval comparison. A broken chain is
+    never evidence that an ancestor has no restrictions.
+    """
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current = session_id
+    while current:
+        if current in seen or len(chain) >= 5:
+            raise ValueError(
+                "Session policy ancestry is cyclic or exceeds the supported depth"
+            )
+        seen.add(current)
+        cur.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+            (current, user_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("Session policy ancestry is unavailable")
+        session = _row_to_dict(row)
+        session["_policy_raw"] = row["policy"] or ""
+        chain.append(session)
+        current = session.get("parent_session_id")
+    return chain
 
 
 class SessionStore:
@@ -122,6 +154,20 @@ class SessionStore:
             raise ValueError(f"Session {session_id} not found")
 
         return _row_to_dict(row)
+
+    def get_with_parent_policy(
+        self, session_id: str, *, user_id: str, agent_policy: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Return an ephemeral effective policy and its earliest scope revisions."""
+        with self._db.cursor() as cur:
+            chain = load_session_policy_chain(cur, session_id, user_id=user_id)
+        session = dict(chain[0])
+        session["policy"] = policy_for_chain(chain, agent_policy)
+        session["_parent_chain"] = chain[1:]
+        session["_scope_versions"] = {
+            item["session_id"]: item["scope_version"] for item in chain
+        }
+        return session
 
     def restrict_agent_session(self, session_id: str, *, user_id: str) -> None:
         """Permanently require server policy once an agent evaluates this session."""

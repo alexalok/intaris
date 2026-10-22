@@ -175,6 +175,13 @@ def collect_intent_evidence(
             except ValueError:
                 continue
             if record["session_id"] == session_id:
+                if record.get(
+                    "user_decision"
+                ) == "approve" and not audit.approvals_are_usable(
+                    {ref}, user_id=user_id
+                ):
+                    # A retained profile reference cannot resurrect a revoked grant.
+                    continue
                 by_id[ref] = record
     candidates = [s for r in by_id.values() if (s := _source(r)) is not None]
     candidates.sort(key=lambda s: (s["timestamp"], s["id"]), reverse=True)
@@ -264,6 +271,9 @@ def collect_intent_evidence(
                 packet.get("parent_unavailable", False),
             )
         )
+    # Effective policy was loaded before sources; later recursive reads must
+    # not replace its earlier revisions with newly changed ancestor scope.
+    packet["scope_versions"].update(session.get("_scope_versions", {}))
     return packet
 
 

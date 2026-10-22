@@ -439,6 +439,7 @@ def test_evaluator_routes_write_classification_to_jev() -> None:
         "policy": None,
     }
     sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
@@ -480,6 +481,7 @@ def test_evaluator_preserves_explicit_jev_escalation() -> None:
         "policy": None,
     }
     sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
@@ -520,6 +522,7 @@ def test_evaluator_preserves_jev_diagnostics_after_decision_matrix() -> None:
         "policy": None,
     }
     sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,

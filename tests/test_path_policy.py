@@ -518,8 +518,13 @@ class TestLearnFromApprovedEscalation:
         mock_sessions.get.return_value = {
             "session_id": "session1",
             "user_id": "user1",
+            "_scope_versions": {"session1": 1},
             "details": {"working_directory": "/Users/foo/src/intaris"},
         }
+
+        mock_sessions.get_with_parent_policy.return_value = (
+            mock_sessions.get.return_value
+        )
 
         class MockAuditStore:
             pass
@@ -534,6 +539,7 @@ class TestLearnFromApprovedEscalation:
         """Approving a read escalation caches the path prefix."""
         record = {
             "call_id": "approved-read",
+            "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
             "tool": "read",
             "args_redacted": {
@@ -553,6 +559,7 @@ class TestLearnFromApprovedEscalation:
         """Write tools are not cached even if approved."""
         record = {
             "call_id": "approved-read",
+            "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
             "tool": "write",
             "args_redacted": {"filePath": "/tmp/output.txt", "content": "data"},
@@ -581,6 +588,7 @@ class TestLearnFromApprovedEscalation:
         """Paths within working_directory are not cached (already fast-pathed)."""
         record = {
             "call_id": "approved-read",
+            "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
             "tool": "read",
             "args_redacted": {"filePath": "/Users/foo/src/intaris/intaris/server.py"},
@@ -596,6 +604,7 @@ class TestLearnFromApprovedEscalation:
         """Records without args_redacted are ignored."""
         record = {
             "call_id": "approved-read",
+            "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
             "tool": "read",
             "args_redacted": None,
@@ -609,13 +618,15 @@ class TestLearnFromApprovedEscalation:
 
     def test_ignores_no_working_directory(self, evaluator: Evaluator):
         """Sessions without working_directory are ignored."""
-        evaluator._sessions.get.return_value = {  # type: ignore[attr-defined]
+        evaluator._sessions.get_with_parent_policy.return_value = {  # type: ignore[attr-defined]
             "session_id": "session1",
             "user_id": "user1",
+            "_scope_versions": {"session1": 1},
             "details": {},
         }
         record = {
             "call_id": "approved-read",
+            "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
             "tool": "read",
             "args_redacted": {"filePath": "/tmp/file.txt"},

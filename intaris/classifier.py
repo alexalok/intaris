@@ -1086,7 +1086,7 @@ def classify(
             return deny_override
 
     # Step 1.5: Session policy deny_paths (resolved path matching)
-    if (working_directory or metadata_readonly or allowed_script) and session_policy:
+    if session_policy:
         resolved = resolve_tool_paths(tool, args, working_directory or "")
         if allowed_script:
             # The generic shell extractor splits at raw delimiters, including

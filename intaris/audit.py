@@ -19,12 +19,30 @@ from weakref import WeakKeyDictionary
 from intaris.approval_policy import validate_approval_policy
 from intaris.db import Database
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.session import load_session_policy_chain
 
 logger = logging.getLogger(__name__)
 
+
+def _not_revoked_sql(alias: str = "audit_log") -> str:
+    """Match exact later human denials using only fixed internal SQL aliases."""
+    assert alias in {"audit_log", "source"}
+    return f"""NOT EXISTS (
+        SELECT 1 FROM audit_log AS denial
+        WHERE denial.user_id = {alias}.user_id
+          AND denial.session_id = {alias}.session_id
+          AND denial.record_type = 'tool_call'
+          AND denial.tool = {alias}.tool
+          AND denial.args_hash = {alias}.args_hash
+          AND denial.resolved_by = 'user'
+          AND denial.user_decision = 'deny'
+          AND denial.resolved_at >= {alias}.resolved_at
+    )"""
+
+
 # Judge grants mechanically derived from a human approval retain that one-hop
 # dependency for future reuse. Their original waiting invocation is unaffected.
-_USABLE_APPROVAL_SOURCE = """(
+_USABLE_APPROVAL_SOURCE = f"""(
     approval_source_call_id IS NULL OR EXISTS (
         SELECT 1 FROM audit_log AS source
         WHERE source.call_id = audit_log.approval_source_call_id
@@ -35,6 +53,7 @@ _USABLE_APPROVAL_SOURCE = """(
           AND source.approval_scope = 'reusable'
           AND COALESCE(source.classification, '') != 'critical'
           AND source.evaluation_path != 'critical'
+          AND {_not_revoked_sql("source")}
     )
 )"""
 
@@ -592,7 +611,7 @@ class AuditStore:
         """
         with self._db.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT call_id, session_id, tool, args_redacted, decision,
                        user_decision, user_note, resolved_at, resolved_by,
                        risk, reasoning, evaluation_path, intention, args_hash,
@@ -604,6 +623,7 @@ class AuditStore:
                   AND (user_decision = 'deny' OR (
                       COALESCE(classification, '') != 'critical'
                       AND evaluation_path != 'critical'
+                      AND {_not_revoked_sql()}
                   ))
                   AND (expired_at IS NULL OR user_decision = 'deny')
                   AND resolved_by = 'user'
@@ -639,7 +659,8 @@ class AuditStore:
                         AND (user_decision = 'deny' OR (
                             expired_at IS NULL
                             AND COALESCE(classification, '') != 'critical'
-                            AND evaluation_path != 'critical')))
+                            AND evaluation_path != 'critical'
+                            AND {_not_revoked_sql()})))
                 ) ORDER BY COALESCE(resolved_at, timestamp) DESC, call_id DESC LIMIT ?""",
                 (user_id, session_id, limit),
             )
@@ -694,6 +715,7 @@ class AuditStore:
                       OR COALESCE(maximum_outcome, 'deny') = 'deny'
                   )
                   AND resolved_at >= ?
+                  AND {_not_revoked_sql()}
                   AND (? = FALSE OR resolved_by = 'user')
                 ORDER BY resolved_at DESC
                 LIMIT 1
@@ -735,6 +757,7 @@ class AuditStore:
                   AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
                   AND {_USABLE_APPROVAL_SOURCE}
+                  AND {_not_revoked_sql()}
                 """,
                 (user_id, *sorted(call_ids)),
             )
@@ -896,29 +919,55 @@ class AuditStore:
         scope_params = [
             value for pair in (scope_versions or {}).items() for value in pair
         ]
+        approval_scope_versions: dict[str, int] | None = None
         policy_state = ("", False)
+        policy_chain: list[dict[str, Any]] = []
+        chain_conditions = ""
+        chain_params: list[Any] = []
         if user_decision == "approve":
             if record.get("expired_at"):
                 raise ApprovalExpiredError(
                     f"Call {call_id} expired; its invocation is no longer waiting"
                 )
             with self._db.cursor() as cur:
-                cur.execute(
-                    "SELECT policy, agent_restricted FROM sessions "
-                    "WHERE user_id = ? AND session_id = ?",
-                    (user_id, record["session_id"]),
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
+                policy_chain = load_session_policy_chain(
+                    cur, record["session_id"], user_id=user_id
                 )
-                row = cur.fetchone()
-            if row is None:
-                raise ValueError("Approval session no longer exists")
-            policy_state = (
-                row["policy"] or "",
-                bool(row["agent_restricted"]),
-            )
-            session = {
-                "policy": json.loads(row["policy"]) if row["policy"] else None,
-                "agent_restricted": bool(row["agent_restricted"]),
-            }
+            session = policy_chain[0]
+            if session["status"] not in {"active", "idle"}:
+                raise ValueError(
+                    f"Session is {session['status']}; approval is not allowed"
+                )
+            if any(
+                ancestor["status"] in {"suspended", "terminated"}
+                for ancestor in policy_chain[1:]
+            ):
+                raise ValueError("Parent session is stopped; approval is not allowed")
+            policy_state = (session["_policy_raw"], bool(session["agent_restricted"]))
+            # Human overrides need fresh policy too; caller-supplied Judge
+            # revisions are an additional inference guard, never a substitute.
+            for item in policy_chain:
+                chain_conditions += (
+                    " AND EXISTS (SELECT 1 FROM sessions AS policy_session "
+                    "WHERE policy_session.user_id = audit_log.user_id "
+                    "AND policy_session.session_id = ? "
+                    "AND COALESCE(policy_session.policy, '') = ? "
+                    "AND policy_session.agent_restricted = ? "
+                    "AND COALESCE(policy_session.parent_session_id, '') = ? "
+                    "AND policy_session.scope_version = ? "
+                    "AND policy_session.status NOT IN ('suspended', 'terminated'))"
+                )
+                chain_params.extend(
+                    (
+                        item["session_id"],
+                        item["_policy_raw"],
+                        bool(item["agent_restricted"]),
+                        item.get("parent_session_id") or "",
+                        item["scope_version"],
+                    )
+                )
 
         # Atomic update: conditions in WHERE prevent TOCTOU races.
         # Matches unresolved escalations/denials OR records resolved by
@@ -930,10 +979,16 @@ class AuditStore:
             if self._db.backend == "postgresql":
                 # Lock all observed scope rows in stable order before audit rows.
                 # Every source writer follows the same session-before-audit order.
-                ids = sorted({record["session_id"], *(scope_versions or {})})
+                ids = sorted(
+                    {
+                        record["session_id"],
+                        *(scope_versions or {}),
+                        *(item["session_id"] for item in policy_chain),
+                    }
+                )
                 placeholders = ", ".join("?" for _ in ids)
                 cur.execute(
-                    "SELECT session_id, policy, agent_restricted FROM sessions "
+                    "SELECT session_id, policy, agent_restricted, parent_session_id, scope_version, status FROM sessions "
                     f"WHERE user_id = ? AND session_id IN ({placeholders}) "
                     "ORDER BY session_id FOR UPDATE",
                     [user_id, *ids],
@@ -954,10 +1009,13 @@ class AuditStore:
                 _check_scope_versions(cur, user_id, scope_versions)
             if user_decision == "approve":
                 validate_approval_policy(
-                    record, session, self._agent_policies.get(self._db)
+                    record,
+                    session,
+                    self._agent_policies.get(self._db),
+                    ancestors=policy_chain[1:],
                 )
             cur.execute(
-                """
+                f"""
                 UPDATE audit_log
                 SET user_decision = ?, user_note = ?, resolved_at = ?,
                     resolved_by = ?, user_note_source = ?,
@@ -979,6 +1037,7 @@ class AuditStore:
                         AND current_session.session_id = audit_log.session_id
                         AND COALESCE(current_session.policy, '') = ?
                         AND current_session.agent_restricted = ?
+                        AND current_session.status IN ('active', 'idle')
                   ))
                   AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
@@ -991,9 +1050,11 @@ class AuditStore:
                         AND source.approval_scope = 'reusable'
                         AND COALESCE(source.classification, '') != 'critical'
                         AND source.evaluation_path != 'critical'
+                        AND {_not_revoked_sql("source")}
                   ))
                 """
-                + scope_conditions,
+                + scope_conditions
+                + chain_conditions,
                 (
                     user_decision,
                     user_note,
@@ -1016,6 +1077,7 @@ class AuditStore:
                     approval_source_call_id,
                     approval_source_call_id,
                     *scope_params,
+                    *chain_params,
                 ),
             )
             if cur.rowcount == 0:
@@ -1066,6 +1128,15 @@ class AuditStore:
                         f"(user_decision={record['user_decision']})"
                     )
                 if user_decision == "approve":
+                    cur.execute(
+                        "SELECT status FROM sessions WHERE user_id = ? AND session_id = ?",
+                        (user_id, record["session_id"]),
+                    )
+                    current = cur.fetchone()
+                    if current is None or current["status"] not in {"active", "idle"}:
+                        raise ValueError(
+                            "Session stopped during approval; evaluate again"
+                        )
                     raise ValueError(
                         "Session policy changed during approval; retry approval"
                     )
@@ -1078,11 +1149,30 @@ class AuditStore:
                     "UPDATE sessions SET scope_version = scope_version + 1 "
                     "WHERE user_id = ? AND session_id = ? AND EXISTS ("
                     "SELECT 1 FROM audit_log WHERE call_id = ? AND user_id = ? "
-                    "AND approval_scope = 'reusable')",
+                    "AND (approval_scope = 'reusable' OR user_decision = 'deny'))",
                     (user_id, record["session_id"], call_id, user_id),
                 )
 
-        return self.get_by_call_id(call_id, user_id=user_id)
+            if user_decision == "approve":
+                # Capture after the human resolution's own revision increment,
+                # while the same transaction still holds every scope row.
+                ids = [item["session_id"] for item in policy_chain]
+                placeholders = ", ".join("?" for _ in ids)
+                cur.execute(
+                    "SELECT session_id, scope_version FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders})",
+                    [user_id, *ids],
+                )
+                approval_scope_versions = {
+                    item["session_id"]: item["scope_version"] for item in cur.fetchall()
+                }
+
+        resolved = self.get_by_call_id(call_id, user_id=user_id)
+        if approval_scope_versions is not None:
+            # Transient callback proof, never persisted or reconstructed from
+            # a later audit read. Delayed learning must retain this exact scope.
+            resolved["_approval_scope_versions"] = approval_scope_versions
+        return resolved
 
     def set_judge_reasoning(
         self,
@@ -1184,7 +1274,8 @@ class AuditStore:
                   AND resolved_by = 'judge'
                   AND judge_decision IN ('approve', 'deny')
                   AND (expired_at IS NULL OR judge_decision = 'deny')
-                  AND (judge_decision = 'deny' OR {_USABLE_APPROVAL_SOURCE})
+                  AND (judge_decision = 'deny' OR (
+                      {_USABLE_APPROVAL_SOURCE} AND {_not_revoked_sql()}))
                   AND (
                     timestamp < ?
                     OR (timestamp = ? AND id < ?)

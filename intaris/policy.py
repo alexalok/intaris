@@ -79,6 +79,29 @@ def policy_for_session(
     return deepcopy(agent_policy)
 
 
+def policy_for_chain(
+    chain: list[dict[str, Any]], agent_policy: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Keep child permissions and inherit only ancestor prohibitions."""
+    own = policy_for_session(chain[0], agent_policy)
+    effective = deepcopy(own) if own else {}
+    for ancestor in chain[1:]:
+        policy = policy_for_session(ancestor, agent_policy) or {}
+        for key in ("deny_tools", "deny_commands", "deny_paths", "deny_policies"):
+            additions = policy.get(key)
+            if not additions:
+                continue
+            existing = effective.get(key, [])
+            effective[key] = (
+                existing if isinstance(existing, list) else [existing]
+            ) + (
+                deepcopy(additions)
+                if isinstance(additions, list)
+                else [deepcopy(additions)]
+            )
+    return effective or own
+
+
 def normalized_policy_clauses(
     policy: dict[str, Any] | None,
 ) -> dict[str, list[dict[str, Any]]]:

@@ -17,7 +17,7 @@ from intaris.classifier import (
     extract_paths,
     resolve_tool_paths,
 )
-from intaris.policy import normalized_policy_clauses, policy_for_session
+from intaris.policy import normalized_policy_clauses, policy_for_chain
 from intaris.redactor import redact
 
 
@@ -95,7 +95,11 @@ def make_evaluation_context(
 
 
 def validate_approval_policy(
-    record: dict[str, Any], session: dict[str, Any], agent_policy: dict[str, Any] | None
+    record: dict[str, Any],
+    session: dict[str, Any],
+    agent_policy: dict[str, Any] | None,
+    *,
+    ancestors: list[dict[str, Any]] | None = None,
 ) -> None:
     """Refuse grants that violate current hard rules or cannot be rechecked.
 
@@ -103,7 +107,7 @@ def validate_approval_policy(
     depends on missing argument text, require a new evaluation; never infer
     that the hidden original could not match a prohibition.
     """
-    policy = policy_for_session(session, agent_policy) or {}
+    policy = policy_for_chain([session, *(ancestors or [])], agent_policy) or {}
     args = dict(record.get("args_redacted") or {})
     context = record.get("evaluation_context")
     if not isinstance(context, dict):

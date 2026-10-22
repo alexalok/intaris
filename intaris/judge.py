@@ -44,7 +44,6 @@ from intaris.policy import (
     POLICY_SEMANTICS,
     effective_policy_for_evaluator,
     normalized_policy_clauses,
-    policy_for_session,
 )
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import filter_model_history, render_user_decisions_section
@@ -1199,7 +1198,7 @@ async def resolve_with_side_effects(
             pass
 
     # Step 1: Resolve the escalation (atomic DB update)
-    audit_store.resolve_escalation(
+    resolved = audit_store.resolve_escalation(
         call_id=call_id,
         user_decision=user_decision,
         user_note=user_note,
@@ -1263,7 +1262,14 @@ async def resolve_with_side_effects(
     # Step 3: Path prefix learning
     if record is not None and user_decision == "approve" and evaluator is not None:
         try:
-            evaluator.learn_from_approved_escalation(record)
+            evaluator.learn_from_approved_escalation(
+                {
+                    **record,
+                    "_approval_scope_versions": resolved.get(
+                        "_approval_scope_versions"
+                    ),
+                }
+            )
         except Exception:
             logger.debug("Could not learn path prefix from approval", exc_info=True)
 
@@ -1643,9 +1649,11 @@ class JudgeReviewer:
 
         # Load session
         session = await asyncio.to_thread(
-            self._sessions.get, session_id, user_id=user_id
+            self._sessions.get_with_parent_policy,
+            session_id,
+            user_id=user_id,
+            agent_policy=self._agent_policy,
         )
-        session["policy"] = policy_for_session(session, self._agent_policy)
         intent_evidence = await asyncio.to_thread(
             collect_intent_evidence, session, self._audit
         )
@@ -1833,10 +1841,10 @@ class JudgeReviewer:
         confidence = str(result.get("confidence", "low"))
         approval_source_call_id = None
         current_session = await asyncio.to_thread(
-            self._sessions.get, session_id, user_id=user_id
-        )
-        current_session["policy"] = policy_for_session(
-            current_session, self._agent_policy
+            self._sessions.get_with_parent_policy,
+            session_id,
+            user_id=user_id,
+            agent_policy=self._agent_policy,
         )
         current_evidence = await asyncio.to_thread(
             collect_intent_evidence, current_session, self._audit
