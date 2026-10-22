@@ -237,6 +237,22 @@ def collect_intent_evidence(
         sources.append(source)
         used += size
     sources.sort(key=lambda s: (s["timestamp"], s["id"]))
+    latest_seq = session.get("latest_user_message_seq")
+    missing_latest_source = latest_seq is not None and not any(
+        source["kind"] == "user_message"
+        and type(source.get("event_seq")) is int
+        and source["event_seq"] == latest_seq
+        for source in candidates
+    )
+    if missing_latest_source and type(latest_seq) is int and latest_seq > 0:
+        projection = audit.get_user_message_projection(
+            session_id, user_id=user_id, event_seq=latest_seq
+        )
+        metadata = (projection or {}).get("args_redacted")
+        if isinstance(metadata, dict) and metadata.get("intention_eligible") is False:
+            # Processing is complete, but this source explicitly cannot supply
+            # authority. Keep its text out of candidates, facts, and the prompt.
+            missing_latest_source = False
     packet = {
         "version": 1,
         # These revisions are read with session state, before loading sources.
@@ -244,7 +260,8 @@ def collect_intent_evidence(
         "scope_versions": {session_id: session.get("scope_version", 0)},
         "sources": sources,
         "facts": [],
-        "complete": not omitted,
+        "complete": not (omitted or missing_latest_source),
+        "missing_latest_user_source": missing_latest_source,
         "omitted_source_ids": omitted,
         # Carry source identities even when prompt limits hide their text.
         # They are re-fetched and validated on the next generation/evaluation.
@@ -269,6 +286,7 @@ def collect_intent_evidence(
             if session.get("status") == "idle"
             else session.get("status"),
             "seq": session.get("latest_user_message_seq"),
+            "missing_latest_user_source": missing_latest_source,
             "scope_version": session.get("scope_version", 0),
         }
     )
@@ -300,6 +318,27 @@ def collect_intent_evidence(
     # not replace its earlier revisions with newly changed ancestor scope.
     packet["scope_versions"].update(session.get("_scope_versions", {}))
     return packet
+
+
+def intent_evidence_complete(packet: dict[str, Any] | None) -> bool:
+    """Require complete current sources throughout the bounded parent chain.
+
+    Models and permissive policy caps cannot reconstruct omitted authority.
+    This checks availability, not whether the available evidence grants access.
+    """
+    if not isinstance(packet, dict):
+        return False
+    current = packet
+    while isinstance(current, dict):
+        if (
+            current.get("complete") is not True
+            or current.get("omitted_source_ids")
+            or current.get("missing_latest_user_source")
+            or current.get("parent_unavailable")
+        ):
+            return False
+        current = current.get("parent")
+    return current is None
 
 
 def validate_profile(

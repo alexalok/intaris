@@ -37,6 +37,7 @@ from intaris.intent_evidence import (
     SCOPE_RULES,
     allows_legacy_precedent,
     collect_intent_evidence,
+    intent_evidence_complete,
     render_intent_evidence,
 )
 from intaris.llm import LLMClient, parse_json_response
@@ -1853,17 +1854,56 @@ class JudgeReviewer:
             current_evidence["fingerprint"] != intent_evidence["fingerprint"]
         )
 
-        async def defer_stale_approval(
+        async def guard_current_approval(
             final_decision: str, *, scope_changed: bool = False
         ) -> bool:
             # Check the final outcome: policy and precedent can turn a model
-            # denial into approval after inference. Neither can bypass freshness.
-            if not (evidence_changed or scope_changed) or final_decision != "approve":
+            # denial into approval. Neither can supply omitted current sources.
+            incomplete = not (
+                intent_evidence_complete(intent_evidence)
+                and intent_evidence_complete(current_evidence)
+            )
+            if (
+                not (evidence_changed or scope_changed or incomplete)
+                or final_decision != "approve"
+            ):
                 return False
+            guard_reasoning = (
+                "Current user intent evidence is incomplete; review full sources."
+                if incomplete
+                else "User scope or policy changed during review; reassess current evidence."
+            )
+            current_policy = current_session.get("policy") or {}
+            if (
+                record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
+                or current_policy.get("interaction_mode") == "none"
+            ):
+                # Background and inline entry points both have no human channel.
+                # A permissive maximum or resolution policy cannot undo this.
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision="deny",
+                    resolved_by="judge",
+                    judge_reasoning=guard_reasoning,
+                    judge_decision="deny",
+                    judge_risk=judge_risk,
+                    audit_store=self._audit,
+                    evaluator=self._evaluator,
+                    event_bus=self._event_bus,
+                    notification_dispatcher=(
+                        self._notification_dispatcher
+                        if self._should_notify_resolution("deny")
+                        else None
+                    ),
+                )
+                if self._metrics:
+                    self._metrics.judge_denials_total += 1
+                return True
             await asyncio.to_thread(
                 self._audit.set_judge_reasoning,
                 call_id,
-                "User scope or policy changed during review; reassess current evidence.",
+                guard_reasoning,
                 user_id=user_id,
                 judge_decision="defer",
                 judge_risk=judge_risk,
@@ -1878,7 +1918,8 @@ class JudgeReviewer:
                     agent_id=agent_id,
                     tool=record.get("tool"),
                     risk=judge_risk,
-                    reasoning="User scope changed during Judge review.",
+                    reasoning=guard_reasoning,
+                    event_type="judge_deferral",
                 )
             return True
 
@@ -1911,7 +1952,7 @@ class JudgeReviewer:
                     ),
                 )
             except ScopeChangedError:
-                await defer_stale_approval(decision, scope_changed=True)
+                await guard_current_approval(decision, scope_changed=True)
                 return False
             return True
 
@@ -1986,7 +2027,7 @@ class JudgeReviewer:
                 record, decision, reasoning, judge_risk, notify_unresolved
             ):
                 return
-            if await defer_stale_approval(decision):
+            if await guard_current_approval(decision):
                 return
             if not await resolve_current_scope():
                 return
@@ -2050,7 +2091,7 @@ class JudgeReviewer:
                 record, decision, reasoning, judge_risk, notify_unresolved
             ):
                 return
-            if await defer_stale_approval(decision):
+            if await guard_current_approval(decision):
                 return
 
             if decision == "defer":

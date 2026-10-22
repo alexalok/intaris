@@ -57,6 +57,7 @@ from intaris.decision import (
 from intaris.intent_evidence import (
     allows_legacy_precedent,
     collect_intent_evidence,
+    intent_evidence_complete,
     requires_read_scope_review,
 )
 from intaris.llm import LLMClient, parse_json_response
@@ -158,12 +159,7 @@ def _unchanged_human_read_scope(
     ):
         return False
     evidence = record.get("intent_evidence")
-    current = evidence
-    while isinstance(current, dict):
-        if current.get("complete") is not True or current.get("parent_unavailable"):
-            return False
-        current = current.get("parent")
-    if not isinstance(evidence, dict) or current is not None:
+    if not intent_evidence_complete(evidence):
         return False
     expected = evidence.get("scope_versions")
     session_id = record.get("session_id")
@@ -896,9 +892,11 @@ class Evaluator:
                     allow_legacy_precedent=not read_scope_review,
                 )
 
-        if read_scope_review and decision.intent_evidence is None:
-            # Operator preferences retain escalation, but a fresh explicit
-            # human retry still needs durable evidence of the reviewed scope.
+        if (
+            read_scope_review or classification == Classification.ESCALATE
+        ) and decision.intent_evidence is None:
+            # Preferences retain escalation until caps or an explicit human
+            # retry apply. Those approvals still require complete current scope.
             decision.intent_evidence = collect_intent_evidence(session, self._audit)
 
         raw_decision = decision.decision
@@ -1003,6 +1001,22 @@ class Evaluator:
             )
             decision.approval_call_id = None
             outcome_override = "intent_evidence_changed"
+
+        if (
+            decision.decision == "approve"
+            and decision.intent_evidence is not None
+            and not intent_evidence_complete(decision.intent_evidence)
+        ):
+            # Apply after caps and explicit approval IDs: neither supplies text
+            # omitted from the current packet, including ancestor restrictions.
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.reasoning = (
+                "Current user intent evidence is incomplete; review full sources."
+            )
+            decision.approval_call_id = None
+            outcome_override = "intent_evidence_incomplete"
 
         # Calculate latency
         latency_ms = int((time.monotonic() - start_time) * 1000)
