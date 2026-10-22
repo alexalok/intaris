@@ -27,8 +27,12 @@ The Hermes adapter intercepts its captured native `skill_view` handler and
 performs a raw text read. It resolves the real absolute target and evaluates an
 internal `skill_view_raw` operation, retaining `skill_view` deny rules and review
 preferences. Shared skill libraries are allowed outside the project. Tool/path
-denies still win; recognized secret-bearing files, natural-language deny
-policies, and explicit `evaluate` preferences still require model evaluation.
+denies still win. Each raw inspection goes through current scope evaluation,
+including initial intention, user messages, parent restrictions, and secret-file
+protections. Policy permits ordinary raw inspection without relevance or
+per-skill consent, even for malicious topics. Earlier approvals and generated
+profiles cannot bypass that check. This costs L1 latency and may require Judge;
+it is not an unconditional deterministic read fast path.
 The internal operation is not registered as an agent-callable tool.
 
 This separation is necessary because the native Hermes loader can run inline
@@ -42,12 +46,14 @@ It does not read instruction contents before approval, trigger plugin discovery,
 or invoke the loader/quarantine scanner. Uncached frontmatter aliases need their
 relative library path; ambiguous names require an exact path. Directory and
 legacy flat skills are supported; flat skills have no linked-file directory.
-A symlink change while approval is pending cannot redirect the approved read.
+Discovered candidates must remain inside their originating registered search
+root. Canonical paths are retained after validation; candidate or ancestor
+symlink changes cannot redirect the approved read.
 The existing in-memory background-review read mark is retained; activation,
 usage/lifecycle hooks, dependency setup, and credential capture are skipped.
 
-Both the adapter and server changes are needed for deterministic raw-read
-approval. Unknown/older host contracts and foreign same-named tools retain
+Both the adapter and server changes are needed for the raw-reader contract.
+Unknown/older host contracts and foreign same-named tools retain
 ordinary evaluation; an argument such as `raw=true` cannot create this exemption.
 As with other native tool identities, the service trusts its authenticated
 adapter to report the operation it actually dispatches.
@@ -169,10 +175,12 @@ full server suite passed 3,114 tests, including 82 hard-prohibition tests.
 
 The [supporting-read follow-up](evaluations/2026-10-22-supporting-reads.md) adds
 raw skill inspection and explicit guidance for corroborating established answers.
-All ten focused controls met their final outcome; both model-evaluated supporting
-reads still needed Judge approval after CLEF confidence escalation. Historical
-skill cases #149/#162 fast-approved with original and regenerated intent under
-the new raw-reader contract using synthetic resolved paths. This was a targeted
-check, not a new full-history comparison. Verification passed 3,160 server and
-1,023 Hermes adapter tests. Both components require deployment before this
-behavior is available in production.
+That frozen phase used deterministic raw-read approval. The
+[review follow-up](evaluations/2026-10-22-codex-review.md) supersedes those fast
+results: raw reads now consider current restrictions on every call. All eight
+benign evaluations approved and none of ten forbidden controls approved;
+historical #149/#162 approved with both original and regenerated intent, each
+after CLEF escalation and Judge review. These are targeted controls, not a new
+population estimate. Verification passed 3,254 server and 1,193 Hermes tests.
+Both components require deployment before this behavior is available in
+production.

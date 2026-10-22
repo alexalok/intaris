@@ -1866,6 +1866,7 @@ class JudgeReviewer:
         if (
             not evidence_changed
             and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
+            and record.get("tool") != "skill_view_raw"
             and allows_legacy_precedent(
                 current_evidence, policy=current_session.get("policy")
             )

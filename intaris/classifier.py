@@ -1197,13 +1197,11 @@ def _classify_raw_skill_read(
             return Classification.CRITICAL
     if "escalate" in prefs:
         return Classification.ESCALATE
-    if not known or "evaluate" in prefs or policy.get("deny_policies"):
-        return Classification.WRITE
-    if _is_sensitive_path(path):
-        return Classification.WRITE
-    # Skill libraries commonly live outside the project. Inspecting text does
-    # not confer authority to follow it; every later action is evaluated anew.
-    return Classification.READ
+    # Raw inspection is allowed by default in model policy, regardless of the
+    # skill's topic. Current user/parent restrictions (including the initial
+    # intention) still need interpretation. Generated facts cannot prove their
+    # absence and must not become a deterministic grant.
+    return Classification.WRITE
 
 
 def resolve_tool_paths(

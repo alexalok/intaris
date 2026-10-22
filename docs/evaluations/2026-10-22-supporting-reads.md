@@ -2,6 +2,10 @@
 
 Date: 2026-10-22. Follow-up to [the policy-prompt comparison](2026-10-21-policy-prompt-replay.md).
 
+Historical frozen-candidate report. The [Codex review follow-up](2026-10-22-codex-review.md)
+supersedes its deterministic raw-read results: current code evaluates each raw
+read against current restrictions. The evidence below remains unchanged.
+
 Supporting evidence can be gathered after an answer is established. Skill text
 can be inspected even when it describes malicious actions. The adapter now
 separates reading from native skill activation; subsequent actions keep their

@@ -49,14 +49,16 @@ def stores(tmp_path):
         {"name": "destructive-maintenance", "path": "/opt/skills/wipe/SKILL.md"},
     ],
 )
-def test_skill_read_approves_without_model_review(stores, backend, args):
+def test_skill_read_uses_model_with_raw_effects_and_current_scope(
+    stores, backend, args
+):
     sessions, audit = stores
     llm = MagicMock()
     deferred = dict(
-        aligned=False,
-        risk="medium",
-        decision="escalate",
-        reasoning="Uncertain relevance.",
+        aligned=True,
+        risk="low",
+        decision="approve",
+        reasoning="Raw instruction read with no current restriction.",
     )
     llm.generate.return_value = json.dumps(deferred)
     jev = MagicMock() if backend == "jev" else None
@@ -67,24 +69,29 @@ def test_skill_read_approves_without_model_review(stores, backend, args):
         user_id="u", session_id="s", agent_id=None, tool="skill_view_raw", args=args
     )
     assert result["decision"] == "approve"
-    assert result["path"] == "fast"
-    assert result["classification"] == "read"
+    assert result["path"] == "llm"
+    assert result["classification"] == "write"
     assert result["risk"] == "low"
     assert audit.get_by_call_id(result["call_id"], user_id="u")["decision"] == "approve"
-    llm.generate.assert_not_called()
+    evidence = audit.get_by_call_id(result["call_id"], user_id="u")["intent_evidence"]
+    assert evidence["complete"]
     if jev:
-        jev.evaluate_tool_call.assert_not_called()
+        state = jev.evaluate_tool_call.call_args.kwargs["state"]
+        assert state["arguments"] == args
+        assert state["tool"] == "skill_view_raw"
+    else:
+        assert args["path"] in llm.generate.call_args.args[0][1]["content"]
 
 
 @pytest.mark.parametrize("working_directory", [None, "/workspace/project"])
-def test_shared_skill_library_is_not_a_project_boundary_violation(working_directory):
+def test_shared_skill_library_still_reviews_current_scope(working_directory):
     assert (
         classify(
             "skill_view_raw",
             {"name": "dangerous-example", "path": "/opt/skills/example/SKILL.md"},
             working_directory=working_directory,
         )
-        == Classification.READ
+        == Classification.WRITE
     )
 
 
@@ -202,6 +209,12 @@ def test_reading_malicious_skill_does_not_approve_its_execution(stores, backend)
     if jev:
         jev.evaluate_tool_call.return_value = EvaluationResult(**rejection)
     evaluator = Evaluator(llm=llm, jev=jev, session_store=sessions, audit_store=audit)
+    accepted = dict(
+        aligned=True, risk="low", decision="approve", reasoning="Raw read only"
+    )
+    llm.generate.return_value = json.dumps(accepted)
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**accepted)
     common = dict(user_id="u", session_id="s", agent_id=None)
     read = evaluator.evaluate(
         **common,
@@ -212,6 +225,9 @@ def test_reading_malicious_skill_does_not_approve_its_execution(stores, backend)
         },
     )
     assert read["decision"] == "approve"
+    llm.generate.return_value = json.dumps(rejection)
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**rejection)
     execute = evaluator.evaluate(
         **common,
         tool="terminal",
@@ -219,13 +235,13 @@ def test_reading_malicious_skill_does_not_approve_its_execution(stores, backend)
     )
     assert execute["decision"] == "deny"
     assert execute["path"] == "llm"
-    (jev.evaluate_tool_call if jev else llm.generate).assert_called_once()
+    assert (jev.evaluate_tool_call if jev else llm.generate).call_count == 2
     critical = evaluator.evaluate(
         **common, tool="terminal", args={"command": "rm -rf /"}
     )
     assert critical["decision"] == "deny"
     assert critical["path"] == "critical"
-    (jev.evaluate_tool_call if jev else llm.generate).assert_called_once()
+    assert (jev.evaluate_tool_call if jev else llm.generate).call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -309,3 +325,95 @@ def test_native_loader_cannot_claim_raw_read_with_agent_arguments():
         )
         == Classification.WRITE
     )
+
+
+@pytest.mark.parametrize("backend", ["llm", "jev"])
+@pytest.mark.parametrize("source", ["initial", "message", "parent", "omitted"])
+def test_skill_read_honors_current_inspection_restriction(stores, backend, source):
+    sessions, audit = stores
+    restriction = "Do not inspect any more skills."
+    session_id = "s"
+    if source == "initial":
+        sessions.create(user_id="u", session_id="restricted", intention=restriction)
+        session_id = "restricted"
+    else:
+        text = restriction if source != "omitted" else "x" * 4001 + restriction
+        audit.insert(
+            call_id="stop",
+            user_id="u",
+            session_id="s",
+            agent_id=None,
+            tool=None,
+            args_redacted={"intention_eligible": True},
+            classification=None,
+            evaluation_path="reasoning",
+            decision="approve",
+            risk=None,
+            reasoning=None,
+            latency_ms=0,
+            record_type="reasoning",
+            content="User message: " + text,
+        )
+        if source == "parent":
+            sessions.create(
+                user_id="u",
+                session_id="child",
+                intention="Inspect useful skills",
+                parent_session_id="s",
+            )
+            session_id = "child"
+    llm, jev = MagicMock(), MagicMock() if backend == "jev" else None
+    answer = dict(
+        aligned=False,
+        risk="medium",
+        decision="escalate",
+        reasoning="Inspection restricted or scope incomplete",
+    )
+    llm.generate.return_value = json.dumps(answer)
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**answer)
+    value = Evaluator(
+        llm=llm, jev=jev, session_store=sessions, audit_store=audit
+    ).evaluate(
+        user_id="u",
+        session_id=session_id,
+        agent_id=None,
+        tool="skill_view_raw",
+        args={"name": "example", "path": "/opt/skills/example/SKILL.md"},
+    )
+    assert value["decision"] == "escalate"
+    assert value["path"] == "llm"
+    evidence = audit.get_by_call_id(value["call_id"], user_id="u")["intent_evidence"]
+    if source == "message":
+        assert evidence["sources"][0]["text"] == restriction
+    elif source == "parent":
+        assert evidence["parent"]["sources"][0]["text"] == restriction
+    elif source == "omitted":
+        assert evidence["complete"] is False
+
+
+def test_raw_read_does_not_reuse_old_approval_without_current_scope_review(stores):
+    sessions, audit = stores
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(
+            aligned=False,
+            risk="medium",
+            decision="escalate",
+            reasoning="Current restriction",
+        )
+    )
+    evaluator = Evaluator(llm=llm, session_store=sessions, audit_store=audit)
+    call = dict(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="skill_view_raw",
+        args={"name": "example", "path": "/opt/skills/example/SKILL.md"},
+    )
+    first = evaluator.evaluate(**call)
+    assert first["decision"] == "escalate"
+    audit.resolve_escalation(first["call_id"], "approve", user_id="u")
+    value = evaluator.evaluate(**call)
+    assert value["decision"] == "escalate"
+    assert value["path"] == "llm"

@@ -1092,6 +1092,11 @@ class Evaluator:
             Decision to approve (reusing prior approval), or None if no
             valid prior approval found.
         """
+        if tool == "skill_view_raw":
+            # Each inspection must consider current restrictions; old reads
+            # and approvals do not establish an unrestricted inspection scope.
+            return None
+
         from datetime import datetime, timedelta, timezone
 
         cutoff = (
@@ -1476,7 +1481,9 @@ class Evaluator:
                 user_decisions = self._audit.get_user_decisions(
                     session_id, user_id=user_id, limit=5
                 )
-            if allows_legacy_precedent(intent_evidence, policy=session.get("policy")):
+            if tool != "skill_view_raw" and allows_legacy_precedent(
+                intent_evidence, policy=session.get("policy")
+            ):
                 evaluation = _apply_authoritative_user_precedent(
                     evaluation,
                     tool=tool,

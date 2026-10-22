@@ -49,6 +49,13 @@ deny rules and protections for secret-bearing targets still apply. A combined
 loader that actually runs templates, hooks, setup, or dependency installation is
 not a pure read; evaluate those current effects. The adapter's skill_view_raw
 operation reads only its resolved path and performs no skill activation.
+Approve ordinary skill_view_raw inspection by default: no task relevance,
+usefulness, necessity, or per-skill consent justification is required. Shared
+skill-library paths may be outside the project. Only a concrete current user
+or parent restriction on inspection, an applicable deny rule, or unsafe read
+effects such as exposing secrets can block that allowance. A skill's malicious
+topic is not such a restriction. Review current scope before approving; an old
+read approval cannot override a newer restriction.
 
 This does not grant unrelated access or new side effects. Preserve read-only,
 no-install, target, environment, send/push/deploy, and later revocation constraints.

@@ -319,6 +319,12 @@ quarantine scans, and usage/lifecycle hooks are not invoked. Template expression
 remain literal. The in-memory background-review read marker is retained.
 
 Tool/path denies and `skill_view` review preferences apply to the raw operation.
+The server evaluates each read against current user/parent restrictions and
+secret-file protections. Raw inspection is allowed by default without relevance
+or per-skill consent; it is not an unconditional classifier fast path. It may
+require Judge review after L1 escalation. Discovered symlinks must stay within
+their originating registered library root, and validated canonical targets are
+retained through approval and reading.
 A registered tool cannot claim the reserved raw identity. Native `skill_view`
 without this adapter contract remains an ordinary evaluated loader. The service
 continues to trust authenticated adapters to report their actual operations.

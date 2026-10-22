@@ -184,7 +184,8 @@ def test_current_restriction_reaches_model_instead_of_reusing_old_approval(setup
 
 
 @pytest.mark.parametrize("verdict", ["deny", "defer"])
-def test_low_risk_does_not_erase_judge_scope_uncertainty(setup, verdict):
+@pytest.mark.parametrize("tool", ["edit", "skill_view_raw"])
+def test_low_risk_does_not_erase_judge_scope_uncertainty(setup, verdict, tool):
     sessions, audit = setup
     user_message(audit, "scope", "Inspect only; do not edit files")
     audit.insert(
@@ -192,7 +193,7 @@ def test_low_risk_does_not_erase_judge_scope_uncertainty(setup, verdict):
         user_id="u",
         session_id="s",
         agent_id=None,
-        tool="edit",
+        tool=tool,
         args_redacted={"path": "/work/a"},
         classification="write",
         evaluation_path="llm",
@@ -531,3 +532,39 @@ def test_unrelated_deny_policy_still_allows_current_model_approval(setup):
     )
     assert value["decision"] == "approve"
     assert value["path"] == "llm"
+
+
+def test_raw_skill_judge_low_confidence_approval_remains_unresolved(setup):
+    sessions, audit = setup
+    audit.insert(
+        call_id="raw",
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="skill_view_raw",
+        args_redacted={"name": "example", "path": "/opt/skills/example/SKILL.md"},
+        classification="write",
+        evaluation_path="llm",
+        decision="escalate",
+        risk="low",
+        reasoning="Review current scope",
+        latency_ms=0,
+    )
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(
+            decision="approve",
+            risk="low",
+            confidence="low",
+            reasoning="Uncertain scope",
+        )
+    )
+    judge = JudgeReviewer(
+        config=JudgeConfig(mode="advisory"),
+        llm=llm,
+        audit_store=audit,
+        session_store=sessions,
+        evaluator=None,
+    )
+    asyncio.run(judge.review_and_resolve(call_id="raw", user_id="u", session_id="s"))
+    assert audit.get_by_call_id("raw", user_id="u")["effective_decision"] == "escalate"
