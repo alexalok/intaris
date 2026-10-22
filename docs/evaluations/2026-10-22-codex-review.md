@@ -25,10 +25,11 @@ Date: 2026-10-22. Follow-up to the [supporting-read report](2026-10-22-supportin
 ## Method and limits
 
 The model replay below is frozen at the source published as `4d39da2`. The
-later deterministic review follow-up at the end of this report changes launcher
-inspection and skill path retention only. It does not rerun model inference;
-all other server source hashes, including prompts, thresholds, evidence, and
-Judge routing, match the frozen replay source.
+first later deterministic follow-up changes launcher inspection and skill path
+retention; the second also tightens approval reuse and resolution. These later
+changes do not rerun model inference. Model prompts, thresholds, and routing
+are unchanged, but the recorded inference outcomes belong to the frozen source
+and are not a fresh measurement of the final branch.
 
 The final replay uses a frozen copy of the corrected server source, 14 fixed-label
 synthetic controls, and historical #149/#162 with original and saved regenerated
@@ -140,3 +141,47 @@ No recorded shell command executes during these tests.
 Private follow-up receipts, regressions, scripts, and source hashes live in
 Git-ignored `runs/codex-review-20261022-round3`, with directories mode 0700 and
 files 0600. The prior inference and historical evidence bundles are unchanged.
+
+
+## Pending-approval and session-scope review follow-up
+
+The next Codex round identified four reproducible gaps:
+
+- An exact approval from another session could bypass a new session's initial
+  restriction. Exact retries now require the same tenant and session. A valid
+  same-session grant remains usable even when another session has a newer grant.
+- Shell `-c --` syntax inspected the terminator instead of the command string.
+  Payload parsing now respects shell option operands, terminators, and positional
+  arguments. Positional examples do not become executable code.
+- POSIX `normpath` preserves exactly two leading slashes, while local Unix root
+  deletion can target `//`. Protected-target matching normalizes root aliases;
+  bounded `//tmp/build` cleanup still follows ordinary evaluation.
+- A pending invocation could be approved after a matching structured deny rule
+  was added. Every approval resolution now checks the current effective policy,
+  including restricted-session adoption, before the shared atomic update. It
+  pins the invocation directory in audit-only metadata, strips appended context
+  from tool targets, and
+  rejects policy changes racing the write. PostgreSQL additionally locks the
+  session row through the approval transaction; SQLite uses its atomic write.
+
+The pending-policy reproducer initially failed all six forbidden combinations
+(three deny-rule types through both human and Judge resolution); its three
+unrelated-rule controls already passed. Additional controls cover native pending
+callbacks, tenant isolation, missing restricted policy, context paths, executor
+cwd snapshots, session adoption, policy races, expired-record status, relevant
+redaction/compaction, and unrelated redacted file contents. Native approval
+refusal restores its pending lease so Deny stays available. Refusal leaves a pending
+record intact: no invented human denial and no implicit expiration. Missing text
+needed by a command/path prohibition fails closed. Shell paths retain bounded
+literal parsing rather than full shell expansion.
+
+Final deterministic verification: 3,413 server tests passed (68 external E2E
+cases deselected, two existing WebSocket warnings); 1,198 Hermes tests passed
+against the same pinned host. Scoped Ruff lint/format and Git whitespace checks
+passed. PostgreSQL transaction ordering is implemented but this run's database
+fixtures use SQLite; no live database or production service was changed.
+The historical inference table above was not rerun in this follow-up.
+
+Private test receipts, scripts, and source hashes are retained in Git-ignored
+`runs/codex-review-20261022-round4`, with directories mode 0700 and files 0600.
+Earlier evidence bundles remain unchanged.
