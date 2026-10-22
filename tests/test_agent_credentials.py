@@ -1211,7 +1211,7 @@ def test_agent_quoted_shell_paths_obey_mandatory_policy(client, tool, deny_paths
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert context["target_paths"] == ["/etc/passwd"]
 
 
@@ -1405,7 +1405,7 @@ def test_agent_unknown_grep_long_options_obey_policy(client, tool, command, deny
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert "/etc/passwd" in context["target_paths"]
 
 
@@ -1463,7 +1463,7 @@ def test_agent_hyphen_pattern_obeys_path_policy(
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert context["target_paths"] == ["/etc/passwd"]
 
 

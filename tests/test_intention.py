@@ -910,9 +910,9 @@ class TestEvaluatorDecisionContext:
         assert prompt_context["tool"]["read_only"] is True
 
         record = audit.get_by_call_id(result["call_id"], user_id="user-1")
-        stored_context = record["args_redacted"]["__intaris_context"]
+        stored_context = record["evaluation_context"]
         assert stored_context["tool"]["description"] == "List Alertmanager silences"
-        assert record["args_redacted"]["context"] == stored_context
+        assert "__intaris_context" not in record["args_redacted"]
 
     def test_llm_evaluate_honors_final_human_same_tool_approval(
         self, db, session_store

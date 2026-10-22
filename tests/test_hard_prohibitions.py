@@ -783,3 +783,158 @@ def test_pending_compacted_patch_cannot_hide_target_headers(stores, kind):
     sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
     with pytest.raises(ValueError, match="incomplete audit arguments"):
         audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_approval_cannot_skip_new_free_text_deny(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.update_session(
+        "s", user_id="u", policy={"deny_policies": ["Do not edit or touch /work/a"]}
+    )
+    with pytest.raises(ValueError):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+    assert audit.get_by_call_id(call_id, user_id="u")["user_decision"] is None
+
+
+def test_reserved_tool_argument_survives_audit_and_pending_policy(stores):
+    sessions, audit = stores
+    args = {
+        "__intaris_context": {"path": "/private/a"},
+        "context": {"note": "real tool argument"},
+    }
+    call_id = Evaluator(
+        llm=MagicMock(), session_store=sessions, audit_store=audit
+    ).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="files:inspect",
+        args=args,
+        context={"working_directory": "/work"},
+        tool_preferences={"files:inspect": "escalate"},
+    )["call_id"]
+    record = audit.get_by_call_id(call_id, user_id="u")
+    assert record["args_redacted"] == args
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+@pytest.mark.parametrize("resolved_by", ["user", "judge"])
+@pytest.mark.parametrize("change", ["add", "edit", "scope", "severity", "legacy"])
+def test_pending_free_text_restriction_changes_require_fresh_evaluation(
+    stores, resolved_by, change
+):
+    sessions, audit = stores
+    clause = {
+        "text": "Do not edit /private/a",
+        "applies_to": "write",
+        "severity": "high",
+    }
+    sessions.update_session("s", user_id="u", policy={"deny_policies": [clause]})
+    call_id = _pending_for_policy(stores)
+    updated = [dict(clause)]
+    if change == "add":
+        updated.append({"text": "Do not edit /work/a"})
+    elif change == "edit":
+        updated[0]["text"] = "Do not edit /work/a"
+    elif change == "scope":
+        updated[0]["applies_to"] = "*"
+    elif change == "severity":
+        updated[0]["severity"] = "critical"
+    else:
+        with audit._db.cursor() as cur:
+            cur.execute(
+                "UPDATE audit_log SET evaluation_context = NULL WHERE call_id = ?",
+                (call_id,),
+            )
+    sessions.update_session("s", user_id="u", policy={"deny_policies": updated})
+    with pytest.raises(ValueError, match="Free-text deny policies changed"):
+        audit.resolve_escalation(
+            call_id, "approve", user_id="u", resolved_by=resolved_by
+        )
+    assert audit.get_by_call_id(call_id, user_id="u")["user_decision"] is None
+    assert (
+        audit.resolve_escalation(call_id, "deny", user_id="u")["user_decision"]
+        == "deny"
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["unchanged", "reorder", "remove", "remove_all", "ids", "allow"]
+)
+def test_pending_free_text_safe_policy_edits_preserve_review(stores, change):
+    sessions, audit = stores
+    clauses = [{"text": "Do not edit /private/a"}, {"text": "Do not send email"}]
+    sessions.update_session("s", user_id="u", policy={"deny_policies": clauses})
+    call_id = _pending_for_policy(stores)
+    policy = {"deny_policies": clauses}
+    if change == "reorder":
+        policy["deny_policies"] = clauses[::-1]
+    elif change == "remove":
+        policy["deny_policies"] = clauses[1:]
+    elif change == "remove_all":
+        policy["deny_policies"] = []
+    elif change == "ids":
+        policy["deny_policies"] = [
+            dict(clause, id=str(i)) for i, clause in enumerate(clauses)
+        ]
+    elif change == "allow":
+        policy["allow_policies"] = ["Allow all safe supporting work"]
+    sessions.update_session("s", user_id="u", policy=policy)
+    assert (
+        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+
+
+def test_pending_restricted_session_uses_server_free_text_snapshot(stores):
+    sessions, audit = stores
+    sessions.update_session(
+        "s", user_id="u", policy={"deny_policies": ["Do not edit /work/a"]}
+    )
+    policy = {"deny_policies": ["Do not send email"]}
+    evaluator = Evaluator(
+        llm=MagicMock(), session_store=sessions, audit_store=audit, agent_policy=policy
+    )
+
+    def evaluate():
+        return evaluator.evaluate(
+            user_id="u",
+            session_id="s",
+            agent_id=None,
+            restricted_agent=True,
+            tool="terminal",
+            args={"command": "touch /work/a"},
+            tool_preferences={"terminal": "escalate"},
+        )["call_id"]
+
+    first = evaluate()
+    assert (
+        audit.resolve_escalation(first, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+    second = evaluate()
+    AuditStore.set_agent_policy(audit._db, {"deny_policies": ["Do not edit /work/a"]})
+    with pytest.raises(ValueError, match="Free-text deny policies changed"):
+        audit.resolve_escalation(second, "approve", user_id="u")
+
+
+def test_client_context_cannot_forge_free_text_snapshot(stores):
+    sessions, audit = stores
+    from intaris.approval_policy import deny_policy_fingerprints
+
+    policy = {"deny_policies": ["Do not edit /work/a"]}
+    call_id = _pending_for_policy(
+        stores,
+        context={
+            "__intaris_deny_policy_clauses": deny_policy_fingerprints(policy),
+            "__intaris_evaluation_directory": "/safe",
+        },
+    )
+    record = audit.get_by_call_id(call_id, user_id="u")
+    assert record["evaluation_context"]["__intaris_deny_policy_clauses"] == []
+    assert record["evaluation_context"]["__intaris_evaluation_directory"] is None
+    sessions.update_session("s", user_id="u", policy=policy)
+    with pytest.raises(ValueError, match="Free-text deny policies changed"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")

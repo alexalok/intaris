@@ -129,6 +129,44 @@ class TestSessionStore:
                 assert record[field] is None
             db.close()
 
+    def test_evaluation_context_migration_preserves_legacy_args(self, tmp_path):
+        path = str(tmp_path / "context-migration.db")
+        import json
+
+        legacy_args = {
+            "__intaris_context": {"path": "/private/a"},
+            "context": {"real": True},
+        }
+        with sqlite3.connect(path) as conn:
+            conn.executescript(_SCHEMA_SQL_SQLITE)
+            conn.execute(
+                "INSERT INTO sessions (user_id, session_id, intention, created_at, updated_at) "
+                "VALUES ('tenant', 'session', 'Test', '2026-01-01', '2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO audit_log (id, call_id, user_id, session_id, timestamp, "
+                "decision, evaluation_path, latency_ms, args_redacted) "
+                "VALUES ('record', 'call', 'tenant', 'session', '2026-01-01', "
+                "'escalate', 'llm', 0, ?)",
+                (json.dumps(legacy_args),),
+            )
+        for _ in range(2):
+            db = Database(DBConfig(path=path))
+            record = AuditStore(db).get_by_call_id("call", user_id="tenant")
+            assert record["evaluation_context"] is None
+            assert record["args_redacted"] == legacy_args
+            db.close()
+        conn = MagicMock()
+        conn.cursor.return_value.fetchone.return_value = None
+        Database.__new__(Database)._migrate_pg(conn)
+        statements = [
+            call.args[0] for call in conn.cursor.return_value.execute.call_args_list
+        ]
+        assert (
+            "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS evaluation_context TEXT"
+            in statements
+        )
+
     def test_database_metrics_record_queries_and_transactions(self, db):
         before = db.metrics()
         with db.cursor() as cur:

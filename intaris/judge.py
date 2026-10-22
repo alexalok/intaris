@@ -1004,8 +1004,8 @@ def _build_review_packet(
             packet["session_details"] = compact_details
 
     args = record.get("args_redacted")
-    context = None
-    if isinstance(args, dict):
+    context = record.get("evaluation_context")
+    if context is None and isinstance(args, dict):
         context = args.get("__intaris_context")
         if context is None:
             context = args.get("context")
@@ -1044,9 +1044,11 @@ def _extract_skill_metadata_from_records(
         args = record.get("args_redacted")
         if not isinstance(args, dict):
             continue
-        context = args.get("__intaris_context")
+        context = record.get("evaluation_context")
         if context is None:
-            context = args.get("context")
+            context = args.get("__intaris_context")
+            if context is None:
+                context = args.get("context")
         if not isinstance(context, dict):
             continue
         skill = context.get("skill")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from typing import Any
 
@@ -15,7 +17,8 @@ from intaris.classifier import (
     extract_paths,
     resolve_tool_paths,
 )
-from intaris.policy import policy_for_session
+from intaris.policy import normalized_policy_clauses, policy_for_session
+from intaris.redactor import redact
 
 
 def effective_working_directory(
@@ -53,6 +56,44 @@ def effective_working_directory(
     return base_directory
 
 
+def deny_policy_fingerprints(policy: dict[str, Any] | None) -> list[str]:
+    """Hash semantic deny clauses; IDs, order, and duplicates do not add rules."""
+    clauses = normalized_policy_clauses(policy).get("deny_policies", [])
+    return sorted(
+        {
+            hashlib.sha256(
+                json.dumps(
+                    {key: value for key, value in clause.items() if key != "id"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            for clause in clauses
+        }
+    )
+
+
+def make_evaluation_context(
+    *,
+    tool: str,
+    args: dict[str, Any],
+    context: dict[str, Any] | None,
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    """Build audit-only metadata without occupying any tool argument name."""
+    return redact(
+        {
+            **(context or {}),
+            "__intaris_evaluation_directory": effective_working_directory(
+                tool, args, context, session.get("details") or {}
+            ),
+            "__intaris_deny_policy_clauses": deny_policy_fingerprints(
+                session.get("policy")
+            ),
+        }
+    )
+
+
 def validate_approval_policy(
     record: dict[str, Any], session: dict[str, Any], agent_policy: dict[str, Any] | None
 ) -> None:
@@ -64,11 +105,21 @@ def validate_approval_policy(
     """
     policy = policy_for_session(session, agent_policy) or {}
     args = dict(record.get("args_redacted") or {})
-    context = args.pop("__intaris_context", None)
-    if isinstance(context, dict) and args.get("context") == context:
-        args.pop("context", None)
+    context = record.get("evaluation_context")
     if not isinstance(context, dict):
+        # Legacy mixed arguments are ambiguous. Never discard a possible real
+        # tool argument or trust its reserved-looking keys as evaluator evidence.
         context = None
+    current_clauses = set(deny_policy_fingerprints(policy))
+    previous_clauses = (context or {}).get("__intaris_deny_policy_clauses")
+    if not isinstance(previous_clauses, list) or not all(
+        isinstance(clause, str) for clause in previous_clauses
+    ):
+        previous_clauses = []
+    if not current_clauses.issubset(previous_clauses):
+        raise ValueError(
+            "Free-text deny policies changed or lack evaluation evidence; evaluate the original call again"
+        )
     tool = record.get("tool") or ""
     # This value is evaluator-owned and already includes tool workdir. Do not
     # apply a relative workdir twice or use mutable current session details.

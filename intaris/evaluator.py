@@ -32,6 +32,9 @@ from typing import TYPE_CHECKING, Any
 from intaris.approval_policy import (
     effective_working_directory as _effective_working_directory,
 )
+from intaris.approval_policy import (
+    make_evaluation_context,
+)
 from intaris.audit import AuditStore
 from intaris.classifier import (
     Classification,
@@ -79,25 +82,8 @@ _MAX_APPROVED_PATHS_PER_SESSION = 50
 # Prevents merging to overly broad prefixes like /Users or /home.
 # Example: /Users/foo/.cache/opencode = 4 components (excluding root).
 _MIN_MERGE_DEPTH = 4
-_CONTEXT_ARG_KEY = "__intaris_context"
 
 logger = logging.getLogger(__name__)
-
-
-def _args_redacted_with_context(
-    args_redacted: dict[str, Any],
-    context: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Attach redacted evaluate context to audit args without clobbering tool args."""
-
-    result = dict(args_redacted)
-    result.pop(_CONTEXT_ARG_KEY, None)
-    if not context:
-        return result
-    result[_CONTEXT_ARG_KEY] = context
-    if "context" not in result:
-        result["context"] = context
-    return result
 
 
 def _apply_authoritative_user_precedent(
@@ -390,9 +376,7 @@ class Evaluator:
                 reasoning = f"{reasoning}. Reason: {status_reason}"
 
             latency_ms = int((time.monotonic() - start_time) * 1000)
-            inactive_args_redacted = _args_redacted_with_context(
-                redact(args), redact(context) if context else None
-            )
+            inactive_args_redacted = redact(args)
             self._audit.insert(
                 call_id=call_id,
                 user_id=user_id,
@@ -400,6 +384,12 @@ class Evaluator:
                 agent_id=agent_id,
                 tool=tool,
                 args_redacted=inactive_args_redacted,
+                evaluation_context=make_evaluation_context(
+                    tool=tool,
+                    args=classification_args,
+                    context=context,
+                    session=session,
+                ),
                 classification="write",
                 evaluation_path="fast",
                 decision="deny",
@@ -456,9 +446,7 @@ class Evaluator:
                     "deny" if unattended else clamp_outcome("escalate", minimum_outcome)
                 )
                 latency_ms = int((time.monotonic() - start_time) * 1000)
-                args_redacted = _args_redacted_with_context(
-                    redact(args), redact(context) if context else None
-                )
+                args_redacted = redact(args)
                 args_hash = _compute_args_hash(args)
                 self._audit.insert(
                     call_id=call_id,
@@ -467,6 +455,12 @@ class Evaluator:
                     agent_id=agent_id,
                     tool=tool,
                     args_redacted=args_redacted,
+                    evaluation_context=make_evaluation_context(
+                        tool=tool,
+                        args=classification_args,
+                        context=context,
+                        session=session,
+                    ),
                     classification="write",
                     evaluation_path="alignment",
                     decision=alignment_decision,
@@ -537,9 +531,9 @@ class Evaluator:
         )
 
         _injection_detected = False
-        injection_scan_payload: dict[str, Any] = dict(args_redacted)
+        injection_scan_payload: dict[str, Any] = {"args": args_redacted}
         if context:
-            injection_scan_payload[_CONTEXT_ARG_KEY] = redact(context)
+            injection_scan_payload["context"] = redact(context)
         args_text = json.dumps(injection_scan_payload, default=str)
         findings = detect_injection_patterns(args_text)
         if findings:
@@ -597,9 +591,7 @@ class Evaluator:
                     except ValueError:
                         pass
                     latency_ms = int((time.monotonic() - start_time) * 1000)
-                    cascade_args_redacted = _args_redacted_with_context(
-                        redact(args), redact(context) if context else None
-                    )
+                    cascade_args_redacted = redact(args)
                     cascade_reasoning = (
                         f"Session suspended — parent session is {parent_status}"
                     )
@@ -610,6 +602,12 @@ class Evaluator:
                         agent_id=agent_id,
                         tool=tool,
                         args_redacted=cascade_args_redacted,
+                        evaluation_context=make_evaluation_context(
+                            tool=tool,
+                            args=classification_args,
+                            context=context,
+                            session=session,
+                        ),
                         classification="write",
                         evaluation_path="fast",
                         decision="deny",
@@ -909,10 +907,8 @@ class Evaluator:
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
         # Step 7: Audit (with args_hash for escalation retry, profile_version)
-        # Audit-only snapshot: preserve the effective cwd without changing model
-        # context or reinterpreting pending targets after session-details edits.
-        audit_context = redact(
-            {**(context or {}), "__intaris_evaluation_directory": working_directory}
+        audit_context = make_evaluation_context(
+            tool=tool, args=classification_args, context=context, session=session
         )
         self._audit.insert(
             call_id=call_id,
@@ -920,7 +916,8 @@ class Evaluator:
             session_id=session_id,
             agent_id=agent_id,
             tool=tool,
-            args_redacted=_args_redacted_with_context(args_redacted, audit_context),
+            args_redacted=args_redacted,
+            evaluation_context=audit_context,
             classification=classification.value,
             evaluation_path=decision.path,
             decision=decision.decision,

@@ -2588,6 +2588,32 @@ class TestJudgePrompt:
             "List Alertmanager silences"
         )
 
+    def test_review_packet_prefers_separate_context_over_real_reserved_args(self):
+        from intaris.judge import _build_review_packet
+
+        record = {
+            "args_redacted": {
+                "__intaris_context": {"skill": {"name": "fake-skill"}},
+                "context": {"tool": {"description": "fake-tool"}},
+            },
+            "evaluation_context": {
+                "tool": {"description": "Real evaluation metadata"},
+                "skill": {"name": "actual-skill"},
+            },
+        }
+        packet = _build_review_packet(
+            session={"policy": None},
+            record=record,
+            latest_reasoning=None,
+            recent_reasoning=[record],
+            session_hints=[],
+        )
+        assert (
+            packet["current_tool_metadata"]["description"] == "Real evaluation metadata"
+        )
+        assert packet["resolved_skill"]["name"] == "actual-skill"
+        assert packet["known_skills"] == [{"name": "actual-skill"}]
+
     def test_review_packet_skill_metadata_prefers_stored_evaluate_context(self):
         """Known skill extraction uses stored evaluate context, not tool args."""
         from intaris.judge import _build_review_packet

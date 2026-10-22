@@ -276,6 +276,7 @@ class AuditRecord(BaseModel):
 
     id: str
     intent_evidence: dict[str, Any] | None = None
+    evaluation_context: dict[str, Any] | None = None
     call_id: str | None = None
     record_type: str = "tool_call"
     source: Literal["evaluation", "event"] = "evaluation"

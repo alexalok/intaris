@@ -112,6 +112,7 @@ class AuditStore:
         minimum_outcome: str | None = None,
         outcome_override: str | None = None,
         intent_evidence: dict[str, Any] | None = None,
+        evaluation_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -132,6 +133,8 @@ class AuditStore:
             record_type: Record type: "tool_call", "reasoning", "checkpoint",
                 or "summary".
             content: Reasoning or checkpoint text (null for tool_call records).
+            evaluation_context: Redacted server evaluation metadata, kept separate
+                from arbitrary tool argument keys.
             args_hash: SHA-256 hash of canonical args for escalation retry.
             profile_version: Behavioral profile version at time of evaluation.
             intention: Session intention at time of evaluation (for tracking).
@@ -159,9 +162,10 @@ class AuditStore:
                      evaluation_path, decision, risk, reasoning, latency_ms,
                      args_hash, profile_version, intention, injection_detected,
                      raw_decision, effective_decision, maximum_outcome,
-                     minimum_outcome, outcome_override, intent_evidence)
+                     minimum_outcome, outcome_override, intent_evidence,
+                     evaluation_context)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -191,6 +195,9 @@ class AuditStore:
                     outcome_override,
                     json.dumps(intent_evidence)
                     if intent_evidence is not None
+                    else None,
+                    json.dumps(evaluation_context)
+                    if evaluation_context is not None
                     else None,
                 ),
             )
@@ -244,6 +251,7 @@ class AuditStore:
             "args_redacted": args_redacted,
             "content": content,
             "intent_evidence": intent_evidence,
+            "evaluation_context": evaluation_context,
             "classification": classification,
             "evaluation_path": evaluation_path,
             "decision": decision,
@@ -1160,11 +1168,12 @@ class AuditStore:
 def _row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, parsing JSON fields."""
     d = dict(row)
-    if d.get("intent_evidence"):
-        try:
-            d["intent_evidence"] = json.loads(d["intent_evidence"])
-        except (json.JSONDecodeError, TypeError):
-            d["intent_evidence"] = None
+    for field in ("intent_evidence", "evaluation_context"):
+        if d.get(field):
+            try:
+                d[field] = json.loads(d[field])
+            except (json.JSONDecodeError, TypeError):
+                d[field] = None
     if d.get("args_redacted"):
         try:
             d["args_redacted"] = json.loads(d["args_redacted"])

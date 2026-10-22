@@ -386,6 +386,8 @@ class Database:
             conn.execute("ALTER TABLE sessions ADD COLUMN intent_profile TEXT")
         if not self._sqlite_column_exists(conn, "audit_log", "intent_evidence"):
             conn.execute("ALTER TABLE audit_log ADD COLUMN intent_evidence TEXT")
+        if not self._sqlite_column_exists(conn, "audit_log", "evaluation_context"):
+            conn.execute("ALTER TABLE audit_log ADD COLUMN evaluation_context TEXT")
         if not self._sqlite_column_exists(
             conn, "mcp_servers", "trust_readonly_annotations"
         ):
@@ -985,6 +987,7 @@ class Database:
             migrations = [
                 ("sessions", "intent_profile", "TEXT"),
                 ("audit_log", "intent_evidence", "TEXT"),
+                ("audit_log", "evaluation_context", "TEXT"),
                 (
                     "mcp_servers",
                     "trust_readonly_annotations",
