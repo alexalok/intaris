@@ -110,18 +110,39 @@ Do not change remote configuration or pull upstream into the fork implicitly.
 
 After claiming the worktree, fetch the two default branches and record their
 exact tips. Avoid importing upstream tags into our release namespace as a side
-effect of review. Then inspect the range using the recorded commit IDs:
+effect of review. Use `--no-tags` and explicit branch refspecs for both fetches;
+this also avoids relying on a remote's configured fetch refspecs. Replace every
+placeholder, then run the complete block as one command. Its subshell stops on
+failure without changing the caller's shell options. Record the printed commit
+IDs before inspecting the range:
 
 ```bash
-# Set these from verified refs and the previous checkpoint record.
+(
+set -eu
+# Replace these aliases/default branches with the verified repository values.
+upstream_remote=upstream
+upstream_branch=main
+fork_remote=fork
+fork_branch=main
 last_reviewed=<previous-upstream-full-sha>
-reviewed_upstream=<new-upstream-full-sha>
-fork_baseline=<fork-default-branch-full-sha>
 
-git merge-base --is-ancestor "$last_reviewed" "$reviewed_upstream"
+git fetch --no-tags "$upstream_remote" \
+  "refs/heads/$upstream_branch:refs/remotes/$upstream_remote/$upstream_branch"
+git fetch --no-tags "$fork_remote" \
+  "refs/heads/$fork_branch:refs/remotes/$fork_remote/$fork_branch"
+reviewed_upstream=$(git rev-parse "refs/remotes/$upstream_remote/$upstream_branch^{commit}")
+fork_baseline=$(git rev-parse "refs/remotes/$fork_remote/$fork_branch^{commit}")
+
+if ! git merge-base --is-ancestor "$last_reviewed" "$reviewed_upstream"; then
+  printf '%s\n' 'Upstream ancestry mismatch; stop and investigate the review boundary.' >&2
+  exit 1
+fi
+printf 'Previous upstream: %s\nReviewed upstream: %s\nFork baseline: %s\n' \
+  "$last_reviewed" "$reviewed_upstream" "$fork_baseline"
 git log --reverse --topo-order --format='%H %s' "$last_reviewed..$reviewed_upstream"
 git diff --stat "$last_reviewed" "$reviewed_upstream"
 git diff "$last_reviewed" "$reviewed_upstream" -- <paths-under-review>
+)
 ```
 
 Stop and investigate if the ancestry check fails; do not silently replace the
@@ -173,15 +194,40 @@ tree. Do not substitute `-X ours`, which can import non-conflicting changes, or
 
 The following is a manual recipe for an authorized checkpoint operation. Start
 from a clean, claimed worktree at verified current fork main. Exclude the local
-coordination marker from commits. Set the variables to real recorded values;
-run the assertions before proceeding to the next step.
+coordination marker from commits. Replace every placeholder and verify the fork
+remote/default branch, then run the complete subshell block. `set -eu` makes a
+failed fetch, metadata check, merge, or assertion stop before later commands.
+The preflight requires a clean tracked worktree/index at freshly fetched fork
+main and a committed review record with exactly one matching status and each
+boundary field. A local untracked record cannot satisfy these checks.
 
 ```bash
+(
+set -eu
 reviewed_upstream=<reviewed-upstream-full-sha>
 last_reviewed=<previous-upstream-full-sha>
 review_record=docs/upstream-reviews/<review-file>.md
-fork_before=$(git rev-parse HEAD)
+fork_remote=fork
+fork_branch=main
+
+git fetch --no-tags "$fork_remote" \
+  "refs/heads/$fork_branch:refs/remotes/$fork_remote/$fork_branch"
+fork_before=$(git rev-parse "refs/remotes/$fork_remote/$fork_branch^{commit}")
+test "$(git rev-parse HEAD)" = "$fork_before"
 fork_tree=$(git rev-parse 'HEAD^{tree}')
+git diff --exit-code
+git diff --cached --exit-code
+
+# Read committed metadata, never an untracked or modified working-copy record.
+test "$(git cat-file -t "$fork_before:$review_record")" = blob
+record_contents=$(git show "$fork_before:$review_record")
+test "$(printf '%s\n' "$record_contents" | grep '^Status: ')" = 'Status: ready for checkpoint'
+test "$(printf '%s\n' "$record_contents" | grep '^Previous upstream tip: ')" = "Previous upstream tip: $last_reviewed"
+test "$(printf '%s\n' "$record_contents" | grep '^Reviewed upstream tip: ')" = "Reviewed upstream tip: $reviewed_upstream"
+if ! git merge-base --is-ancestor "$last_reviewed" "$reviewed_upstream"; then
+  printf '%s\n' 'Upstream ancestry mismatch; no checkpoint may be created.' >&2
+  exit 1
+fi
 
 git merge --no-ff --no-commit -s ours "$reviewed_upstream"
 test "$(git rev-parse MERGE_HEAD)" = "$reviewed_upstream"
@@ -196,16 +242,18 @@ Upstream-Previous: $last_reviewed
 Upstream-Review-Record: $review_record"
 
 checkpoint=$(git rev-parse HEAD)
-test "$(git rev-parse HEAD^1)" = "$fork_before"
-test "$(git rev-parse HEAD^2)" = "$reviewed_upstream"
+test "$(git show -s --format=%P HEAD)" = "$fork_before $reviewed_upstream"
 test "$(git rev-parse 'HEAD^{tree}')" = "$fork_tree"
 git rev-list --parents -n 1 HEAD
 git diff --exit-code HEAD^1 HEAD --
+)
 ```
 
 Require exactly two parents. If the tip is already an ancestor and Git reports
 that nothing needs merging, verify the existing checkpoint instead of inventing
 another one. If any check fails, stop; do not commit an apparent checkpoint.
+If a failure occurs after the merge starts, inspect the remaining merge state
+before deciding how to recover; never continue with the commit command alone.
 
 Publish/integrate the checkpoint only through an explicitly authorized path
 that **preserves the merge commit and its two parents**. A merge-commit PR can
