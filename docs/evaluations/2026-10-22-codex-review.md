@@ -501,3 +501,24 @@ assumed safe. No historical inference, live PostgreSQL test, deployment, or
 upstream checkpoint merge was performed. Private receipts and source hashes
 remain ignored under `runs/codex-review-20261022-round12` with 0700 directories
 and 0600 files.
+
+
+## Timing-prefix follow-up
+
+Codex reproduced `time rm -rf /` becoming READ under an explicit `time *`
+allowance. The critical-command path now unwraps the timing prefix before
+applying command allowances, reusing the existing nested-operation checks.
+Option values remain data; a format/output argument containing command-looking
+text and ordinary `echo` arguments are not treated as executable payloads.
+
+The parser distinguishes Bash timing keywords from external command argv, including pipeline positions and find/xargs payloads. GNU/BSD option arity, abbreviations, informational exits, and format/output operands follow the [Bash parser](https://raw.githubusercontent.com/mirror/bash/master/parse.y), [GNU Time 1.10 source](https://ftp.gnu.org/gnu/time/time-1.10.tar.gz), and [FreeBSD implementation](https://raw.githubusercontent.com/freebsd/freebsd-src/main/usr.bin/time/time.c). Initial regressions had 98 failures and 112 passing controls; five additional context regressions failed before the external-argv distinction was fixed. Six cases exercise permission ceilings and human/Judge hard-stop refusal. Runtime aliases, functions, PATH lookup, and inherited environment remain outside the recognizer.
+
+All 216 dedicated timing cases pass. Final verification:
+4,910 server tests passed, 68 external E2E cases excluded, two existing
+WebSocket warnings. Scoped Ruff lint/format and whitespace checks passed.
+The previously verified 1,203 Hermes tests have unchanged source hashes.
+No destructive command, historical model inference, live PostgreSQL test,
+deployment, or upstream checkpoint merge was performed. This remains bounded
+literal command recognition, not containment of arbitrary program behavior.
+Private verification receipts remain ignored under
+`runs/codex-review-20261022-round13` (0700 directories, 0600 files).
