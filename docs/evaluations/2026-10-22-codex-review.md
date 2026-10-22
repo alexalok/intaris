@@ -455,3 +455,49 @@ source hashes were checked; this round changes server code and docs only.
 No historical inference, live PostgreSQL test, deployment, or upstream checkpoint
 merge was performed. Private receipts, scripts, and source hashes remain ignored
 under `runs/codex-review-20261022-round11` (0700 directories, 0600 files).
+
+
+## runuser, evidence availability, and atomic user-source follow-up
+
+Codex reproduced three executable gaps: `runuser` could hide a prohibited nested
+command, direct model approvals could use incomplete intent packets, and an
+event-backed message revision could become visible before its source text.
+
+- `runuser` direct argv and shell-command forms are parsed before allow rules.
+  Option arity, GNU permutation, conflicts, abbreviations, help/version exits,
+  and explicit literal `POSIXLY_CORRECT`/`env` handling follow the
+  [util-linux source](https://github.com/util-linux/util-linux/blob/master/login-utils/su-common.c).
+  The final dedicated suite had 118 failures and 87 passing controls before the
+  fix; all 205 now pass, including 12 evaluator/audit hard-boundary cases. No
+  destructive command ran. Inherited environment, dynamic shell state, PAM,
+  account configuration, and arbitrary programs remain outside literal parsing.
+- Final L1/Jev and Judge approval requires complete applicable own/ancestor
+  packets. Source-size, total-budget, and count omissions, unavailable parents,
+  and unprojected latest user events cannot become approval through policy caps,
+  explicit IDs, or operator-preference shortcuts. Unattended approvals become
+  denial; ordinary model denials and deterministic prohibitions remain intact.
+  Twelve preference-cap/ID bypass cases failed before the final attachment fix.
+- Availability checks distinguish an absent projection from an explicitly
+  ineligible one. Ineligible text never becomes authority. Complete independent
+  user requests remain usable when explanatory assistant context is too large;
+  its missing-context flag and bare-confirmation uncertainty remain visible.
+  Seven false-positive controls failed before these distinctions were added.
+- Source insertion, event observation, and scope revision now share one DB
+  transaction. Session-row locking serializes duplicate delivery; rollback does
+  not expose a pointer without a source. Duplicate delivery reuses its audit ID;
+  stale delivery does not cancel newer intention work. Event allocation/startup
+  reconciliation can still publish pending sequences, which completeness checks
+  now reject for model approval until projection is available. The 35 dedicated
+  atomic/projection tests cover independent SQLite connections, final approval
+  races, rollback, duplicate workers, tenant isolation, and invalid seq types.
+
+Final verification: 4,694 server tests passed, 68 external E2E cases excluded,
+two existing WebSocket warnings. Scoped Ruff lint/format and whitespace checks
+passed. The previously verified 1,203 Hermes tests have unchanged source hashes.
+The new intent controls use model stubs; they verify routing and final outcome
+boundaries, not current live-model false-positive/negative rates. Long source
+history can now require additional review because incomplete text is never
+assumed safe. No historical inference, live PostgreSQL test, deployment, or
+upstream checkpoint merge was performed. Private receipts and source hashes
+remain ignored under `runs/codex-review-20261022-round12` with 0700 directories
+and 0600 files.

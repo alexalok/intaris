@@ -113,6 +113,23 @@ language; source binding proves provenance, not semantic correctness.
   takes priority, then retained restrictions. Over-budget text is omitted whole,
   with source IDs and `complete=false`; it is never clipped into permission.
   This is bounded evidence, not a claim to reproduce the full conversation.
+  Incomplete applicable packets, including ancestor packets, cannot produce
+  evaluator or Judge approval. The final decision guard runs after permissive
+  caps and explicit approval-ID handling; it escalates, or denies unattended
+  calls. Existing denials and hard prohibitions remain binding. Long sessions
+  or large messages can therefore require human review; a generated summary
+  does not make omitted sources complete. This conservative limit is not a
+  measured live-model false-positive rate.
+- Event-backed user source text, its observation marker, and its sequence/scope
+  revision commit in one transaction. Duplicate delivery reuses the source;
+  stale delivery does not replace the current intention task. Event allocation
+  and startup reconciliation may still expose a pending sequence before source
+  projection. A packet remains incomplete until that exact sequence is available.
+  An explicitly ineligible projection proves processing is finished without
+  entering authority sources; unrelated direct text cannot substitute for a
+  missing event. Oversized explanatory assistant context keeps its existing
+  missing-context flag without invalidating an otherwise complete user source.
+  Bare confirmations still require model assessment of an unambiguous proposal.
 - Current ancestor evidence is included through four parent levels. Evaluation
   and approval require a complete, tenant-scoped chain: missing, cyclic, or
   deeper ancestry cannot authorize execution. Child requests cannot widen
@@ -133,9 +150,10 @@ language; source binding proves provenance, not semantic correctness.
   Explicit approval-ID retries can still use a fresh bare human grant when
   complete original evidence, all scope revisions, and the invocation directory
   match; only the grant's own human-resolution revision increment is allowed.
-  Changed scope, missing evidence, or a conditional note requires current L1
-  approval. Operator-preference escalations also retain the evidence needed for
-  this comparison.
+  Changed scope or a conditional note requires current L1 assessment. Missing
+  evidence must be collected completely before evaluator/Judge approval; an L1
+  approval alone cannot repair an incomplete packet. All operator-preference
+  escalations retain current evidence before caps or explicit retries apply.
 
 Jev/CLEF keeps its provider routing and full UTF-8 input budget. If the enriched
 request exceeds that budget, the existing local escalation applies; evidence is

@@ -13,9 +13,10 @@ For reads that require current scope assessment, an old ID cannot override a
 new restriction or a changed invocation directory. If L1 still escalates, a
 fresh bare human approval can be reused only with complete recorded evidence,
 unchanged session/ancestor revisions (apart from that approval's own increment),
-and the same effective working directory. Conditional notes and missing or
-changed evidence require current L1 approval. Read-only operator-preference
-escalations store this evidence too, preserving fresh explicit retries.
+and the same effective working directory. Conditional notes and changed scope
+require current L1 assessment. Incomplete current evidence cannot produce
+evaluator or Judge approval, even with an explicit approval ID or permissive
+cap. Operator-preference escalations store this evidence for reads and writes.
 
 This reference is not a single-use grant. The trusted controller sends it only when it resumes the approved operation.
 The response echoes `minimum_outcome` when supplied, so clients can detect unsupported servers.
