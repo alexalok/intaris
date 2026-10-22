@@ -27,9 +27,10 @@ Date: 2026-10-22. Follow-up to the [supporting-read report](2026-10-22-supportin
 The model replay below is frozen at the source published as `4d39da2`. The
 first later deterministic follow-up changes launcher inspection and skill path
 retention; later follow-ups also tighten approval reuse, resolution, and audit
-metadata separation. These changes do not rerun model inference. Model prompts, thresholds, and routing
-are unchanged, but the recorded inference outcomes belong to the frozen source
-and are not a fresh measurement of the final branch.
+metadata separation. These follow-ups do not rerun model inference. A later follow-up removes a
+duplicate scope rubric from CLEF input; thresholds and routing remain unchanged.
+The recorded inference outcomes belong to the frozen source and are not a fresh
+measurement of the final branch.
 
 The final replay uses a frozen copy of the corrected server source, 14 fixed-label
 synthetic controls, and historical #149/#162 with original and saved regenerated
@@ -288,3 +289,48 @@ results above remain separate from these later deterministic changes.
 
 Private receipts, scripts, and source hashes are retained in Git-ignored
 `runs/codex-review-20261022-round7`, with directories 0700 and files 0600.
+
+
+## L1 commit, denial pagination, and CLEF input follow-up
+
+- L1 approvals now commit through a conditional audit INSERT using the observed
+  scope revisions, including parent evidence. PostgreSQL locks the observed
+  session rows first; SQLite evaluates the revision predicates in the INSERT.
+  If scope changed, no approval row is written. The evaluator persists one
+  escalation (interactive) or denial (unattended), preserves the raw decision,
+  records `intent_evidence_changed`, and updates counters once. Path permission
+  learning runs after successful audit insertion. Exact retries cannot replace
+  the earlier classifier scope with a newer snapshot. Regressions cover both
+  LLM and CLEF/Jev, parent/user/policy/lifecycle changes, a concurrent SQLite
+  write immediately before INSERT, normal activity, and unchanged approvals.
+  Expiring either a human or Judge reusable approval bumps the scope revision,
+  closing the same race between exact-retry lookup and approval insertion.
+  A failing Judge-expiry reproduction and unchanged-grant controls cover this.
+- `chroot` and `gchroot` payloads pass through hard checks after options and
+  NEWROOT are consumed. GNU long options and BSD user/group flags are parsed;
+  an omitted command is treated as a shell for stdin inspection. Help/version,
+  invalid options, quoted examples, and bounded cleanup remain non-critical.
+  Source contracts: [GNU coreutils](https://github.com/coreutils/coreutils/blob/v9.7/src/chroot.c)
+  and [FreeBSD](https://github.com/freebsd/freebsd-src/blob/releng/14.3/usr.sbin/chroot/chroot.c).
+  Literal parsing remains bounded and does not claim to sandbox arbitrary code.
+- The approvals UI requests `overridable_denials=true`. SQL excludes hard and
+  lifecycle denials before counting and pagination, so twenty newer ineligible
+  records cannot hide older reviewable denials. Tests cover multiple pages,
+  tenant/agent isolation, and unfiltered audit history retaining every denial.
+- CLEF/Jev appends the scope rubric only when caller rules do not already
+  contain it. Normal evaluator calls carry one copy; standalone callers still
+  receive the rubric. Byte-budget boundary tests prove that a request fitting
+  one copy reaches the provider mock, while one byte over budget still escalates
+  without truncation or an outgoing request.
+
+Verification: 3,706 server tests and 1,203 Hermes tests passed; 68 external E2E
+tests excluded, two existing WebSocket warnings. Scoped Ruff lint/format and
+Git whitespace checks passed. SQLite concurrency was exercised; PostgreSQL
+locking has not been tested against a live server. These changes do not execute
+recorded commands or mutate a deployed service. Historical inference was not
+rerun: the earlier frozen-source replay also predates the duplicate-rubric fix.
+Its selected-control results remain historical evidence, not current population
+false-positive/negative rates.
+
+Private receipts, scripts, and source hashes are retained in Git-ignored
+`runs/codex-review-20261022-round8`, with directories 0700 and files 0600.
