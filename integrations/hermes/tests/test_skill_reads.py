@@ -446,3 +446,55 @@ def test_linked_symlinks_within_skill_remain_readable(skill_host, scripted_http)
     result = skill_host.call({"name": "example", "file_path": "alias.md"})
     assert result["content"] == "Reference evidence"
     assert skill_host.activated == []
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_oversized_raw_skill_fails_without_activation_or_read_mark(
+    skill_host, scripted_http, linked
+):
+    folder = skill_host.root / "large"
+    folder.mkdir()
+    folder.joinpath("SKILL.md").write_text("Instructions")
+    path = folder / ("large.txt" if linked else "SKILL.md")
+    with path.open("wb") as stream:
+        stream.truncate(2 * 1024 * 1024)
+    scripted_http({"decision": "approve", "call_id": "large-1"})
+    args = {"name": "large"}
+    if linked:
+        args["file_path"] = "large.txt"
+    result = skill_host.call(args)
+    assert result.get("success") is False
+    assert "exceeds" in result["error"]
+    assert "content" not in result
+    assert skill_host.activated == skill_host.marks == []
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "utf-8-sig"])
+def test_raw_skill_byte_limit_keeps_complete_boundary_text(
+    tmp_path, monkeypatch, encoding
+):
+    from hermes_intaris import skills
+
+    text = "a" * 61 if encoding == "ascii" else "é" * 29 + "abc"
+    data = text.encode(encoding)
+    path = tmp_path / "boundary.md"
+    path.write_bytes(data)
+    monkeypatch.setattr(skills, "MAX_RAW_SKILL_BYTES", len(data))
+    assert skills._read_exact_path(path) == text
+
+
+def test_raw_skill_read_caps_file_that_grows_after_stat(tmp_path, monkeypatch):
+    from hermes_intaris import skills
+
+    path = tmp_path / "growing.md"
+    path.write_bytes(b"x" * 96)
+    real_fstat = skills.os.fstat
+
+    def earlier_size(fd):
+        info = real_fstat(fd)
+        return types.SimpleNamespace(st_mode=info.st_mode, st_size=32)
+
+    monkeypatch.setattr(skills, "MAX_RAW_SKILL_BYTES", 64)
+    monkeypatch.setattr(skills.os, "fstat", earlier_size)
+    with pytest.raises(ValueError, match="exceeds 64 byte"):
+        skills._read_exact_path(path)

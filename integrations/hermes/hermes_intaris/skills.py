@@ -16,6 +16,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 RAW_SKILL_TOOL = "skill_view_raw"
+MAX_RAW_SKILL_BYTES = 1024 * 1024
 _REQUIRED = (
     "_skill_lookup_path_error",
     "_skill_search_dirs",
@@ -52,10 +53,22 @@ def _read_exact_path(path: Path) -> str:
         )
     finally:
         os.close(directory)
-    with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError("Skill target is not a regular file")
-        return stream.read()
+        if info.st_size > MAX_RAW_SKILL_BYTES:
+            raise ValueError(
+                f"Skill file exceeds {MAX_RAW_SKILL_BYTES} byte read limit"
+            )
+        # The file may grow after fstat. Read at most one sentinel byte beyond
+        # the cap, then reject before decoding or serializing a partial document.
+        content = stream.read(MAX_RAW_SKILL_BYTES + 1)
+        if len(content) > MAX_RAW_SKILL_BYTES:
+            raise ValueError(
+                f"Skill file exceeds {MAX_RAW_SKILL_BYTES} byte read limit"
+            )
+        return content.decode("utf-8-sig", errors="replace")
 
 
 @dataclass(frozen=True)
