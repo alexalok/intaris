@@ -1292,14 +1292,19 @@ def _strip_quoted_strings(command: str) -> str:
     return _QUOTED_STRING_RE.sub('""', command)
 
 
+_MAX_SHELL_DEPTH = 8
+
+
 def _is_critical(command: str, _depth: int = 0) -> bool:
     """Recognize prohibited execution, preserving quoted operands and prose.
 
     This is a bounded literal shell recognizer, not a shell interpreter.
     Dynamic/unknown commands still take the ordinary WRITE evaluation path.
     """
-    if _depth > 8:
-        return False
+    if _depth > _MAX_SHELL_DEPTH:
+        # Exhausted inspection is not evidence of safety. A broad allow rule
+        # must not authorize an uninspected nested payload.
+        return True
     raw_segments, heredocs = _shell_segments(command)
     executable_text = "".join(raw + separator for raw, separator in raw_segments)
     if re.search(
