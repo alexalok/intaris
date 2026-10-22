@@ -1683,6 +1683,48 @@ def _unwrap_taskset_command(words: list[str]) -> list[str]:
     return words[index + 1 :]
 
 
+def _unwrap_chroot_command(words: list[str]) -> list[str]:
+    """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
+    long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        index += 1
+        if token.startswith("--"):
+            name, equals, _ = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            if name in {"help", "version"}:
+                return []
+            if name in {"groups", "userspec"}:
+                if not equals:
+                    index += 1
+            elif equals:
+                return []
+        else:
+            # BSD chroot uses -u/-g/-G values and FreeBSD also supports -n.
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "ugG":
+                    if offset == len(token) - 1:
+                        index += 1
+                    break
+                if option != "n":
+                    return []
+    if index >= len(words):
+        return []  # Missing NEWROOT is an error, not a shell launch.
+    # No explicit command runs the interactive shell; inspect stdin as shell
+    # input as well. Do not assume a chroot makes root destruction harmless.
+    return words[index + 1 :] or ["sh", "-i"]
+
+
 def _critical_command_words(command: str) -> list[str]:
     """Unwrap literal execution prefixes without promoting argument text."""
     command = re.sub(
@@ -1736,6 +1778,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_ionice_command(words)
         elif head == "taskset":
             words = _unwrap_taskset_command(words)
+        elif head in {"chroot", "gchroot"}:
+            words = _unwrap_chroot_command(words)
         elif head in option_values:
             words = words[1:]
             while words and words[0].startswith("-"):
