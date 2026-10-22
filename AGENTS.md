@@ -11,6 +11,19 @@
 - **Repository**: https://github.com/fpytloun/intaris
 - **Part of**: Cognara platform (Cognis controller, Intaris guardrails, Mnemory memory)
 
+## Fork maintenance
+
+This repository is a loose fork that is expected to diverge substantially from
+upstream. Treat it as a separate product. Follow
+[Loose-Fork Upstream Workflow](docs/upstream-workflow.md): review commits since
+the last completed checkpoint, adapt selected changes through backport PRs,
+then record the reviewed upstream tip with an unchanged-tree, two-parent merge
+only after the selected PRs and review record are merged. Preserve fork-owned
+versions, builds, images, packages, and runtime contracts; upstream artifacts or
+tags must not silently determine our product. A checkpoint records review, not
+adoption of every upstream change. Pushes, merges, and live actions still require
+the applicable user authorization.
+
 ## Architecture
 
 ```

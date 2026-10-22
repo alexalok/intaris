@@ -42,3 +42,4 @@
 | Document | Description |
 |---|---|
 | [Development](development.md) | Setup, testing, linting, and code conventions |
+| [Loose-Fork Upstream Workflow](upstream-workflow.md) | Review new upstream commits, adapt selected changes through backport PRs, and record completed reviews without importing upstream code |
