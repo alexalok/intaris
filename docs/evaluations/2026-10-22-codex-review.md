@@ -410,3 +410,48 @@ service changed. Historical inference was not rerun; the selected frozen-source
 results above are not current population false-positive/negative measurements.
 Private scripts, receipts, source hashes, and manifest remain Git-ignored under
 `runs/codex-review-20261022-round10` (directories 0700, files 0600).
+
+
+## setpriv and current read-scope follow-up
+
+Codex reproduced two further bypasses: `setpriv -- rm -rf /` could inherit a
+command allowance, and ordinary read fast paths could omit a current user or
+ancestor restriction. Both have deterministic regression coverage.
+
+- The `setpriv` parser follows option arity, aliases, abbreviations, `--`, and
+  informational exits from the [util-linux source](https://github.com/util-linux/util-linux/blob/master/sys-utils/setpriv.c).
+  Literal nested payloads use existing hard checks. The final test set against
+  the previous classifier had 88 failing cases and 101 passing controls; all
+  189 now pass, including six evaluator/approval checks. No destructive command
+  was executed. This remains bounded literal recognition, not arbitrary-program
+  containment.
+- Read candidates with current user or parent scope now reach normal evaluation
+  after path-cache lookup. The source query excludes bare positive grants before
+  LIMIT without hiding older messages, denials, or human-authored notes. Initial
+  root-only declarations retain legacy read allowlists; keyword heuristics are
+  not used to claim natural-language enforcement. Trusted MCP readonly identity
+  survives disabled child shortcuts; raw skill reads use the same scope guard.
+- Automatic exact retry and legacy similarity precedent cannot undo these read
+  scope decisions. An explicit human approval ID can override an escalation
+  only with fresh complete evidence, matching session/ancestor revisions, and
+  the same invocation directory, or a current L1 approval. Conditional notes,
+  missing evidence, or changed scope require current interpretation. Fresh bare
+  human approvals still work, including parent and operator-preference flows.
+
+The first 33 read cases reproduced 27 failures and six passing controls.
+Additional failing cases isolated conditional-note precedence, missing-source
+retry, invocation-directory changes, and internal read identities. The final
+81-case read suite includes approving supporting-evidence controls, both LLM
+and Jev/CLEF plumbing, tenant/session isolation, oversized sources, SQL filtering
+before LIMIT, and a concurrent user message before audit insertion. These model
+responses are stubbed: they prove routing and decision boundaries, not live-model
+false-positive/negative rates. Existing parent read tests now exercise benign L1
+approvals instead of assuming a fast path.
+
+Final verification: 4,372 server tests passed, 68 external E2E cases excluded,
+two existing WebSocket warnings. Scoped Ruff lint/format and whitespace checks
+passed. The previously verified 1,203 Hermes tests remain unchanged and their
+source hashes were checked; this round changes server code and docs only.
+No historical inference, live PostgreSQL test, deployment, or upstream checkpoint
+merge was performed. Private receipts, scripts, and source hashes remain ignored
+under `runs/codex-review-20261022-round11` (0700 directories, 0600 files).

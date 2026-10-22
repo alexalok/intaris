@@ -18,6 +18,24 @@ Uncertain usefulness or apparent redundancy is not itself a reason to escalate.
 A generated summary such as "no further action requested" does not invent a user
 restriction on evidence gathering; actual user restrictions still apply.
 
+Ordinary read allowlists, command allowances, and approved path prefixes do not
+skip current scope assessment when the session has eligible user messages,
+human denials, human-authored scope notes, a user-derived intention, a pending
+user sequence, or parent scope. Trusted readonly MCP calls and raw skill reads
+retain this rule when path checks force their classification to WRITE. Evidence
+presence sends the call through normal evaluation; it does not itself deny or
+escalate a benign supporting read. Operator escalation preferences remain in force.
+Bare human approvals without notes and unrelated tenant/session records do not
+disable an otherwise unrestricted read fast path. Scope lookup filters before
+its row limit, so a newer bare approval cannot hide an older restriction.
+
+This retains a legacy boundary: a root session with only its initial declaration,
+no forwarded user evidence, and no semantic deny policy still uses existing read
+allowlists. Initial free text is not deterministically parsed for restrictions.
+Clients needing current natural-language scope enforcement must forward user
+messages or use explicit policy rules. Scope-aware reads now incur L1 latency
+and can require Judge; the old historical replay does not measure this new path.
+
 Skill text inspection is permitted regardless of whether the instructions are
 benign, malicious, disabled, or quarantined. Text remains untrusted data and
 never grants permission to execute the instructions. Explicit denies, sensitive
@@ -82,7 +100,8 @@ language; source binding proves provenance, not semantic correctness.
 ## Lifetime and bounds
 
 - Existing intention regeneration also generates the profile; there is no new
-  inference call per tool evaluation. Old sessions and two-field intention
+  separate profile-generation call per tool evaluation. Scope-aware reads may
+  newly use the existing L1 evaluator. Old sessions and two-field intention
   responses remain compatible.
 - Current constraints and revocations retain their source references across
   topic changes. Omitting a fact does not revoke it. Retirement requires a newer
@@ -108,7 +127,15 @@ language; source binding proves provenance, not semantic correctness.
 - Legacy mechanical same-tool precedent is disabled when user messages, omitted
   evidence, or parent scope are present. Existing exact-call retry also refuses
   newer messages, incomplete evidence, and parent scope. Human decisions remain
-  model context. Explicit client approval expiration is preserved.
+  model context. Scope-aware reads also disable exact automatic retry and
+  similarity fallback so a conditional human note cannot be mechanically
+  expanded to another target. Explicit client approval expiration is preserved.
+  Explicit approval-ID retries can still use a fresh bare human grant when
+  complete original evidence, all scope revisions, and the invocation directory
+  match; only the grant's own human-resolution revision increment is allowed.
+  Changed scope, missing evidence, or a conditional note requires current L1
+  approval. Operator-preference escalations also retain the evidence needed for
+  this comparison.
 
 Jev/CLEF keeps its provider routing and full UTF-8 input budget. If the enriched
 request exceeds that budget, the existing local escalation applies; evidence is
@@ -158,7 +185,8 @@ and executor directory, never the parent's directory. Absolute targets remain
 checkable without cwd; unresolved relative targets under path denies return a
 non-executable response requesting sufficient executor metadata. Nonempty
 semantic deny clauses require model assessment even for otherwise read-only
-calls. Empty clauses do not disable read fast paths.
+calls. Empty clauses alone add no restriction; parent scope still requires
+review of child reads.
 
 An active or idle session can receive approval. A completed, suspended, or
 terminated session cannot; suspended or terminated ancestors also block child
