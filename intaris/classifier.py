@@ -1808,6 +1808,60 @@ def _unwrap_prlimit_command(words: list[str]) -> list[str]:
     return []
 
 
+def _unwrap_namespace_command(
+    words: list[str],
+    *,
+    required_long: set[str],
+    optional_long: set[str],
+    flag_long: set[str],
+    required_short: str,
+    flag_short: str,
+    optional_short: str = "",
+) -> list[str]:
+    """Parse unshare/nsenter's matching getopt grammar and default shell.
+
+    Both stop at the first operand. Optional values only attach, required
+    values may follow, and help/version never execute a program.
+    """
+    long_options = required_long | optional_long | flag_long
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            break
+        if token == "-" or not token.startswith("-"):
+            return words[index - 1 :]
+        if token.startswith("--"):
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []  # Invalid or ambiguous options never execute argv.
+                name = matches[0]
+            if name in {"help", "version"} or (name in flag_long and equals):
+                return []
+            if name in required_long and not equals:
+                if index >= len(words):
+                    return []
+                index += 1
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hV":
+                    return []
+                if option in required_short or option in optional_short:
+                    if option in required_short and offset == len(token) - 1:
+                        if index >= len(words):
+                            return []
+                        index += 1
+                    break  # An attached value consumes the rest of the cluster.
+                if option not in flag_short:
+                    return []
+    # Namespace/root changes do not exempt destructive commands. Model the
+    # default shell as a shell consumer without consulting the server's SHELL.
+    return words[index:] or ["sh"]
+
+
 def _unwrap_unshare_command(words: list[str]) -> list[str]:
     """Locate util-linux unshare's program without inspecting option data.
 
@@ -1855,43 +1909,58 @@ def _unwrap_unshare_command(words: list[str]) -> list[str]:
         "help",
         "version",
     }
-    long_options = required_long | optional_long | flag_long
-    index = 1
-    while index < len(words):
-        token = words[index]
-        index += 1
-        if token == "--":
-            break
-        if token == "-" or not token.startswith("-"):
-            return words[index - 1 :]
-        if token.startswith("--"):
-            name, equals, _value = token[2:].partition("=")
-            if name not in long_options:
-                matches = [option for option in long_options if option.startswith(name)]
-                if len(matches) != 1:
-                    return []  # Invalid or ambiguous options never execute argv.
-                name = matches[0]
-            if name in {"help", "version"} or (name in flag_long and equals):
-                return []
-            if name in required_long and not equals:
-                if index >= len(words):
-                    return []
-                index += 1
-        else:
-            for offset, option in enumerate(token[1:], start=1):
-                if option in "hV":
-                    return []
-                if option in "RwSGl":
-                    if offset == len(token) - 1:
-                        if index >= len(words):
-                            return []
-                        index += 1
-                    break  # An attached value consumes the rest of the cluster.
-                if option not in "fmuinpCTUrc":
-                    return []
-    # Namespace/root changes do not exempt destructive commands. Model the
-    # default shell as a shell consumer without consulting the server's SHELL.
-    return words[index:] or ["sh"]
+    return _unwrap_namespace_command(
+        words,
+        required_long=required_long,
+        optional_long=optional_long,
+        flag_long=flag_long,
+        required_short="RwSGl",
+        flag_short="fmuinpCTUrc",
+    )
+
+
+def _unwrap_nsenter_command(words: list[str]) -> list[str]:
+    """Locate util-linux nsenter's explicit program or default shell.
+
+    Its namespace/directory short options take attached optional values,
+    unlike unshare's no-argument namespace short flags. The actual getopt
+    table requires setuid/setgid values and makes wdns optional.
+    """
+    launched = _unwrap_namespace_command(
+        words,
+        required_long={"target", "net-socket", "setuid", "setgid"},
+        optional_long={
+            "mount",
+            "uts",
+            "ipc",
+            "net",
+            "pid",
+            "user",
+            "cgroup",
+            "time",
+            "root",
+            "wd",
+            "wdns",
+        },
+        flag_long={
+            "all",
+            "env",
+            "no-fork",
+            "join-cgroup",
+            "preserve-credentials",
+            "keep-caps",
+            "user-parent",
+            "follow-context",
+            "help",
+            "version",
+        },
+        required_short="tNSG",
+        optional_short="muinpCUTrwW",
+        flag_short="aecFZ",
+    )
+    if launched and _looks_like_env_assignment(launched[0]):
+        return []  # nsenter execs argv; NAME=value is a program, not assignment.
+    return launched
 
 
 def _unwrap_setpriv_command(words: list[str]) -> list[str]:
@@ -2246,6 +2315,8 @@ def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[
             words = _unwrap_prlimit_command(words)
         elif head == "unshare":
             words = _unwrap_unshare_command(words)
+        elif head == "nsenter":
+            words = _unwrap_nsenter_command(words)
         elif head == "setpriv":
             words = _unwrap_setpriv_command(words)
         elif head == "runuser":
