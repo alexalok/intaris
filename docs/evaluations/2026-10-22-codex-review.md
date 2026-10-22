@@ -522,3 +522,41 @@ deployment, or upstream checkpoint merge was performed. This remains bounded
 literal command recognition, not containment of arbitrary program behavior.
 Private verification receipts remain ignored under
 `runs/codex-review-20261022-round13` (0700 directories, 0600 files).
+
+
+## Namespace entry and approved-path directory follow-up
+
+Codex reproduced two additional boundary errors:
+
+- `nsenter -- rm -rf /` bypassed the hard prohibition under a broad command
+  allowance. The recognizer now inspects nsenter's program or default-shell
+  consumer before allow shortcuts. A shared namespace scanner preserves
+  unshare's existing grammar while separate option tables distinguish nsenter's
+  attached optional values and required operands. Option values, quoted command
+  examples, help/version calls, and bounded cleanup do not become hard denials.
+  Grammar follows the [util-linux source](https://raw.githubusercontent.com/util-linux/util-linux/master/sys-utils/nsenter.c)
+  and [manual](https://raw.githubusercontent.com/util-linux/util-linux/master/sys-utils/nsenter.1.adoc).
+  All 217 dedicated cases pass, including six evaluator/approval hard-stop
+  controls; before correction, 129 failed and 88 controls passed. The combined
+  nsenter/unshare suite passes 405 cases.
+- A human-approved relative read could seed an unrelated directory because the
+  callback used the session default instead of the evaluated invocation directory.
+  Cache learning now uses the evaluator-owned audit snapshot, which already
+  includes call context and shell workdir. Missing, invalid, or unknown snapshots
+  cannot seed a cache. Current transaction-scope, revocation, and expiration checks
+  remain in place. All 20 new directory cases pass; 18 failed before correction.
+  Controls verify valid sibling reuse, session defaults recorded at evaluation,
+  per-call directories without a session default, and no double application of
+  relative shell workdir. The focused cache/approval/read-scope suite passes 548.
+
+Final verification: 5,147 server tests passed, 68 external E2E cases excluded,
+two existing WebSocket warnings. Scoped Ruff lint/format and whitespace checks
+passed. The previously verified 1,203 Hermes tests have unchanged source hashes.
+No destructive command, historical model inference, live PostgreSQL test,
+deployment, or upstream checkpoint merge was performed. Namespace inspection
+remains bounded literal recognition; runtime namespace/PID/credential/path
+availability, inherited or target environment, and actual default-shell identity
+are not simulated. Missing invocation metadata can require normal reevaluation
+instead of cache reuse; this is not a measured live false-positive rate.
+Private receipts remain ignored under `runs/codex-review-20261022-round14`
+(0700 directories, 0600 files).
