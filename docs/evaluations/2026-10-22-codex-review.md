@@ -242,3 +242,49 @@ E2E cases excluded, two existing WebSocket warnings. Scoped Ruff and whitespace
 checks passed. Commands were inspected as inert strings; none were executed.
 No inference replay or deployment occurred. Private evidence is retained in
 Git-ignored `runs/codex-review-20261022-round6` (0700 directories, 0600 files).
+
+
+## Scope transaction and bounded-read follow-up
+
+Four further Codex findings had failing reproductions before their fixes:
+
+- Restore the previous hard stop for recursive deletion of any single lowercase
+  root component, including `/srv`, `/mnt`, `/proc`, `/sys`, `/run`, and `/media`.
+  Canonical aliases stay protected; bounded child targets and quoted examples
+  remain ordinary evaluation inputs.
+- Inspect `taskset` executable argv after its CPU mask/list operand, including
+  nested wrappers, shell payloads, heredocs, and pipeline shells. The parser follows
+  the [util-linux option contract](https://github.com/util-linux/util-linux/blob/v2.42.2/schedutils/taskset.c).
+  PID, help, version, and invalid option modes do not promote trailing data into
+  executable commands. Tests cover destructive payloads under broad allowances
+  and benign controls. All commands are inert strings in these tests.
+- Guard Judge approvals inside the final database transaction with the observed
+  session and ancestor `scope_version` values. Eligible user-message inserts,
+  reusable human decisions, explicit expiration of reusable human approvals,
+  intention/profile changes, policy changes, and restrictive lifecycle changes
+  advance revisions in the same transaction as the source mutation. Event
+  sequence advancement and its later audit insert each invalidate older reads.
+  The final audit UPDATE requires matching revisions. PostgreSQL locks the
+  observed session rows in sorted order before audit rows; source writers use
+  the same lock order. SQLite uses predicates on its atomic UPDATE. A mismatch
+  records Judge deferral without publishing approval or learning permissions.
+  Human override semantics and deterministic hard prohibitions remain intact.
+  Agent chatter, counters, routine activity, repeated restriction flags, and
+  automatic idle/resume transitions do not invalidate scope. Tests include
+  updates after the last evidence read, a separate SQLite connection racing the
+  final write, unchanged approvals, rollback, and additive/idempotent migration.
+- Bound raw skill reads to 1 MiB. Check the already-open descriptor size, then
+  read at most the cap plus one byte to detect growth before decoding or JSON
+  serialization. Oversized files fail without partial content, activation, or
+  read marking. Main/linked files, exact byte limits, UTF-8/BOM content, and growth
+  after `fstat` are covered.
+
+Verification: 3,621 server tests and 1,203 Hermes tests passed; 68 external E2E
+tests excluded, two existing WebSocket warnings. Scoped Ruff lint/format and
+Git whitespace checks passed. PostgreSQL migration SQL is tested; concurrent
+transaction behavior was exercised with SQLite, not a live PostgreSQL server.
+No historical inference rerun or deployment occurred. Frozen-source replay
+results above remain separate from these later deterministic changes.
+
+Private receipts, scripts, and source hashes are retained in Git-ignored
+`runs/codex-review-20261022-round7`, with directories 0700 and files 0600.
