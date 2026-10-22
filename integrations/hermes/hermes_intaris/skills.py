@@ -245,13 +245,20 @@ def prepare_skill_read(
                 # the priority of an enclosing project root.
                 search_root, tier = max(owners, key=lambda owner: len(owner[0].parts))
                 boundary = search_root.resolve()
-                if not candidate.resolve().is_relative_to(boundary) or (
-                    directory is not None
-                    and not Path(directory).resolve().is_relative_to(boundary)
+                candidate = candidate.resolve(strict=True)
+                directory = (
+                    Path(directory).resolve(strict=True)
+                    if directory is not None
+                    else None
+                )
+                if not candidate.is_relative_to(boundary) or (
+                    directory is not None and not directory.is_relative_to(boundary)
                 ):
                     # A discovered symlink cannot redefine its originating
                     # search root. Explicitly registered roots may be symlinks.
                     continue
+                # Retain the canonical paths that passed containment, never
+                # resolve the original candidate symlinks again after checking.
                 ranked.append((tier, directory, candidate))
         if not ranked:
             raise ValueError(

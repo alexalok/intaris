@@ -347,3 +347,34 @@ def test_registered_search_root_symlink_remains_valid(skill_host, scripted_http)
     scripted_http({"decision": "approve", "call_id": "root-approved"})
     result = skill_host.call({"name": "example"})
     assert result["content"] == "Registered library instructions"
+
+
+def test_candidate_symlink_swap_cannot_change_validated_target(
+    skill_host, scripted_http, monkeypatch
+):
+    original = skill_host.root / "original/SKILL.md"
+    original.parent.mkdir()
+    original.write_text("Original instructions")
+    outside = skill_host.root.parent / "private/SKILL.md"
+    outside.parent.mkdir()
+    outside.write_text("Private instructions")
+    alias = skill_host.root / "alias"
+    alias.symlink_to(original.parent, target_is_directory=True)
+    resolve = Path.resolve
+    swapped = False
+
+    def replacing(path, *args, **kwargs):
+        nonlocal swapped
+        result = resolve(path, *args, **kwargs)
+        if path == alias and not swapped:
+            alias.unlink()
+            alias.symlink_to(outside.parent, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(Path, "resolve", replacing)
+    scripted_http({"decision": "approve", "call_id": "pinned-target"})
+    result = skill_host.call({"name": "alias"})
+    assert "Private instructions" not in json.dumps(result)
+    assert result.get("content") == "Original instructions" or "error" in result
+    assert skill_host.activated == []
