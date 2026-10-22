@@ -51,6 +51,10 @@ prompt; its buttons accept the configured approver IDs. Group membership alone
 does not grant approval authority. With no usable origin or fallback, the
 existing bounded Intaris UI approval wait remains available.
 
+Restored legacy sessions without a pinned Telegram transport identity use the
+operator's fallback rather than their unverified stored origin. Conflicting
+profile or transport identities still block native presentation.
+
 When Telegram explicitly rejects an unavailable origin topic, delivery falls
 back once to the operator's configured fallback chat/topic. The same lease and
 deadline apply, and only the fallback's configured approvers can act there.
