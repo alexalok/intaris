@@ -1080,8 +1080,8 @@ class Evaluator:
         """Check if a prior escalation or denial for the same tool+args was approved.
 
         Looks for an audit record within the retry TTL window where:
-        - Same user, tool, and args_hash (session-independent so approvals
-          survive MCP proxy reconnects)
+        - Same user, session, tool, and args_hash. Reconnects retaining their
+          session can retry; a new session requires its own scope evaluation.
         - The record was resolved with user_decision='approve'
 
         This covers both escalation retry (existing) and denial override
@@ -1092,7 +1092,7 @@ class Evaluator:
             Decision to approve (reusing prior approval), or None if no
             valid prior approval found.
         """
-        if tool == "skill_view_raw":
+        if session_id is None or tool == "skill_view_raw":
             # Each inspection must consider current restrictions; old reads
             # and approvals do not establish an unrestricted inspection scope.
             return None
@@ -1110,6 +1110,7 @@ class Evaluator:
             args_hash=args_hash,
             cutoff=cutoff,
             human_only=human_only,
+            session_id=session_id,
         )
 
         if row is not None:

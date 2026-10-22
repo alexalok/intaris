@@ -568,3 +568,87 @@ def test_raw_skill_judge_low_confidence_approval_remains_unresolved(setup):
     )
     asyncio.run(judge.review_and_resolve(call_id="raw", user_id="u", session_id="s"))
     assert audit.get_by_call_id("raw", user_id="u")["effective_decision"] == "escalate"
+
+
+@pytest.mark.parametrize("backend", ["llm", "jev"])
+@pytest.mark.parametrize("restricts", [False, True])
+def test_cross_session_approval_requires_current_intention_evaluation(
+    setup, backend, restricts
+):
+    sessions, audit = setup
+    llm, jev = MagicMock(), MagicMock() if backend == "jev" else None
+    answer = dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    llm.generate.return_value = json.dumps(answer)
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**answer)
+    evaluator = Evaluator(llm=llm, jev=jev, session_store=sessions, audit_store=audit)
+    call = dict(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="edit",
+        args={"path": "/work/a"},
+    )
+    first = evaluator.evaluate(**call)
+    audit.resolve_escalation(first["call_id"], "approve", user_id="u")
+    assert evaluator.evaluate(**call)["path"] == "fast"
+    intention = "Do not edit /work/a" if restricts else "Maintain project"
+    sessions.create(session_id="new", user_id="u", intention=intention)
+    answer = dict(
+        aligned=not restricts,
+        risk="medium",
+        decision="escalate" if restricts else "approve",
+        reasoning="Current session scope",
+    )
+    llm.generate.return_value = json.dumps(answer)
+    llm.generate.reset_mock()
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**answer)
+        jev.evaluate_tool_call.reset_mock()
+    value = evaluator.evaluate(**{**call, "session_id": "new"})
+    assert value["path"] == "llm"
+    assert value["decision"] == ("escalate" if restricts else "approve")
+    if jev:
+        assert (
+            jev.evaluate_tool_call.call_args.kwargs["state"]["intention"] == intention
+        )
+    else:
+        assert intention in llm.generate.call_args.args[0][1]["content"]
+
+
+def test_foreign_session_approval_does_not_hide_same_session_retry(setup):
+    sessions, audit = setup
+    sessions.create(session_id="other", user_id="u", intention="Another project")
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    )
+    evaluator = Evaluator(llm=llm, session_store=sessions, audit_store=audit)
+    call = dict(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="edit",
+        args={"path": "/work/a"},
+    )
+    first = evaluator.evaluate(**call)
+    audit.resolve_escalation(first["call_id"], "approve", user_id="u")
+    audit.insert(
+        call_id="foreign",
+        user_id="u",
+        session_id="other",
+        agent_id=None,
+        tool="edit",
+        args_redacted={"path": "/work/a"},
+        args_hash=audit.get_by_call_id(first["call_id"], user_id="u")["args_hash"],
+        classification="write",
+        evaluation_path="llm",
+        decision="escalate",
+        risk="medium",
+        reasoning="Review",
+        latency_ms=0,
+    )
+    audit.resolve_escalation("foreign", "approve", user_id="u")
+    value = evaluator.evaluate(**call)
+    assert value["path"] == "fast"
+    assert first["call_id"] in value["reasoning"]

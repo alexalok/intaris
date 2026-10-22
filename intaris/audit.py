@@ -535,6 +535,7 @@ class AuditStore:
         args_hash: str,
         cutoff: str,
         human_only: bool = False,
+        session_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Find a prior approved override for the same tool+args.
 
@@ -551,6 +552,7 @@ class AuditStore:
             tool: Tool name.
             args_hash: SHA-256 hash of canonical args.
             cutoff: ISO timestamp — only consider approvals after this time.
+            session_id: If supplied, restrict retry grants to this session.
 
         Returns:
             Audit record dict if a matching approval is found, else None.
@@ -561,6 +563,7 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  {"AND session_id = ?" if session_id is not None else ""}
                   AND COALESCE(classification, '') != 'critical'
                   AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
@@ -577,7 +580,15 @@ class AuditStore:
                 ORDER BY resolved_at DESC
                 LIMIT 1
                 """,
-                (user_id, tool, args_hash, UNATTENDED_JUDGE_REVIEW, cutoff, human_only),
+                (
+                    user_id,
+                    tool,
+                    args_hash,
+                    *((session_id,) if session_id is not None else ()),
+                    UNATTENDED_JUDGE_REVIEW,
+                    cutoff,
+                    human_only,
+                ),
             )
             row = cur.fetchone()
 
