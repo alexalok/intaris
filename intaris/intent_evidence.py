@@ -137,6 +137,31 @@ def _source(record: dict[str, Any]) -> dict[str, Any] | None:
     return redact(source)
 
 
+def requires_read_scope_review(session: dict[str, Any], audit: AuditStore) -> bool:
+    """Keep current user and parent scope ahead of read allowlist shortcuts.
+
+    Presence of evidence requires interpretation, not denial. Do not guess
+    restrictions from keywords or model-assigned fact kinds. A pending or
+    already-summarized user update still needs review if its source is absent.
+    Legacy sessions without user evidence retain their ordinary read fast path.
+    The evaluator's atomic scope revision check guards this lookup against races.
+    """
+    if (
+        session.get("parent_session_id")
+        or session.get("intention_source") == "user"
+        or session.get("latest_user_message_seq") is not None
+    ):
+        return True
+    return bool(
+        audit.get_intent_sources(
+            session["session_id"],
+            user_id=session["user_id"],
+            limit=1,
+            include_bare_approvals=False,
+        )
+    )
+
+
 def collect_intent_evidence(
     session: dict[str, Any],
     audit: AuditStore,

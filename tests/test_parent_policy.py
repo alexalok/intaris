@@ -372,5 +372,5 @@ def test_empty_ancestor_semantic_clauses_do_not_escalate_reads(stores, clauses):
         args={"filePath": "/child/a"},
     )
     assert result["decision"] == "approve"
-    assert result["path"] == "fast"
-    llm.generate.assert_not_called()
+    assert result["path"] == "llm"
+    llm.generate.assert_called_once()

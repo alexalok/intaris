@@ -669,6 +669,10 @@ class TestAlignmentEscalation:
 
         audit_store = AuditStore(db)
         mock_llm = MagicMock()
+        mock_llm.generate.return_value = (
+            '{"aligned": true, "risk": "low", "decision": "approve", '
+            '"reasoning": "Read supports current parent scope"}'
+        )
 
         from intaris.alignment import AlignmentBarrier
 
@@ -684,7 +688,7 @@ class TestAlignmentEscalation:
             alignment_barrier=barrier,
         )
 
-        # Read-only tool → fast-path approve (no LLM needed)
+        # Parent scope is checked even for ordinary read-only tools.
         result = evaluator.evaluate(
             user_id="user-1",
             session_id="child-norm",
@@ -694,7 +698,8 @@ class TestAlignmentEscalation:
         )
 
         assert result["decision"] == "approve"
-        assert result["path"] == "fast"
+        assert result["path"] == "llm"
+        mock_llm.generate.assert_called_once()
 
 
 # ── Parent lifecycle cascade tests ────────────────────────────────────
@@ -817,13 +822,17 @@ class TestParentLifecycleCascade:
 
         audit_store = AuditStore(db)
         mock_llm = MagicMock()
+        mock_llm.generate.return_value = (
+            '{"aligned": true, "risk": "low", "decision": "approve", '
+            '"reasoning": "Read supports current parent scope"}'
+        )
         evaluator = Evaluator(
             llm=mock_llm,
             session_store=session_store,
             audit_store=audit_store,
         )
 
-        # Read-only tool → fast-path approve (no LLM needed)
+        # Parent scope is checked even for ordinary read-only tools.
         result = evaluator.evaluate(
             user_id="user-1",
             session_id="child-lc3",
@@ -833,7 +842,8 @@ class TestParentLifecycleCascade:
         )
 
         assert result["decision"] == "approve"
-        assert result["path"] == "fast"
+        assert result["path"] == "llm"
+        mock_llm.generate.assert_called_once()
         # No session_status in the response for normal evaluations
         assert result.get("session_status") is None
 

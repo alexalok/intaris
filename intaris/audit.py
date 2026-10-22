@@ -639,9 +639,19 @@ class AuditStore:
         return [_row_to_dict(row) for row in rows]
 
     def get_intent_sources(
-        self, session_id: str, *, user_id: str, limit: int = 25
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        limit: int = 25,
+        include_bare_approvals: bool = True,
     ) -> list[dict[str, Any]]:
-        """Get user-channel evidence without displacement by agent chatter."""
+        """Get user-channel evidence without displacement by agent chatter.
+
+        Read-scope checks can omit bare positive grants, which contain no user
+        restriction text. Filter before LIMIT so a new bare approval cannot hide
+        an older user message, denial, or human-authored scope note.
+        """
         eligible = (
             "COALESCE((args_redacted::jsonb -> 'intention_eligible')::text, 'null') != 'false'"
             if self._db.backend == "postgresql"
@@ -656,6 +666,7 @@ class AuditStore:
                     OR (record_type = 'tool_call' AND resolved_by = 'user'
                         AND user_decision IS NOT NULL AND approval_scope = 'reusable'
                         AND COALESCE(user_note, '') != 'Resolved via notification action link'
+                        {"" if include_bare_approvals else "AND (user_decision = 'deny' OR (TRIM(COALESCE(user_note, '')) != '' AND COALESCE(user_note_source, 'user') = 'user'))"}
                         AND (user_decision = 'deny' OR (
                             expired_at IS NULL
                             AND COALESCE(classification, '') != 'critical'

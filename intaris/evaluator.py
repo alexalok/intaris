@@ -54,7 +54,11 @@ from intaris.decision import (
     clamp_outcome,
     make_fast_decision,
 )
-from intaris.intent_evidence import allows_legacy_precedent, collect_intent_evidence
+from intaris.intent_evidence import (
+    allows_legacy_precedent,
+    collect_intent_evidence,
+    requires_read_scope_review,
+)
 from intaris.llm import LLMClient, parse_json_response
 from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
 from intaris.precedent import find_authoritative_precedent
@@ -127,6 +131,51 @@ def _apply_authoritative_user_precedent(
         metadata=evaluation.metadata,
         approval_call_id=precedent.get("call_id"),
     )
+
+
+def _unchanged_human_read_scope(
+    record: dict[str, Any],
+    scope_versions: dict[str, int],
+    working_directory: str | None,
+) -> bool:
+    """Accept an explicit bare human grant only for its unchanged reviewed scope.
+
+    Resolving the grant advances its own session revision once. Any additional
+    user, policy, lifecycle, or ancestor change invalidates this proof. Missing
+    or incomplete historical evidence and conditional notes need current L1
+    approval instead. This preserves the explicit approval-ID retry protocol.
+    """
+    if (
+        record.get("user_note_source") in {None, "user"}
+        and str(record.get("user_note") or "").strip()
+    ):
+        return False
+    context = record.get("evaluation_context")
+    if (
+        not isinstance(context, dict)
+        or "__intaris_evaluation_directory" not in context
+        or context["__intaris_evaluation_directory"] != working_directory
+    ):
+        return False
+    evidence = record.get("intent_evidence")
+    current = evidence
+    while isinstance(current, dict):
+        if current.get("complete") is not True or current.get("parent_unavailable"):
+            return False
+        current = current.get("parent")
+    if not isinstance(evidence, dict) or current is not None:
+        return False
+    expected = evidence.get("scope_versions")
+    session_id = record.get("session_id")
+    if (
+        not isinstance(expected, dict)
+        or session_id not in expected
+        or any(type(value) is not int or value < 0 for value in expected.values())
+    ):
+        return False
+    expected = dict(expected)
+    expected[session_id] += 1
+    return expected == scope_versions
 
 
 def _resolve_tool_paths_for_context(
@@ -571,6 +620,9 @@ class Evaluator:
         scope_versions = dict(session["_scope_versions"])
         parent_intention: str | None = None
         parent_session_id = session.get("parent_session_id")
+        # Keep trusted operation identity when parent handling disables its
+        # classifier shortcut. Read scope must still constrain metadata reads.
+        metadata_readonly = trusted_readonly is True and ":" in tool
         if parent_session_id:
             # Child calls retain per-call review against the parent's latest
             # intention. The alignment barrier is fail-open on timeout/error
@@ -720,11 +772,25 @@ class Evaluator:
                             outside_paths,
                         )
 
-        # Semantic prohibitions need current model interpretation, including
-        # builtin reads and cached path approvals. Structured denies ran first.
-        if classification == Classification.READ and normalized_policy_clauses(
-            session_policy
-        ).get("deny_policies"):
+        # Read-only effects are not proof of current authorization. User and
+        # parent sources may constrain builtin reads, allowlisted commands, or
+        # siblings of cached paths. Route these through normal scope assessment;
+        # evidence presence itself neither denies nor escalates benign reads.
+        # Structured hard prohibitions have already run and cannot be weakened.
+        read_scope_review = (
+            classification != Classification.CRITICAL
+            and (
+                classification == Classification.READ
+                or is_read_only(tool, classification_args)
+                or metadata_readonly
+                or tool == "skill_view_raw"
+            )
+            and bool(
+                normalized_policy_clauses(session_policy).get("deny_policies")
+                or requires_read_scope_review(session, self._audit)
+            )
+        )
+        if read_scope_review and classification == Classification.READ:
             classification = Classification.WRITE
 
         # Inject deterministic path-policy facts into WRITE evaluations when
@@ -791,7 +857,7 @@ class Evaluator:
                     human_only=restricted,
                     session_id=session_id,
                 )
-                if minimum_outcome is None and not unattended
+                if minimum_outcome is None and not unattended and not read_scope_review
                 else None
             )
             if retry_decision is not None:
@@ -813,7 +879,7 @@ class Evaluator:
                     human_only=restricted,
                     session_id=session_id,
                 )
-                if minimum_outcome is None and not unattended
+                if minimum_outcome is None and not unattended and not read_scope_review
                 else None
             )
             if retry_decision is not None:
@@ -827,7 +893,13 @@ class Evaluator:
                     agent_id=agent_id,
                     context=redact(context) if context else None,
                     parent_intention=parent_intention,
+                    allow_legacy_precedent=not read_scope_review,
                 )
+
+        if read_scope_review and decision.intent_evidence is None:
+            # Operator preferences retain escalation, but a fresh explicit
+            # human retry still needs durable evidence of the reviewed scope.
+            decision.intent_evidence = collect_intent_evidence(session, self._audit)
 
         raw_decision = decision.decision
         hard_prohibition = classification == Classification.CRITICAL
@@ -864,7 +936,18 @@ class Evaluator:
                     decision.decision = "deny"
                     decision.reasoning = "Approval does not match this evaluation."
                     outcome_override = "invalid_approval"
-            if approved and minimum_outcome == "escalate" and raw_decision != "deny":
+            if (
+                approved
+                and minimum_outcome == "escalate"
+                and raw_decision != "deny"
+                and (
+                    not read_scope_review
+                    or raw_decision == "approve"
+                    or _unchanged_human_read_scope(
+                        record, scope_versions, working_directory
+                    )
+                )
+            ):
                 decision.decision = "approve"
                 decision.reasoning = f"User approved call {approval_call_id}."
                 outcome_override = "human_approval"
@@ -1468,6 +1551,7 @@ class Evaluator:
         agent_id: str | None,
         context: dict[str, Any] | None = None,
         parent_intention: str | None = None,
+        allow_legacy_precedent: bool = True,
     ) -> Decision:
         """Run LLM safety evaluation and apply decision matrix.
 
@@ -1478,6 +1562,8 @@ class Evaluator:
             agent_id: Agent identity.
             context: Optional additional context for evaluation.
             parent_intention: Parent session intention for sub-sessions.
+            allow_legacy_precedent: Whether the old similarity fallback may
+                replace model scope assessment. False for scope-gated reads.
 
         Returns:
             Decision from the decision matrix.
@@ -1574,8 +1660,12 @@ class Evaluator:
                 user_decisions = self._audit.get_user_decisions(
                     session_id, user_id=user_id, limit=5
                 )
-            if tool != "skill_view_raw" and allows_legacy_precedent(
-                intent_evidence, policy=session.get("policy")
+            if (
+                allow_legacy_precedent
+                and tool != "skill_view_raw"
+                and allows_legacy_precedent(
+                    intent_evidence, policy=session.get("policy")
+                )
             ):
                 evaluation = _apply_authoritative_user_precedent(
                     evaluation,

@@ -215,6 +215,17 @@ def test_explicit_approval_id_cannot_revive_revoked_grant(denial_stores, case):
             == "approve"
         )
         audit.resolve_escalation(second["call_id"], "deny", user_id="u")
+    if case in {"other_args", "older"}:
+        # Unrelated/older denials preserve the exact grant, but their source
+        # evidence still requires current read-scope assessment.
+        evaluator._llm.generate.return_value = json.dumps(
+            dict(
+                aligned=True,
+                risk="low",
+                decision="approve",
+                reasoning="Unaffected target",
+            )
+        )
     result = evaluator.evaluate(**args, approval_call_id=first["call_id"])
     expected = "deny" if case in {"same", "call_only"} else "approve"
     assert result["decision"] == expected
@@ -562,7 +573,17 @@ def test_human_path_cache_respects_later_user_restriction(
     another_read = {**args, "args": {"path": "/outside/b"}}
     if learning == "before_message":
         evaluator.learn_from_approved_escalation(approved)
+        previous = evaluator._llm.generate.return_value
+        evaluator._llm.generate.return_value = json.dumps(
+            dict(
+                aligned=True,
+                risk="low",
+                decision="approve",
+                reasoning="Current parent scope permits read",
+            )
+        )
         assert evaluator.evaluate(**another_read)["decision"] == "approve"
+        evaluator._llm.generate.return_value = previous
     _read_restriction(audit, "grandparent" if restriction == "grandparent" else "s")
     if learning == "after_message":
         evaluator.learn_from_approved_escalation(approved)
@@ -602,9 +623,24 @@ def test_current_human_grant_learns_with_post_resolution_ancestor_snapshot(
         pending["call_id"], user_id="u"
     )
     evaluator.learn_from_approved_escalation(approved)
+    assert evaluator._check_approved_paths(
+        "u",
+        "child",
+        ["/outside/b"],
+        "/work",
+        scope_versions=approved["_approval_scope_versions"],
+    )
+    evaluator._llm.generate.return_value = json.dumps(
+        dict(
+            aligned=True,
+            risk="low",
+            decision="approve",
+            reasoning="Current parent scope permits read",
+        )
+    )
     result = evaluator.evaluate(**{**args, "args": {"path": "/outside/b"}})
     assert result["decision"] == "approve"
-    assert result["path"] == "fast"
+    assert result["path"] == "llm"
 
 
 @pytest.mark.parametrize("record_source", ["legacy", "reloaded"])
