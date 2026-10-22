@@ -1456,6 +1456,11 @@ def _critical_command_words(command: str) -> list[str]:
         "command": set(),
         "nohup": set(),
         "busybox": set(),
+        "timeout": {"-s", "--signal", "-k", "--kill-after"},
+        "gtimeout": {"-s", "--signal", "-k", "--kill-after"},
+        "setsid": set(),
+        "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+        "gstdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     }
     while words:
         head = os.path.basename(words[0])
@@ -1471,8 +1476,16 @@ def _critical_command_words(command: str) -> list[str]:
                     break
                 if head == "command" and option in {"-v", "-V"}:
                     return []  # Lookup, not execution.
+                if head in {"timeout", "gtimeout", "setsid", "stdbuf", "gstdbuf"}:
+                    if option in {"--help", "--version"} or (
+                        head == "setsid" and option in {"-h", "-V"}
+                    ):
+                        return []  # Runner exits without executing its operands.
                 if option in option_values[head] and words:
                     words = words[1:]
+            if head in {"timeout", "gtimeout"}:
+                # DURATION is an operand of timeout, not the command to run.
+                words = words[1:]
         else:
             break
     return words
