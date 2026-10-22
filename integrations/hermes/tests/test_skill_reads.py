@@ -289,3 +289,61 @@ def test_nested_external_root_keeps_its_tier_below_profile(skill_host, scripted_
     scripted_http({"decision": "approve", "call_id": "tier-1"})
     result = skill_host.call({"name": "same-name"})
     assert result["content"] == "Profile instructions"
+
+
+@pytest.mark.parametrize("lookup", ["directory", "parent", "cached-alias"])
+def test_skill_candidate_cannot_escape_its_original_search_root(
+    skill_host, scripted_http, lookup
+):
+    outside = skill_host.root.parent / "private"
+    path = outside / "secret/SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("Private instructions outside every skill root")
+    if lookup == "parent":
+        skill_host.root.joinpath("escape").symlink_to(outside, target_is_directory=True)
+        name = "escape/secret"
+    else:
+        skill_host.root.joinpath("escape").symlink_to(
+            path.parent, target_is_directory=True
+        )
+        name = "escape"
+        if lookup == "cached-alias":
+            skill_host.module._SKILLS_CACHE = {
+                ("filtered", False): (
+                    (),
+                    0,
+                    [{"name": "alias", "path": skill_host.root / "escape/SKILL.md"}],
+                )
+            }
+            name = "alias"
+    transport = scripted_http({"decision": "approve", "call_id": "should-not-evaluate"})
+    result = skill_host.call({"name": name})
+    assert "error" in result
+    assert "Private instructions" not in json.dumps(result)
+    assert skill_host.activated == skill_host.marks == []
+    assert transport.call_count == 0
+
+
+def test_skill_directory_alias_within_search_root_remains_readable(
+    skill_host, scripted_http
+):
+    path = skill_host.root / "actual/SKILL.md"
+    path.parent.mkdir()
+    path.write_text("Public instructions")
+    skill_host.root.joinpath("alias").symlink_to(path.parent, target_is_directory=True)
+    scripted_http({"decision": "approve", "call_id": "alias-approved"})
+    result = skill_host.call({"name": "alias"})
+    assert result["content"] == "Public instructions"
+    assert skill_host.activated == []
+
+
+def test_registered_search_root_symlink_remains_valid(skill_host, scripted_http):
+    path = skill_host.root / "example/SKILL.md"
+    path.parent.mkdir()
+    path.write_text("Registered library instructions")
+    alias = skill_host.root.parent / "library-alias"
+    alias.symlink_to(skill_host.root, target_is_directory=True)
+    skill_host.module._skill_search_dirs = lambda: ([(1, alias)], alias)
+    scripted_http({"decision": "approve", "call_id": "root-approved"})
+    result = skill_host.call({"name": "example"})
+    assert result["content"] == "Registered library instructions"
