@@ -459,15 +459,20 @@ def _extract_bash_file_paths(
 
 
 def _unwrap_read_command(
-    tokens: list[str], *, environment: dict[str, str | None] | None = None
+    tokens: list[str],
+    *,
+    environment: dict[str, str | None] | None = None,
+    env_only: bool = False,
 ) -> list[str]:
     """Remove wrappers, optionally tracking only requested literal env keys.
 
     Critical inspection tracks POSIXLY_CORRECT to recognize runuser's option
     order. No inherited environment is read or arbitrary expansion performed.
+    Its env_only mode leaves other launchers for their critical option parser.
     """
     remaining = list(tokens)
-    while remaining and remaining[0] in _BASH_COMMAND_WRAPPERS:
+    wrappers = {"env"} if env_only else _BASH_COMMAND_WRAPPERS
+    while remaining and remaining[0] in wrappers:
         wrapper = remaining.pop(0)
         if wrapper == "env":
             while remaining:
@@ -1325,7 +1330,7 @@ def _strip_quoted_strings(command: str) -> str:
 _MAX_SHELL_DEPTH = 8
 
 
-def _is_critical(command: str, _depth: int = 0) -> bool:
+def _is_critical(command: str, _depth: int = 0, *, _time_keyword: bool = True) -> bool:
     """Recognize prohibited execution, preserving quoted operands and prose.
 
     This is a bounded literal shell recognizer, not a shell interpreter.
@@ -1336,7 +1341,7 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         # Exhausted inspection is not evidence of safety. A broad allow rule
         # must not authorize an uninspected nested payload.
         return True
-    raw_segments, heredocs = _shell_segments(command)
+    raw_segments, heredocs = _shell_segments(command, time_keyword=_time_keyword)
     executable_text = "".join(raw + separator for raw, separator in raw_segments)
     if re.search(
         r":\(\)\s*\{\s*:\|:&\s*\}\s*;", _strip_quoted_strings(executable_text)
@@ -1354,19 +1359,27 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         if any(_is_critical(nested, _depth + 1) for nested in nested_commands):
             return True
     segments: list[tuple[list[str], str]] = []
-    for raw, separator in raw_segments:
+    for segment_index, (raw, separator) in enumerate(raw_segments):
         if any(
             _is_critical(nested, _depth + 1) for nested in _shell_substitutions(raw)
         ):
             return True
-        words = _critical_command_words(raw)
+        # Bash recognizes time before a pipeline, not after a pipe operator.
+        words = _critical_command_words(
+            raw,
+            time_keyword=_time_keyword
+            and (
+                not segment_index
+                or raw_segments[segment_index - 1][1] not in {"|", "|&"}
+            ),
+        )
         segments.append((words, separator))
         if not words:
             continue
         head = os.path.basename(words[0])
         operands = words[1:]
         if any(
-            _is_critical(shlex.join(launched), _depth + 1)
+            _is_critical(shlex.join(launched), _depth + 1, _time_keyword=False)
             for launched in _literal_launched_commands(words)
         ):
             return True
@@ -2097,11 +2110,82 @@ def _unwrap_chroot_command(words: list[str]) -> list[str]:
     return words[index + 1 :] or ["sh", "-i"]
 
 
-def _critical_command_words(command: str) -> list[str]:
+def _unwrap_time_command(words: list[str]) -> list[str]:
+    """Locate GNU/BSD time's command without interpreting timing option data.
+
+    GNU getopt_long("+af:o:pqvV") and BSD getopt("ahlo:p") both stop at the
+    first operand. Track their dialects separately: BSD -h is an execution
+    flag, and mixing BSD-only and GNU-only options cannot launch a command.
+    """
+    required_long = {"format", "output-file"}
+    flag_long = {"append", "portability", "quiet", "verbose"}
+    long_options = required_long | flag_long | {"help", "version"}
+    dialects = {"gnu"} if os.path.basename(words[0]) == "gtime" else {"gnu", "bsd"}
+    short_options = {"gnu": "afopqvV", "bsd": "ahlop"}
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        index += 1
+        if token.startswith("--"):
+            dialects &= {"gnu"}
+            if not dialects:
+                return []
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                # --output is the documented abbreviation of --output-file.
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            if name in {"help", "version"} or (name in flag_long and equals):
+                return []
+            if name in required_long and not equals:
+                if index >= len(words):
+                    return []
+                index += 1
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                dialects = {
+                    dialect for dialect in dialects if option in short_options[dialect]
+                }
+                if not dialects or option == "V":
+                    return []
+                if option in "fo":
+                    if offset == len(token) - 1:
+                        if index >= len(words):
+                            return []
+                        index += 1
+                    break  # The rest of this token is a format or output path.
+    launched = words[index:]
+    if launched and _looks_like_env_assignment(launched[0]):
+        # External time execs argv directly; NAME=value is a program name.
+        return []
+    return launched
+
+
+def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[str]:
     """Unwrap literal execution prefixes without promoting argument text."""
-    command = re.sub(
-        r"^(?:(?:if|then|elif|else|do|while|until|!|\{)\s+)+", "", command.lstrip()
-    )
+    while True:
+        command = re.sub(
+            r"^(?:(?:if|then|elif|else|do|while|until|!|\{)\s+)+", "", command.lstrip()
+        )
+        # Bash's unquoted time [-p] [--] prefixes a pipeline, including !,
+        # assignments and another time. Preserve quoting until these shell
+        # keywords are removed; external/quoted time only receives argv.
+        if not time_keyword:
+            break
+        timing = re.match(r"time(?:\s+-p)?(?:\s+--)?(?=\s|$)", command)
+        if timing is None:
+            break
+        remainder = command[timing.end() :].lstrip()
+        if remainder.startswith("-"):
+            break  # Parse GNU/BSD timing options below instead.
+        command = remainder
     try:
         words = shlex.split(command, comments=True)
     except ValueError:
@@ -2149,7 +2233,11 @@ def _critical_command_words(command: str) -> list[str]:
                 environment[name] = value
             words = words[1:]
         elif head == "env":
-            words = _unwrap_read_command(["env", *words[1:]], environment=environment)
+            words = _unwrap_read_command(
+                ["env", *words[1:]], environment=environment, env_only=True
+            )
+        elif head in {"time", "gtime"}:
+            words = _unwrap_time_command(words)
         elif head == "ionice":
             words = _unwrap_ionice_command(words)
         elif head == "taskset":
@@ -2190,7 +2278,7 @@ def _critical_command_words(command: str) -> list[str]:
 
 
 def _shell_segments(
-    command: str,
+    command: str, *, time_keyword: bool = True
 ) -> tuple[list[tuple[str, str]], list[tuple[str, bool, bool]]]:
     """Split unquoted shell operators, preserving literals and heredoc bodies.
 
@@ -2234,7 +2322,11 @@ def _shell_segments(
                     delimiter = shlex.split(raw_delimiter)[0]
                 except (ValueError, IndexError):
                     return segments, heredocs
-                words = _critical_command_words(command[start:index])
+                words = _critical_command_words(
+                    command[start:index],
+                    time_keyword=time_keyword
+                    and (not segments or segments[-1][1] not in {"|", "|&"}),
+                )
                 executes = bool(
                     words
                     and os.path.basename(words[0])
