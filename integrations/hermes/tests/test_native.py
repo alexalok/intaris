@@ -583,6 +583,60 @@ def test_exact_hermes_route_and_distinct_intaris_id(harness):
     until(lambda: not actionable(h))
 
 
+def test_legacy_session_without_transport_identity_uses_configured_fallback(harness):
+    h = harness
+    # Restored legacy routing rows have neither a persisted transport profile
+    # nor the live identity that Hermes pins on an admitted source.
+    h.entry.transport_profile = None
+    h.source.identity = None
+    h.server.open_reply["route"] = {
+        "chat_id": "-200",
+        "thread_id": "7",
+        "actor_ids": ["8"],
+    }
+
+    with pending(h):
+        until(lambda: actionable(h))
+        assert h.server.ops("fallback_transport") == [
+            {"op": "fallback_transport", "profile": "/profiles/alpha"}
+        ]
+        opened = h.server.ops("open")[0]
+        assert opened["session_id"] == "hm-uuid"
+        assert opened["call_id"] == "audit-call"
+        assert "origin" not in opened
+        assert len(h.app.bot.sends) == 1
+        sent = h.app.bot.sends[0]
+        assert sent["chat_id"] == "-200"
+        assert sent["message_thread_id"] == 7
+
+        # The originating actor has no authority in the fallback unless the
+        # operator explicitly lists them there.
+        callback_route = {
+            "message__chat": types.SimpleNamespace(id=-200),
+            "message__message_thread_id": 7,
+        }
+        click(h, actor="9", **callback_route).result(3)
+        assert not h.server.ops("resolve")
+        click(h, actor="8", **callback_route).result(3)
+        assert h.server.ops("resolve")[0]["decision"] == "approve"
+    until(lambda: not actionable(h))
+
+
+def test_legacy_session_without_fallback_policy_keeps_audit_wait(harness):
+    h = harness
+    h.entry.transport_profile = None
+    h.source.identity = None
+    h.server.transport_ok = False
+
+    with pending(h):
+        assert h.server.ops("fallback_transport") == [
+            {"op": "fallback_transport", "profile": "/profiles/alpha"}
+        ]
+        assert not h.server.ops("open")
+        assert not h.app.bot.sends
+        h.budget.check()
+
+
 def test_routing_snapshot_eviction_requires_fallback_until_readmission(harness):
     from hermes_intaris import MAX_SESSIONS
 
@@ -1097,12 +1151,28 @@ def test_enable_edit_completing_after_cancellation_is_followed_by_removal(harnes
 
 
 @pytest.mark.parametrize(
-    "fault", ["profile", "thread", "key", "adapter", "ambiguous_parent"]
+    "fault",
+    [
+        "profile",
+        "transport",
+        "missing_transport",
+        "inferred_transport",
+        "thread",
+        "key",
+        "adapter",
+        "ambiguous_parent",
+    ],
 )
 def test_ambiguous_or_mismatched_route_never_sends(harness, fault):
     h = harness
     if fault == "profile":
         h.source.identity.runtime_home = Path("/profiles/other")
+    elif fault == "transport":
+        h.entry.transport_profile = "other"
+    elif fault == "missing_transport":
+        h.entry.transport_profile = None
+    elif fault == "inferred_transport":
+        h.source.identity.transport_inferred = True
     elif fault == "thread":
         h.source.thread_id = "43"
     elif fault == "key":
@@ -1115,6 +1185,7 @@ def test_ambiguous_or_mismatched_route_never_sends(harness, fault):
         hook(parent_session_id="hermes-root", child_session_id="child")
         hook(parent_session_id="other-parent", child_session_id="child")
     with pending(h, "child" if fault == "ambiguous_parent" else "hermes-root"):
+        assert not h.server.ops("fallback_transport")
         assert not h.server.ops("open")
         assert not h.app.bot.sends
 

@@ -445,10 +445,11 @@ class NativeApprovals:
                 and getattr(source.platform, "value", source.platform) == "telegram"
             ):
                 identity = identity_of(source)
-                if (
-                    identity is None
-                    or str(Path(identity.runtime_home).resolve()) != self.home
-                ):
+                if identity is None:
+                    # Legacy routing rows cannot restore a pinned identity.
+                    # Use only operator policy, never their unverified origin.
+                    return self._route(session_id, policy_fallback=True)
+                if str(Path(identity.runtime_home).resolve()) != self.home:
                     raise _Unroutable("Profile identity unavailable")
                 if identity.multiplexed and (
                     identity.transport_inferred
