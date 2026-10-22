@@ -1765,6 +1765,92 @@ def _unwrap_prlimit_command(words: list[str]) -> list[str]:
     return []
 
 
+def _unwrap_unshare_command(words: list[str]) -> list[str]:
+    """Locate util-linux unshare's program without inspecting option data.
+
+    getopt_long's leading '+' stops at the first operand. Namespace short
+    flags take no value; optional long values attach with '='. With no program,
+    unshare starts the user's shell, which can execute heredoc or piped input.
+    """
+    required_long = {
+        "map-user",
+        "map-users",
+        "map-group",
+        "map-groups",
+        "owner",
+        "propagation",
+        "setgroups",
+        "setuid",
+        "setgid",
+        "root",
+        "wd",
+        "monotonic",
+        "boottime",
+        "load-interp",
+    }
+    optional_long = {
+        "mount",
+        "uts",
+        "ipc",
+        "net",
+        "pid",
+        "user",
+        "cgroup",
+        "time",
+        "kill-child",
+        "mount-proc",
+        "mount-binfmt",
+    }
+    flag_long = {
+        "fork",
+        "forward-signals",
+        "map-root-user",
+        "map-current-user",
+        "map-auto",
+        "map-subids",
+        "keep-caps",
+        "help",
+        "version",
+    }
+    long_options = required_long | optional_long | flag_long
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            break
+        if token == "-" or not token.startswith("-"):
+            return words[index - 1 :]
+        if token.startswith("--"):
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []  # Invalid or ambiguous options never execute argv.
+                name = matches[0]
+            if name in {"help", "version"} or (name in flag_long and equals):
+                return []
+            if name in required_long and not equals:
+                if index >= len(words):
+                    return []
+                index += 1
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hV":
+                    return []
+                if option in "RwSGl":
+                    if offset == len(token) - 1:
+                        if index >= len(words):
+                            return []
+                        index += 1
+                    break  # An attached value consumes the rest of the cluster.
+                if option not in "fmuinpCTUrc":
+                    return []
+    # Namespace/root changes do not exempt destructive commands. Model the
+    # default shell as a shell consumer without consulting the server's SHELL.
+    return words[index:] or ["sh"]
+
+
 def _unwrap_chroot_command(words: list[str]) -> list[str]:
     """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
     long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
@@ -1862,6 +1948,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_taskset_command(words)
         elif head == "prlimit":
             words = _unwrap_prlimit_command(words)
+        elif head == "unshare":
+            words = _unwrap_unshare_command(words)
         elif head in {"chroot", "gchroot"}:
             words = _unwrap_chroot_command(words)
         elif head in option_values:
