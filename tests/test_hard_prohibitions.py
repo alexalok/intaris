@@ -368,3 +368,418 @@ def test_shell_positional_arguments_and_bounded_root_aliases_are_not_hard_stops(
     command,
 ):
     assert classify("terminal", {"command": command}) != Classification.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"deny_tools": ["terminal"]},
+        {"deny_commands": ["touch *"]},
+        {"deny_paths": ["/work/a"]},
+    ],
+)
+@pytest.mark.parametrize("resolver", ["user", "judge"])
+def test_pending_invocation_cannot_be_approved_after_new_hard_deny(
+    stores, rule, resolver
+):
+    sessions, audit = stores
+    sessions.update_session("s", user_id="u", details={"working_directory": "/work"})
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    )
+    evaluator = Evaluator(llm=llm, session_store=sessions, audit_store=audit)
+    first = evaluator.evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="terminal",
+        args={"command": "touch /work/a"},
+    )
+    assert first["decision"] == "escalate"
+    sessions.update_session(
+        "s", user_id="u", policy={**rule, "maximum_outcome": "approve"}
+    )
+    with pytest.raises(ValueError):
+        audit.resolve_escalation(
+            first["call_id"], "approve", user_id="u", resolved_by=resolver
+        )
+    record = audit.get_by_call_id(first["call_id"], user_id="u")
+    assert record["effective_decision"] != "approve"
+    assert record["expired_at"] is None
+    assert record["user_decision"] is None
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"deny_tools": ["deploy"]},
+        {"deny_commands": ["shutdown*"]},
+        {"deny_paths": ["/production/*"]},
+    ],
+)
+def test_unrelated_new_hard_rule_does_not_block_pending_approval(stores, rule):
+    sessions, audit = stores
+    sessions.update_session("s", user_id="u", details={"working_directory": "/work"})
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    )
+    first = Evaluator(llm=llm, session_store=sessions, audit_store=audit).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="terminal",
+        args={"command": "touch /work/a"},
+    )
+    sessions.update_session("s", user_id="u", policy=rule)
+    record = audit.resolve_escalation(first["call_id"], "approve", user_id="u")
+    assert record["effective_decision"] == "approve"
+
+
+def _pending_for_policy(stores, *, args=None, context=None):
+    sessions, audit = stores
+    return Evaluator(
+        llm=MagicMock(), session_store=sessions, audit_store=audit
+    ).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="terminal",
+        args=args or {"command": "touch /work/a"},
+        context=context,
+        tool_preferences={"terminal": "escalate"},
+    )["call_id"]
+
+
+@pytest.mark.parametrize(
+    "args,context,details",
+    [
+        ({"command": "touch /work/a"}, None, {}),
+        ({"command": "cat a"}, {"working_directory": "/work"}, {}),
+        (
+            {"command": "cat a", "workdir": "child"},
+            {"executor_environment": {"cwd": "/work"}},
+            {},
+        ),
+        ({"command": "cat a"}, None, {"working_directory": "/work"}),
+    ],
+)
+def test_pending_deny_paths_uses_invocation_directory(stores, args, context, details):
+    sessions, audit = stores
+    sessions.update_session("s", user_id="u", details=details)
+    call_id = _pending_for_policy(stores, args=args, context=context)
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/work/*"]})
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_policy_does_not_treat_context_paths_as_targets(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(
+        stores,
+        context={
+            "working_directory": "/work",
+            "path_policy": {"deny_paths": ["/private/*"]},
+        },
+    )
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    assert (
+        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+
+
+@pytest.mark.parametrize("state", ["policy", "adoption"])
+def test_pending_approval_cas_rejects_concurrent_scope_change(
+    stores, monkeypatch, state
+):
+    import intaris.audit as audit_module
+
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    validate = audit_module.validate_approval_policy
+
+    def change_after_validation(*args, **kwargs):
+        validate(*args, **kwargs)
+        if state == "adoption":
+            sessions.restrict_agent_session("s", user_id="u")
+        else:
+            changes = (
+                {"policy": {"deny_tools": ["terminal"]}}
+                if state == "policy"
+                else {"details": {"working_directory": "/different"}}
+            )
+            sessions.update_session("s", user_id="u", **changes)
+
+    monkeypatch.setattr(
+        audit_module, "validate_approval_policy", change_after_validation
+    )
+    with pytest.raises(ValueError, match="changed during approval"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+    record = audit.get_by_call_id(call_id, user_id="u")
+    assert record["user_decision"] is None
+    assert record["expired_at"] is None
+
+
+@pytest.mark.parametrize("policy", [None, {"deny_tools": ["terminal"]}])
+def test_pending_adoption_requires_current_server_policy(stores, policy):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.restrict_agent_session("s", user_id="u")
+    AuditStore.set_agent_policy(audit._db, policy)
+    # A fresh store (email action/API route) shares this DB's runtime policy.
+    with pytest.raises(ValueError):
+        AuditStore(audit._db).resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_server_policy_is_bound_to_database(stores, tmp_path):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.restrict_agent_session("s", user_id="u")
+    AuditStore.set_agent_policy(audit._db, {"deny_tools": ["different"]})
+    db = Database(DBConfig(path=str(tmp_path / "other.db")))
+    try:
+        AuditStore.set_agent_policy(db, {"deny_tools": ["terminal"]})
+        assert (
+            audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+            == "approve"
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "[REDACTED:credential]",
+        "<long string truncated for safety evaluation: chars=100>",
+        "<long string omitted for safety evaluation: chars=100>",
+    ],
+)
+def test_pending_policy_cannot_prove_redacted_command_safe(stores, marker):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores, args={"command": f"touch {marker}"})
+    sessions.update_session("s", user_id="u", policy={"deny_commands": ["*private*"]})
+    with pytest.raises(ValueError, match="incomplete audit arguments"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_command_policy_ignores_unrelated_redacted_field(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(
+        stores, args={"command": "touch /work/a", "password": "sensitive"}
+    )
+    sessions.update_session("s", user_id="u", policy={"deny_commands": ["shutdown*"]})
+    assert (
+        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+
+
+@pytest.mark.parametrize("pending_only", [True, False])
+def test_pending_policy_blocks_native_callbacks_too(stores, pending_only):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.update_session("s", user_id="u", policy={"deny_tools": ["terminal"]})
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        audit.resolve_escalation(
+            call_id, "approve", user_id="u", pending_only=pending_only
+        )
+    assert (
+        audit.resolve_escalation(
+            call_id, "deny", user_id="u", pending_only=pending_only
+        )["user_decision"]
+        == "deny"
+    )
+
+
+def test_pending_path_policy_refuses_unknown_relative_base(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores, args={"command": "cat a"})
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    with pytest.raises(ValueError, match="executor working directory"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_policy_lookup_is_tenant_scoped(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.create(
+        session_id="s",
+        user_id="other",
+        intention="Other tenant",
+        policy={"deny_tools": ["terminal"]},
+    )
+    with pytest.raises(ValueError):
+        audit.resolve_escalation(call_id, "approve", user_id="other")
+    assert (
+        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+
+
+def test_pending_judge_cannot_approve_current_deny(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores)
+    sessions.update_session("s", user_id="u", policy={"deny_tools": ["terminal"]})
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(decision="approve", confidence="high", risk="low", reasoning="Allowed")
+    )
+    reviewer = JudgeReviewer(
+        llm=llm,
+        config=JudgeConfig(mode="auto"),
+        audit_store=audit,
+        session_store=sessions,
+        evaluator=None,
+    )
+    asyncio.run(
+        reviewer.review_and_resolve(call_id=call_id, user_id="u", session_id="s")
+    )
+    record = audit.get_by_call_id(call_id, user_id="u")
+    assert record["user_decision"] is None
+    assert record["effective_decision"] != "approve"
+    assert record["expired_at"] is None
+
+
+@pytest.mark.parametrize("context", [None, {"__intaris_evaluation_directory": "/safe"}])
+def test_pending_directory_is_pinned_before_session_details_change(stores, context):
+    sessions, audit = stores
+    sessions.update_session("s", user_id="u", details={"working_directory": "/work"})
+    call_id = _pending_for_policy(stores, args={"command": "cat a"}, context=context)
+    sessions.update_session(
+        "s",
+        user_id="u",
+        details={"working_directory": "/safe"},
+        policy={"deny_paths": ["/work/a"]},
+    )
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_pending_directory_does_not_apply_relative_workdir_twice(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(
+        stores,
+        args={"command": "cat a", "workdir": "child"},
+        context={"working_directory": "/work"},
+    )
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/work/child/a"]})
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+def test_legacy_pending_relative_path_cannot_use_current_session_directory(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(stores, args={"command": "cat a"})
+    sessions.update_session(
+        "s",
+        user_id="u",
+        details={"working_directory": "/safe"},
+        policy={"deny_paths": ["/private/*"]},
+    )
+    with pytest.raises(ValueError, match="executor working directory"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected",
+    [
+        (
+            "write",
+            {"file_path": "/work/.env", "content": "[REDACTED:credential]"},
+            "approve",
+        ),
+        (
+            "write",
+            {"file_path": "/work/[REDACTED:credential]", "content": "safe"},
+            "incomplete",
+        ),
+        (
+            "files:write",
+            {"nested": {"files": ["/work/a"]}, "token": "[REDACTED:credential]"},
+            "approve",
+        ),
+        ("files:write", {"nested": {"files": ["[REDACTED:credential]"]}}, "incomplete"),
+        (
+            "apply_patch",
+            {
+                "patchText": "*** Begin Patch\n*** Add File: /work/a\n+[REDACTED:credential]\n*** End Patch"
+            },
+            "approve",
+        ),
+    ],
+)
+def test_pending_path_policy_ignores_redacted_content_but_checks_targets(
+    stores, tool, args, expected
+):
+    sessions, audit = stores
+    call_id = Evaluator(
+        llm=MagicMock(), session_store=sessions, audit_store=audit
+    ).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool=tool,
+        args=args,
+        context={"working_directory": "/work", "note": "[REDACTED:credential]"},
+        tool_preferences={tool: "escalate"},
+    )["call_id"]
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    if expected == "incomplete":
+        with pytest.raises(ValueError, match="incomplete audit arguments"):
+            audit.resolve_escalation(call_id, "approve", user_id="u")
+    else:
+        assert (
+            audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+            == "approve"
+        )
+
+
+def test_pending_directory_change_does_not_retarget_safe_invocation(stores):
+    sessions, audit = stores
+    sessions.update_session("s", user_id="u", details={"working_directory": "/safe"})
+    call_id = _pending_for_policy(stores, args={"command": "cat a"})
+    sessions.update_session(
+        "s",
+        user_id="u",
+        details={"working_directory": "/private"},
+        policy={"deny_paths": ["/private/*"]},
+    )
+    assert (
+        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        == "approve"
+    )
+
+
+def test_raw_args_cannot_forge_pending_directory_metadata(stores):
+    sessions, audit = stores
+    call_id = _pending_for_policy(
+        stores,
+        args={
+            "command": "cat a",
+            "__intaris_context": {"__intaris_evaluation_directory": "/safe"},
+        },
+    )
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    with pytest.raises(ValueError, match="executor working directory"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")
+
+
+@pytest.mark.parametrize("kind", ["truncated", "omitted"])
+def test_pending_compacted_patch_cannot_hide_target_headers(stores, kind):
+    sessions, audit = stores
+    call_id = Evaluator(
+        llm=MagicMock(), session_store=sessions, audit_store=audit
+    ).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="apply_patch",
+        args={"patchText": f"<long string {kind} for safety evaluation: chars=100000>"},
+        tool_preferences={"apply_patch": "escalate"},
+    )["call_id"]
+    sessions.update_session("s", user_id="u", policy={"deny_paths": ["/private/*"]})
+    with pytest.raises(ValueError, match="incomplete audit arguments"):
+        audit.resolve_escalation(call_id, "approve", user_id="u")

@@ -11,9 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
+from weakref import WeakKeyDictionary
 
+from intaris.approval_policy import validate_approval_policy
 from intaris.db import Database
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
@@ -68,6 +71,17 @@ class AuditStore:
         """Clear the search hook only if the caller still owns it."""
         if cls._search_service is service:
             cls._search_service = None
+
+    # Runtime policy is shared by stores using the same DB, never across app
+    # instances. Weak keys release configuration when that DB is discarded.
+    _agent_policies: WeakKeyDictionary[Database, dict[str, Any] | None] = (
+        WeakKeyDictionary()
+    )
+
+    @classmethod
+    def set_agent_policy(cls, db: Database, policy: dict[str, Any] | None) -> None:
+        """Bind the server-owned policy used to resolve restricted approvals."""
+        cls._agent_policies[db] = deepcopy(policy)
 
     def __init__(self, db: Database):
         self._db = db
@@ -738,6 +752,34 @@ class AuditStore:
             approval_source_call_id = None
         now = datetime.now(timezone.utc).isoformat()
 
+        policy_state = ("", False)
+        if user_decision == "approve":
+            record = self.get_by_call_id(call_id, user_id=user_id)
+            if record.get("expired_at"):
+                raise ApprovalExpiredError(
+                    f"Call {call_id} expired; its invocation is no longer waiting"
+                )
+            with self._db.cursor() as cur:
+                cur.execute(
+                    "SELECT policy, agent_restricted FROM sessions "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, record["session_id"]),
+                )
+                row = cur.fetchone()
+            if row is None:
+                raise ValueError("Approval session no longer exists")
+            policy_state = (
+                row["policy"] or "",
+                bool(row["agent_restricted"]),
+            )
+            session = {
+                "policy": json.loads(row["policy"]) if row["policy"] else None,
+                "agent_restricted": bool(row["agent_restricted"]),
+            }
+            validate_approval_policy(
+                record, session, self._agent_policies.get(self._db)
+            )
+
         # Atomic update: conditions in WHERE prevent TOCTOU races.
         # Matches unresolved escalations/denials OR records resolved by
         # the judge (allowing human override of judge decisions). Human
@@ -745,6 +787,27 @@ class AuditStore:
         # COALESCE preserves existing judge_reasoning when the caller
         # does not provide it (i.e., human override passes None).
         with self._db.cursor() as cur:
+            if user_decision == "approve" and self._db.backend == "postgresql":
+                # A READ COMMITTED subquery alone can use an old snapshot while
+                # waiting for the audit row. Hold the session row until commit,
+                # so policy updates cannot overtake the final approval write.
+                cur.execute(
+                    "SELECT policy, agent_restricted FROM sessions "
+                    "WHERE user_id = ? AND session_id = ? FOR UPDATE",
+                    (user_id, record["session_id"]),
+                )
+                locked = cur.fetchone()
+                if (
+                    locked is None
+                    or (
+                        locked["policy"] or "",
+                        bool(locked["agent_restricted"]),
+                    )
+                    != policy_state
+                ):
+                    raise ValueError(
+                        "Session policy changed during approval; retry approval"
+                    )
             cur.execute(
                 """
                 UPDATE audit_log
@@ -761,6 +824,13 @@ class AuditStore:
                   AND (? != 'approve' OR (
                       COALESCE(classification, '') != 'critical'
                       AND evaluation_path != 'critical'
+                  ))
+                  AND (? != 'approve' OR EXISTS (
+                      SELECT 1 FROM sessions AS current_session
+                      WHERE current_session.user_id = audit_log.user_id
+                        AND current_session.session_id = audit_log.session_id
+                        AND COALESCE(current_session.policy, '') = ?
+                        AND current_session.agent_restricted = ?
                   ))
                   AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
@@ -789,6 +859,8 @@ class AuditStore:
                     call_id,
                     user_id,
                     user_decision,
+                    user_decision,
+                    *policy_state,
                     int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
@@ -833,6 +905,10 @@ class AuditStore:
                     raise ValueError(
                         f"Call {call_id} already resolved "
                         f"(user_decision={record['user_decision']})"
+                    )
+                if user_decision == "approve":
+                    raise ValueError(
+                        "Session policy changed during approval; retry approval"
                     )
                 # Shouldn't reach here, but raise generic error
                 raise ValueError(f"Failed to resolve call {call_id}")

@@ -323,6 +323,13 @@ pending records requiring evidence-based reconciliation.
 
 Resolve an escalated tool call (approve or deny). When the judge is enabled (`JUDGE_MODE`), escalations may also be auto-resolved by the judge before `POST /evaluate` returns. This endpoint is only for unresolved human-review escalations.
 
+Approval rechecks deterministic prohibitions against the current effective
+session policy, including rules added after escalation and restricted-session
+adoption. A matching hard rule, incomplete arguments needed to check a current
+rule, or a concurrent policy change returns HTTP 400 and leaves the record
+unresolved. Unrelated rules do not block approval. Denial and explicit client
+expiration remain separate actions; an expired invocation returns HTTP 409.
+
 **Request:**
 
 ```json

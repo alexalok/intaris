@@ -1395,6 +1395,8 @@ class JudgeReviewer:
         self._config = config
         self._agent_policy = agent_policy
         self._audit = audit_store
+        if agent_policy is not None:
+            audit_store.set_agent_policy(audit_store._db, agent_policy)
         self._sessions = session_store
         self._evaluator = evaluator
         self._intention_barrier = intention_barrier

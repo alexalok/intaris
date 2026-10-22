@@ -124,6 +124,23 @@ corresponding actions. An incorrect configured rule must be changed by its
 operator, followed by a new evaluation. Built-in prohibitions require a code
 change, not a per-call approval.
 
+Pending approvals also recheck deterministic prohibitions against the current
+effective session policy when resolved, including restricted-session adoption.
+The check uses the recorded invocation directory and redacted arguments; context
+metadata is not treated as a tool target. A policy change during approval refuses
+the grant. Unrelated deny rules still allow normal review. Refusal leaves the
+record pending and does not manufacture a human denial or a client-expiration
+event. Email actions, native callbacks, human review, and Judge share this guard.
+
+If redacted or compacted argument text prevents checking a relevant command or
+path deny rule, or a relative path lacks its executor directory, approval fails
+closed. A new evaluation with sufficient invocation metadata is required; if
+arguments remain redacted, an operator must resolve the policy ambiguity rather
+than override the hard rule. No raw secrets are stored to enable review. Shell
+path checks retain the classifier's bounded literal parsing, not full expansion.
+Exact approval retries are confined to the same session: reconnecting with that
+session preserves usable grants, while a new session gets its own scope check.
+
 Shell recognition distinguishes executable positions, literal wrappers,
 operators, quoted arguments, substitutions, and heredoc data. For example:
 

