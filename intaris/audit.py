@@ -43,6 +43,24 @@ class ApprovalExpiredError(ValueError):
     """The originating client has retired this guarded invocation."""
 
 
+class ScopeChangedError(ValueError):
+    """User authority changed after the Judge collected its evidence."""
+
+
+def _check_scope_versions(cur: Any, user_id: str, expected: dict[str, int]) -> None:
+    """Compare tenant-scoped revisions using the approval transaction cursor."""
+    for session_id, version in expected.items():
+        cur.execute(
+            "SELECT scope_version FROM sessions WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        row = cur.fetchone()
+        if row is None or row["scope_version"] != version:
+            raise ScopeChangedError(
+                "User scope changed during review; reassess current evidence"
+            )
+
+
 class ApprovalNotFoundError(ValueError):
     """No approval exists in the supplied tenant and session scope."""
 
@@ -154,6 +172,22 @@ class AuditStore:
         now = datetime.now(timezone.utc).isoformat()
 
         with self._db.cursor() as cur:
+            if (
+                record_type == "reasoning"
+                and isinstance(content, str)
+                and content.startswith("User message:")
+                and not (
+                    isinstance(args_redacted, dict)
+                    and args_redacted.get("intention_eligible") is False
+                )
+            ):
+                # Update first: PostgreSQL scope writers take the session lock
+                # before audit rows. The revision and source commit together.
+                cur.execute(
+                    "UPDATE sessions SET scope_version = scope_version + 1 "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, session_id),
+                )
             cur.execute(
                 """
                 INSERT INTO audit_log
@@ -667,6 +701,11 @@ class AuditStore:
             raise ValueError("Expiration requires the originating session_id")
         now = datetime.now(timezone.utc).isoformat()
         with self._db.cursor() as cur:
+            if self._db.backend == "postgresql":
+                cur.execute(
+                    "SELECT session_id FROM sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+                    (user_id, session_id),
+                )
             cur.execute(
                 """
                 UPDATE audit_log SET expired_at = ?, expiration_reason = ?
@@ -676,6 +715,7 @@ class AuditStore:
                 """,
                 (now, reason, call_id, user_id, session_id),
             )
+            changed = cur.rowcount == 1
             cur.execute(
                 "SELECT * FROM audit_log WHERE call_id = ? AND user_id = ? AND session_id = ?",
                 (call_id, user_id, session_id),
@@ -686,6 +726,17 @@ class AuditStore:
             if row["decision"] != "escalate" or row["record_type"] != "tool_call":
                 raise ValueError("Only escalated tool calls can expire")
             record = _row_to_dict(row)
+            if (
+                changed
+                and record.get("resolved_by") == "user"
+                and record.get("user_decision") == "approve"
+                and record.get("approval_scope") == "reusable"
+            ):
+                cur.execute(
+                    "UPDATE sessions SET scope_version = scope_version + 1 "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, session_id),
+                )
         return record
 
     def resolve_escalation(
@@ -702,6 +753,7 @@ class AuditStore:
         judge_risk: str | None = None,
         pending_only: bool = False,
         approval_source_call_id: str | None = None,
+        scope_versions: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -725,6 +777,8 @@ class AuditStore:
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
             approval_source_call_id: Human grant used for a derived judge approval.
+            scope_versions: Session and ancestor revisions observed by the Judge.
+                Only Judge approvals use this guard; human overrides stay final.
             pending_only: Resolve only an unresolved escalation, without the
                 normal human override of a prior judge verdict. Native
                 callbacks use this to make stale buttons inert.
@@ -760,9 +814,28 @@ class AuditStore:
             approval_source_call_id = None
         now = datetime.now(timezone.utc).isoformat()
 
+        record = self.get_by_call_id(call_id, user_id=user_id)
+        if resolved_by != "judge" or user_decision != "approve":
+            scope_versions = None
+        if scope_versions is not None and (
+            record["session_id"] not in scope_versions
+            or any(
+                not isinstance(key, str) or type(value) is not int or value < 0
+                for key, value in scope_versions.items()
+            )
+        ):
+            raise ScopeChangedError("User scope changed or its revision is unavailable")
+        scope_conditions = "".join(
+            " AND EXISTS (SELECT 1 FROM sessions AS scope_session "
+            "WHERE scope_session.user_id = audit_log.user_id "
+            "AND scope_session.session_id = ? AND scope_session.scope_version = ?)"
+            for _ in (scope_versions or {})
+        )
+        scope_params = [
+            value for pair in (scope_versions or {}).items() for value in pair
+        ]
         policy_state = ("", False)
         if user_decision == "approve":
-            record = self.get_by_call_id(call_id, user_id=user_id)
             if record.get("expired_at"):
                 raise ApprovalExpiredError(
                     f"Call {call_id} expired; its invocation is no longer waiting"
@@ -784,9 +857,6 @@ class AuditStore:
                 "policy": json.loads(row["policy"]) if row["policy"] else None,
                 "agent_restricted": bool(row["agent_restricted"]),
             }
-            validate_approval_policy(
-                record, session, self._agent_policies.get(self._db)
-            )
 
         # Atomic update: conditions in WHERE prevent TOCTOU races.
         # Matches unresolved escalations/denials OR records resolved by
@@ -795,27 +865,35 @@ class AuditStore:
         # COALESCE preserves existing judge_reasoning when the caller
         # does not provide it (i.e., human override passes None).
         with self._db.cursor() as cur:
-            if user_decision == "approve" and self._db.backend == "postgresql":
-                # A READ COMMITTED subquery alone can use an old snapshot while
-                # waiting for the audit row. Hold the session row until commit,
-                # so policy updates cannot overtake the final approval write.
+            if self._db.backend == "postgresql":
+                # Lock all observed scope rows in stable order before audit rows.
+                # Every source writer follows the same session-before-audit order.
+                ids = sorted({record["session_id"], *(scope_versions or {})})
+                placeholders = ", ".join("?" for _ in ids)
                 cur.execute(
-                    "SELECT policy, agent_restricted FROM sessions "
-                    "WHERE user_id = ? AND session_id = ? FOR UPDATE",
-                    (user_id, record["session_id"]),
+                    "SELECT session_id, policy, agent_restricted FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders}) "
+                    "ORDER BY session_id FOR UPDATE",
+                    [user_id, *ids],
                 )
-                locked = cur.fetchone()
-                if (
+                locked_rows = {row["session_id"]: row for row in cur.fetchall()}
+                locked = locked_rows.get(record["session_id"])
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
+                if user_decision == "approve" and (
                     locked is None
-                    or (
-                        locked["policy"] or "",
-                        bool(locked["agent_restricted"]),
-                    )
+                    or (locked["policy"] or "", bool(locked["agent_restricted"]))
                     != policy_state
                 ):
                     raise ValueError(
                         "Session policy changed during approval; retry approval"
                     )
+            elif scope_versions is not None:
+                _check_scope_versions(cur, user_id, scope_versions)
+            if user_decision == "approve":
+                validate_approval_policy(
+                    record, session, self._agent_policies.get(self._db)
+                )
             cur.execute(
                 """
                 UPDATE audit_log
@@ -852,7 +930,8 @@ class AuditStore:
                         AND COALESCE(source.classification, '') != 'critical'
                         AND source.evaluation_path != 'critical'
                   ))
-                """,
+                """
+                + scope_conditions,
                 (
                     user_decision,
                     user_note,
@@ -874,11 +953,21 @@ class AuditStore:
                     UNATTENDED_JUDGE_REVIEW,
                     approval_source_call_id,
                     approval_source_call_id,
+                    *scope_params,
                 ),
             )
             if cur.rowcount == 0:
                 # Determine why the update failed for a clear error message
-                record = self.get_by_call_id(call_id, user_id=user_id)
+                cur.execute(
+                    "SELECT * FROM audit_log WHERE call_id = ? AND user_id = ?",
+                    (call_id, user_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"Call {call_id} not found")
+                record = _row_to_dict(row)
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
                 if user_decision == "approve" and (
                     record.get("classification") == "critical"
                     or record.get("evaluation_path") == "critical"
@@ -920,6 +1009,16 @@ class AuditStore:
                     )
                 # Shouldn't reach here, but raise generic error
                 raise ValueError(f"Failed to resolve call {call_id}")
+            if resolved_by == "user":
+                # The UPDATE below observes the current scope, including a
+                # concurrent native lease claiming this call before resolution.
+                cur.execute(
+                    "UPDATE sessions SET scope_version = scope_version + 1 "
+                    "WHERE user_id = ? AND session_id = ? AND EXISTS ("
+                    "SELECT 1 FROM audit_log WHERE call_id = ? AND user_id = ? "
+                    "AND approval_scope = 'reusable')",
+                    (user_id, record["session_id"], call_id, user_id),
+                )
 
         return self.get_by_call_id(call_id, user_id=user_id)
 

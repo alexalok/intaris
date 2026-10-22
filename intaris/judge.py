@@ -30,6 +30,7 @@ from datetime import datetime
 from datetime import timezone as tz
 from typing import Any
 
+from intaris.audit import ScopeChangedError
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
 from intaris.intent_evidence import (
@@ -1131,6 +1132,7 @@ async def resolve_with_side_effects(
     notification_dispatcher: Any | None = None,
     metrics: Any | None = None,
     pending_only: bool = False,
+    scope_versions: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Resolve an escalation or denial with all side effects.
 
@@ -1166,6 +1168,8 @@ async def resolve_with_side_effects(
         event_bus: EventBus instance.
         notification_dispatcher: NotificationDispatcher instance.
         metrics: Metrics instance for observability counters.
+        scope_versions: Observed session and ancestor revisions for atomic
+            Judge approval freshness checks.
         pending_only: Refuse resolved calls even when the prior resolver was
             the judge. Used by invocation-bounded native callbacks.
 
@@ -1207,6 +1211,7 @@ async def resolve_with_side_effects(
         approval_source_call_id=approval_source_call_id,
         **({"user_note_source": user_note_source} if user_note_source else {}),
         **({"pending_only": True} if pending_only else {}),
+        **({"scope_versions": scope_versions} if scope_versions is not None else {}),
     )
 
     # Look up the full record for downstream processing
@@ -1840,10 +1845,12 @@ class JudgeReviewer:
             current_evidence["fingerprint"] != intent_evidence["fingerprint"]
         )
 
-        async def defer_stale_approval(final_decision: str) -> bool:
+        async def defer_stale_approval(
+            final_decision: str, *, scope_changed: bool = False
+        ) -> bool:
             # Check the final outcome: policy and precedent can turn a model
             # denial into approval after inference. Neither can bypass freshness.
-            if not evidence_changed or final_decision != "approve":
+            if not (evidence_changed or scope_changed) or final_decision != "approve":
                 return False
             await asyncio.to_thread(
                 self._audit.set_judge_reasoning,
@@ -1865,6 +1872,39 @@ class JudgeReviewer:
                     risk=judge_risk,
                     reasoning="User scope changed during Judge review.",
                 )
+            return True
+
+        async def resolve_current_scope() -> bool:
+            try:
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision=decision,
+                    user_note=f"Judge ({confidence} confidence)",
+                    resolved_by="judge",
+                    judge_reasoning=reasoning,
+                    judge_decision=decision,
+                    judge_risk=judge_risk,
+                    approval_source_call_id=approval_source_call_id,
+                    scope_versions=(
+                        current_evidence["scope_versions"]
+                        if decision == "approve"
+                        else None
+                    ),
+                    audit_store=self._audit,
+                    evaluator=self._evaluator,
+                    intention_barrier=self._intention_barrier,
+                    alignment_barrier=self._alignment_barrier,
+                    event_bus=self._event_bus,
+                    notification_dispatcher=(
+                        self._notification_dispatcher
+                        if self._should_notify_resolution(decision)
+                        else None
+                    ),
+                )
+            except ScopeChangedError:
+                await defer_stale_approval(decision, scope_changed=True)
+                return False
             return True
 
         if (
@@ -1940,27 +1980,8 @@ class JudgeReviewer:
                 return
             if await defer_stale_approval(decision):
                 return
-            await resolve_with_side_effects(
-                call_id=call_id,
-                user_id=user_id,
-                user_decision=decision,
-                user_note=f"Judge ({confidence} confidence)",
-                resolved_by="judge",
-                judge_reasoning=reasoning,
-                judge_decision=decision,
-                judge_risk=judge_risk,
-                approval_source_call_id=approval_source_call_id,
-                audit_store=self._audit,
-                evaluator=self._evaluator,
-                intention_barrier=self._intention_barrier,
-                alignment_barrier=self._alignment_barrier,
-                event_bus=self._event_bus,
-                notification_dispatcher=(
-                    self._notification_dispatcher
-                    if self._should_notify_resolution(decision)
-                    else None
-                ),
-            )
+            if not await resolve_current_scope():
+                return
 
             if self._metrics:
                 if decision == "approve":
@@ -2062,27 +2083,8 @@ class JudgeReviewer:
                 )
             else:
                 # Judge made a decision (approve or high-confidence deny)
-                await resolve_with_side_effects(
-                    call_id=call_id,
-                    user_id=user_id,
-                    user_decision=decision,
-                    user_note=f"Judge ({confidence} confidence)",
-                    resolved_by="judge",
-                    judge_reasoning=reasoning,
-                    judge_decision=decision,
-                    judge_risk=judge_risk,
-                    approval_source_call_id=approval_source_call_id,
-                    audit_store=self._audit,
-                    evaluator=self._evaluator,
-                    intention_barrier=self._intention_barrier,
-                    alignment_barrier=self._alignment_barrier,
-                    event_bus=self._event_bus,
-                    notification_dispatcher=(
-                        self._notification_dispatcher
-                        if self._should_notify_resolution(decision)
-                        else None
-                    ),
-                )
+                if not await resolve_current_scope():
+                    return
 
                 if self._metrics:
                     if decision == "approve":

@@ -127,7 +127,9 @@ class SessionStore:
         """Permanently require server policy once an agent evaluates this session."""
         with self._db.cursor() as cur:
             cur.execute(
-                "UPDATE sessions SET agent_restricted = TRUE WHERE session_id = ? AND user_id = ?",
+                "UPDATE sessions SET scope_version = scope_version + "
+                "CASE WHEN agent_restricted THEN 0 ELSE 1 END, "
+                "agent_restricted = TRUE WHERE session_id = ? AND user_id = ?",
                 (session_id, user_id),
             )
             if cur.rowcount == 0:
@@ -175,7 +177,10 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = ?, status_reason = ?, updated_at = ?
+                SET status = ?, status_reason = ?, updated_at = ?,
+                    scope_version = scope_version + CASE
+                        WHEN status = ? OR (status IN ('active', 'idle')
+                            AND ? IN ('active', 'idle')) THEN 0 ELSE 1 END
                 WHERE session_id = ? AND user_id = ?
                 """
                 + (
@@ -183,7 +188,7 @@ class SessionStore:
                     if agent_request
                     else ""
                 ),
-                (status, status_reason, now, session_id, user_id),
+                (status, status_reason, now, status, status, session_id, user_id),
             )
             if cur.rowcount == 0:
                 if agent_request:
@@ -253,6 +258,11 @@ class SessionStore:
             sets.append("title = ?")
             params.append(title)
 
+        if any(
+            value is not None
+            for value in (intention, details, policy, intention_source)
+        ):
+            sets.append("scope_version = scope_version + 1")
         params.extend([session_id, user_id])
 
         with self._db.cursor() as cur:
@@ -305,7 +315,8 @@ class SessionStore:
                         WHEN ? > 0 THEN TRUE
                         ELSE user_message_observed
                     END,
-                    last_event_seq = {base_sql} + ?
+                    last_event_seq = {base_sql} + ?,
+                    scope_version = scope_version + {int(last_user_offset > 0)}
                 WHERE session_id = ? AND user_id = ?{returning}
                 """,
                 (
@@ -356,10 +367,21 @@ class SessionStore:
                         THEN ?
                         ELSE last_event_seq
                     END,
-                    user_message_observed = TRUE
+                    user_message_observed = TRUE,
+                    scope_version = scope_version + CASE
+                        WHEN latest_user_message_seq IS NULL OR latest_user_message_seq < ?
+                        THEN 1 ELSE 0 END
                 WHERE session_id = ? AND user_id = ?
                 """,
-                (event_seq, event_seq, event_seq, event_seq, session_id, user_id),
+                (
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    session_id,
+                    user_id,
+                ),
             )
             if cur.rowcount == 0:
                 raise ValueError(f"Session {session_id} not found")
@@ -418,12 +440,17 @@ class SessionStore:
                     user_message_observed = CASE
                         WHEN ? IS NOT NULL THEN TRUE
                         ELSE user_message_observed
-                    END
+                    END,
+                    scope_version = scope_version + CASE
+                        WHEN ? IS NOT NULL AND (latest_user_message_seq IS NULL
+                            OR latest_user_message_seq < ?) THEN 1 ELSE 0 END
                 WHERE session_id = ? AND user_id = ?
                 """,
                 (
                     last_event_seq,
                     last_event_seq,
+                    latest_user_message_seq,
+                    latest_user_message_seq,
                     latest_user_message_seq,
                     latest_user_message_seq,
                     latest_user_message_seq,
@@ -474,7 +501,8 @@ class SessionStore:
                 """
                 UPDATE sessions
                 SET intention = ?, intention_source = ?,
-                    title = COALESCE(?, title), updated_at = ?, intent_profile = ?
+                    title = COALESCE(?, title), updated_at = ?, intent_profile = ?,
+                    scope_version = scope_version + 1
                 WHERE """
                 + " AND ".join(conditions),
                 params,
@@ -603,7 +631,7 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = 'completed', updated_at = ?
+                SET status = 'completed', updated_at = ?, scope_version = scope_version + 1
                 WHERE status = 'idle'
                   AND parent_session_id IS NOT NULL
                   AND last_activity_at IS NOT NULL
@@ -680,10 +708,12 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET alignment_overridden = ?, updated_at = ?
+                SET alignment_overridden = ?, updated_at = ?,
+                    scope_version = scope_version + CASE
+                        WHEN COALESCE(alignment_overridden, FALSE) = ? THEN 0 ELSE 1 END
                 WHERE session_id = ? AND user_id = ?
                 """,
-                (overridden, now, session_id, user_id),
+                (overridden, now, overridden, session_id, user_id),
             )
 
     def get_active_child_sessions(

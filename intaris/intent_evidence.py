@@ -207,6 +207,9 @@ def collect_intent_evidence(
     sources.sort(key=lambda s: (s["timestamp"], s["id"]))
     packet = {
         "version": 1,
+        # These revisions are read with session state, before loading sources.
+        # A concurrent source write invalidates the final approval transaction.
+        "scope_versions": {session_id: session.get("scope_version", 0)},
         "sources": sources,
         "facts": [],
         "complete": not omitted,
@@ -229,8 +232,12 @@ def collect_intent_evidence(
             "intention": session.get("intention"),
             "profile": profile,
             "policy": session.get("policy"),
-            "status": session.get("status"),
+            # Idle sessions resume automatically; this is not new authority.
+            "status": "active"
+            if session.get("status") == "idle"
+            else session.get("status"),
             "seq": session.get("latest_user_message_seq"),
+            "scope_version": session.get("scope_version", 0),
         }
     )
     parent_id = session.get("parent_session_id")
@@ -247,6 +254,9 @@ def collect_intent_evidence(
                 )
             except ValueError:
                 packet["parent_unavailable"] = True
+        packet["scope_versions"].update(
+            packet.get("parent", {}).get("scope_versions", {})
+        )
         packet["fingerprint"] = _digest(
             (
                 packet["fingerprint"],
