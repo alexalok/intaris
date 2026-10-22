@@ -221,3 +221,24 @@ frozen-source outcomes and population-rate limitations above still apply.
 
 Private receipts, scripts, and final source hashes are retained in Git-ignored
 `runs/codex-review-20261022-round5`, with directories 0700 and files 0600.
+
+
+## ionice launcher follow-up
+
+Codex identified a missing literal command launcher: `ionice -c 3 rm -rf /`
+could reach a broad allow shortcut. A dedicated argv parser now follows the
+[util-linux ionice option contract](https://github.com/util-linux/util-linux/blob/v2.42.2/schedutils/ionice.c):
+class/data operands, attached values, short clusters, unambiguous long options,
+and the `--` terminator. Command parsing stops at the first non-option operand.
+Help/version and existing PID/PGID/UID modes do not promote trailing data into
+executable commands. Nested wrappers, shell payloads, heredocs, and pipelines
+reuse the existing hard checks.
+
+The initial suite reproduced missing hard checks while its 22 non-executing
+and benign controls passed. Final cases use valid class options and cover quoted
+examples, bounded cleanup, informational exits, and existing-process modes.
+Full verification: 3,524 server tests and 1,198 Hermes tests passed; 68 external
+E2E cases excluded, two existing WebSocket warnings. Scoped Ruff and whitespace
+checks passed. Commands were inspected as inert strings; none were executed.
+No inference replay or deployment occurred. Private evidence is retained in
+Git-ignored `runs/codex-review-20261022-round6` (0700 directories, 0600 files).

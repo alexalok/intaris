@@ -1593,6 +1593,58 @@ def _literal_launched_commands(words: list[str]) -> list[list[str]]:
     return commands
 
 
+def _unwrap_ionice_command(words: list[str]) -> list[str]:
+    """Return ionice's command argv; help and existing-process modes do not exec.
+
+    util-linux uses getopt_long with a leading '+': parsing stops at the first
+    operand. Required short values may be attached or follow a flag cluster.
+    """
+    long_options = {
+        "class": "c",
+        "classdata": "n",
+        "pid": "p",
+        "pgid": "P",
+        "uid": "u",
+        "ignore": "t",
+        "help": "h",
+        "version": "V",
+    }
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            return words[index:]
+        if token == "-" or not token.startswith("-"):
+            return words[index - 1 :]
+        if token.startswith("--"):
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []  # Invalid or ambiguous options stop ionice.
+                name = matches[0]
+            option = long_options[name]
+            if option in "pPuhV":
+                return []  # Existing-process mode or immediate informational exit.
+            if option in "cn":
+                if not equals:
+                    index += 1
+            elif equals:
+                return []  # --ignore has no value.
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "pPuhV":
+                    return []
+                if option in "cn":
+                    if offset == len(token) - 1:
+                        index += 1
+                    break  # Remaining cluster characters are the option's value.
+                if option != "t":
+                    return []
+    return []
+
+
 def _critical_command_words(command: str) -> list[str]:
     """Unwrap literal execution prefixes without promoting argument text."""
     command = re.sub(
@@ -1642,6 +1694,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = words[1:]
         elif head == "env":
             words = _unwrap_read_command(["env", *words[1:]])
+        elif head == "ionice":
+            words = _unwrap_ionice_command(words)
         elif head in option_values:
             words = words[1:]
             while words and words[0].startswith("-"):
