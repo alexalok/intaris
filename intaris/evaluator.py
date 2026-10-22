@@ -35,7 +35,7 @@ from intaris.approval_policy import (
 from intaris.approval_policy import (
     make_evaluation_context,
 )
-from intaris.audit import AuditStore
+from intaris.audit import AuditStore, ScopeChangedError
 from intaris.classifier import (
     Classification,
     classify,
@@ -564,6 +564,7 @@ class Evaluator:
         # session's intention and their own. This prevents sub-agents
         # from escaping the parent's guardrails by declaring a narrow
         # intention that doesn't cover what they're actually doing.
+        scope_versions = {session_id: session.get("scope_version", 0)}
         parent_intention: str | None = None
         parent_session_id = session.get("parent_session_id")
         if parent_session_id:
@@ -574,6 +575,9 @@ class Evaluator:
             try:
                 parent_session = self._sessions.get(parent_session_id, user_id=user_id)
                 parent_intention = parent_session.get("intention")
+                scope_versions[parent_session_id] = parent_session.get(
+                    "scope_version", 0
+                )
 
                 # Parent lifecycle cascade: if parent is terminated or
                 # suspended, auto-suspend the child session. This prevents
@@ -874,6 +878,72 @@ class Evaluator:
             decision.approval_call_id = None
             outcome_override = "intent_evidence_changed"
 
+        # Calculate latency
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+
+        # Step 7: Audit (with args_hash for escalation retry, profile_version)
+        audit_context = make_evaluation_context(
+            tool=tool, args=classification_args, context=context, session=session
+        )
+        audit_args = dict(
+            call_id=call_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            tool=tool,
+            args_redacted=args_redacted,
+            evaluation_context=audit_context,
+            classification=classification.value,
+            evaluation_path=decision.path,
+            decision=decision.decision,
+            risk=decision.risk,
+            reasoning=decision.reasoning,
+            latency_ms=latency_ms,
+            args_hash=args_hash,
+            profile_version=profile_version,
+            intention=session.get("intention"),
+            injection_detected=_injection_detected,
+            raw_decision=raw_decision,
+            maximum_outcome=maximum_outcome,
+            minimum_outcome=minimum_outcome,
+            outcome_override=outcome_override,
+            intent_evidence=decision.intent_evidence,
+        )
+        if decision.intent_evidence is not None:
+            # Earlier classifier/parent checks must not inherit a newer scope
+            # merely because exact-retry evidence was collected later.
+            scope_versions = {
+                **decision.intent_evidence["scope_versions"],
+                **scope_versions,
+            }
+        try:
+            self._audit.insert(
+                **audit_args,
+                **(
+                    {"scope_versions": scope_versions}
+                    if decision.decision == "approve"
+                    else {}
+                ),
+            )
+        except ScopeChangedError:
+            # No approving row was inserted. Persist the existing scope-change
+            # fallback without applying permissive caps or unattended Judge reuse.
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.reasoning = "User scope or policy changed during evaluation; review current evidence."
+            decision.approval_call_id = None
+            decision.evidence_changed = True
+            outcome_override = "intent_evidence_changed"
+            self._audit.insert(
+                **{
+                    **audit_args,
+                    "decision": decision.decision,
+                    "reasoning": decision.reasoning,
+                    "outcome_override": outcome_override,
+                }
+            )
+
         # Learn from LLM approvals: cache path prefixes for path-reclassified
         # calls so subsequent reads to the same directory are fast-pathed.
         # User-approved escalations are handled separately via
@@ -902,38 +972,6 @@ class Evaluator:
                         prefix,
                         session_id,
                     )
-
-        # Calculate latency
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        # Step 7: Audit (with args_hash for escalation retry, profile_version)
-        audit_context = make_evaluation_context(
-            tool=tool, args=classification_args, context=context, session=session
-        )
-        self._audit.insert(
-            call_id=call_id,
-            user_id=user_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            tool=tool,
-            args_redacted=args_redacted,
-            evaluation_context=audit_context,
-            classification=classification.value,
-            evaluation_path=decision.path,
-            decision=decision.decision,
-            risk=decision.risk,
-            reasoning=decision.reasoning,
-            latency_ms=latency_ms,
-            args_hash=args_hash,
-            profile_version=profile_version,
-            intention=session.get("intention"),
-            injection_detected=_injection_detected,
-            raw_decision=raw_decision,
-            maximum_outcome=maximum_outcome,
-            minimum_outcome=minimum_outcome,
-            outcome_override=outcome_override,
-            intent_evidence=decision.intent_evidence,
-        )
 
         # Step 8: Update session counters
         try:
@@ -1132,6 +1170,7 @@ class Evaluator:
                 ),
                 path="fast",
                 approval_call_id=prior_call_id,
+                intent_evidence=current,
             )
 
         return None

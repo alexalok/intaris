@@ -1120,10 +1120,19 @@ def test_admin_inference_finishing_after_adoption_cannot_train_path_cache(client
         return Decision("approve", "low", "Old admin inference completed", "llm")
 
     with patch.object(evaluator, "_llm_evaluate", side_effect=adopt_during_inference):
-        assert (
-            _evaluate_path_read(client, "/outside/first.txt", ADMIN)["decision"]
-            == "approve"
+        # The final L1 transaction now rejects the stale admin approval itself,
+        # before a fresh Judge review can evaluate the newly restricted scope.
+        first = evaluator.evaluate(
+            user_id="owner",
+            session_id="s",
+            agent_id="operator",
+            tool="read",
+            args={"filePath": "/outside/first.txt"},
         )
+        assert first["decision"] == "escalate"
+    stored = client.get(f"/api/v1/audit/{first['call_id']}", headers=ADMIN).json()
+    assert stored["effective_decision"] == "escalate"
+    assert stored["outcome_override"] == "intent_evidence_changed"
     assert not evaluator._approved_paths.get(("owner", "s"))
     with patch.object(
         evaluator,

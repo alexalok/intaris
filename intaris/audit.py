@@ -131,6 +131,7 @@ class AuditStore:
         outcome_override: str | None = None,
         intent_evidence: dict[str, Any] | None = None,
         evaluation_context: dict[str, Any] | None = None,
+        scope_versions: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -151,6 +152,9 @@ class AuditStore:
             record_type: Record type: "tool_call", "reasoning", "checkpoint",
                 or "summary".
             content: Reasoning or checkpoint text (null for tool_call records).
+            scope_versions: Observed revisions required to commit an approval.
+                A mismatch inserts nothing and raises ScopeChangedError so the
+                evaluator can persist its non-executable fallback exactly once.
             evaluation_context: Redacted server evaluation metadata, kept separate
                 from arbitrary tool argument keys.
             args_hash: SHA-256 hash of canonical args for escalation retry.
@@ -170,8 +174,39 @@ class AuditStore:
 
         record_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+        if decision != "approve" or record_type != "tool_call":
+            scope_versions = None
+        if scope_versions is not None and (
+            session_id not in scope_versions
+            or any(
+                not isinstance(key, str) or type(value) is not int or value < 0
+                for key, value in scope_versions.items()
+            )
+        ):
+            raise ScopeChangedError("User scope changed or its revision is unavailable")
+        scope_predicates = [
+            "EXISTS (SELECT 1 FROM sessions WHERE user_id = ? "
+            "AND session_id = ? AND scope_version = ?)"
+            for _ in (scope_versions or {})
+        ]
+        scope_params = [
+            item
+            for key, value in (scope_versions or {}).items()
+            for item in (user_id, key, value)
+        ]
 
         with self._db.cursor() as cur:
+            if scope_versions is not None and self._db.backend == "postgresql":
+                ids = sorted(scope_versions)
+                placeholders = ", ".join("?" for _ in ids)
+                cur.execute(
+                    "SELECT session_id FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders}) "
+                    "ORDER BY session_id FOR UPDATE",
+                    [user_id, *ids],
+                )
+                cur.fetchall()
+                _check_scope_versions(cur, user_id, scope_versions)
             if (
                 record_type == "reasoning"
                 and isinstance(content, str)
@@ -198,9 +233,14 @@ class AuditStore:
                      raw_decision, effective_decision, maximum_outcome,
                      minimum_outcome, outcome_override, intent_evidence,
                      evaluation_context)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?)
-                """,
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?
+                """
+                + (
+                    " WHERE " + " AND ".join(scope_predicates)
+                    if scope_predicates
+                    else ""
+                ),
                 (
                     record_id,
                     call_id,
@@ -233,8 +273,13 @@ class AuditStore:
                     json.dumps(evaluation_context)
                     if evaluation_context is not None
                     else None,
+                    *scope_params,
                 ),
             )
+            if scope_versions is not None and cur.rowcount != 1:
+                raise ScopeChangedError(
+                    "User scope changed during evaluation; review current evidence"
+                )
 
         # Fan out to the search indexer (vector tier only). Lexical
         # search reads canonical tables directly via tsvector — no
@@ -745,7 +790,7 @@ class AuditStore:
             record = _row_to_dict(row)
             if (
                 changed
-                and record.get("resolved_by") == "user"
+                and record.get("resolved_by") in {"user", "judge"}
                 and record.get("user_decision") == "approve"
                 and record.get("approval_scope") == "reusable"
             ):
