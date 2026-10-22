@@ -15,7 +15,36 @@ Our maintenance loop is:
 
 This document defines the process; it does not schedule reviews or authorize
 pushes, PR merges, publication, deployment, or live configuration changes.
-Follow the repository's worktree-ownership and approval rules for each action.
+Follow the worktree ownership protocol below and the applicable user approval
+rules for each action.
+
+## Worktree ownership
+
+Before any write (including fetch, tests, builds, installs, or Git changes),
+inspect `<worktree-root>/.codex/in-progress`. The marker has a Unix timestamp in
+seconds on line 1 and a unique task/session owner ID on line 2. Keep the same ID
+through follow-ups. Never stage or commit this marker or its lock files.
+
+A valid timestamp at most 900 seconds old reserves that worktree for its owner;
+future timestamps also count as active. An active foreign or unknown owner
+requires another worktree; read-only inspection is still allowed. Do not replace
+an active foreign marker. An absent, invalid, or expired timestamp permits a
+claim, but never permits discarding someone else's uncommitted files.
+
+Serialize claims, refreshes, and deletion using a per-worktree exclusive lock
+at `.codex/in-progress.lock`. With that lock held, re-read the marker, check its
+owner/expiry, then create it exclusively if absent or atomically replace it if
+takeover is permitted. Re-read to verify ownership before each write batch.
+Refresh the timestamp before 15 minutes elapse while actively working. If
+ownership changes or lock acquisition fails, stop writing and use another
+worktree. After a pause, re-check and claim again; do not assume an old claim.
+
+Keep the marker while implementation, verification, review, or requested
+follow-up remains unfinished. Do not use an unattended heartbeat. Remove it
+only after the changes are committed and the task has no pending work, checking
+ownership under the same lock immediately before deletion. Leave uncommitted
+work's marker to expire rather than making an unsolicited commit. Ownership
+grants no additional staging, push, merge, or deployment permission.
 
 ## Product independence
 
@@ -133,13 +162,41 @@ git fetch --no-tags "$fork_remote" \
 reviewed_upstream=$(git rev-parse "refs/remotes/$upstream_remote/$upstream_branch^{commit}")
 fork_baseline=$(git rev-parse "refs/remotes/$fork_remote/$fork_branch^{commit}")
 
+boundary_fork=$fork_baseline
+# Continuation: use the last completed checkpoint reachable from this fork tip.
+# First cycle only: set review_mode=first-cycle and previous_checkpoint=none.
+review_mode=continuation
+previous_checkpoint=<last-checkpoint-full-sha>
+if [ "$review_mode" = first-cycle ]; then
+  test "$previous_checkpoint" = none
+  test -z "$(git log --merges --format=%H --grep='^Upstream-Reviewed: ' "$boundary_fork")"
+  test "$(git merge-base "$boundary_fork" "$reviewed_upstream")" = "$last_reviewed"
+elif [ "$review_mode" = continuation ]; then
+  test "$(git rev-parse "$previous_checkpoint^{commit}")" = "$previous_checkpoint"
+  git merge-base --is-ancestor "$previous_checkpoint" "$boundary_fork"
+  recorded_tip=$(git show -s --format='%(trailers:key=Upstream-Reviewed,valueonly)' "$previous_checkpoint")
+  test "$recorded_tip" = "$last_reviewed"
+  previous_first=$(git rev-parse "$previous_checkpoint^1")
+  test "$(git show -s --format=%P "$previous_checkpoint")" = "$previous_first $recorded_tip"
+  test "$(git rev-parse "$previous_checkpoint^{tree}")" = "$(git rev-parse "$previous_first^{tree}")"
+  previous_record=$(git show -s --format='%(trailers:key=Upstream-Review-Record,valueonly)' "$previous_checkpoint")
+  test -n "$previous_record"
+  test "$(git cat-file -t "$previous_first:$previous_record")" = blob
+  previous_contents=$(git show "$previous_first:$previous_record")
+  test "$(printf '%s\n' "$previous_contents" | grep '^Status: ')" = 'Status: ready for checkpoint'
+  test "$(printf '%s\n' "$previous_contents" | grep '^Reviewed upstream tip: ')" = "Reviewed upstream tip: $recorded_tip"
+else
+  printf '%s\n' 'Unknown review mode; stop.' >&2
+  exit 1
+fi
+
 if ! git merge-base --is-ancestor "$last_reviewed" "$reviewed_upstream"; then
   printf '%s\n' 'Upstream ancestry mismatch; stop and investigate the review boundary.' >&2
   exit 1
 fi
 printf 'Previous upstream: %s\nReviewed upstream: %s\nFork baseline: %s\n' \
   "$last_reviewed" "$reviewed_upstream" "$fork_baseline"
-git log --reverse --topo-order --format='%H %s' "$last_reviewed..$reviewed_upstream"
+git log --reverse --topo-order --format='%H %s' --patch --diff-merges=separate "$last_reviewed..$reviewed_upstream"
 git diff --stat "$last_reviewed" "$reviewed_upstream"
 git diff "$last_reviewed" "$reviewed_upstream" -- <paths-under-review>
 )
@@ -149,7 +206,16 @@ Stop and investigate if the ancestry check fails; do not silently replace the
 baseline after upstream rewrites history. For the first cycle with no checkpoint,
 establish and record a verified common ancestor as the starting point. Do not
 treat an informal previous conversation or a checkout's stale tracking ref as a
-completed checkpoint.
+completed checkpoint. The complete recipes require an explicit `first-cycle`
+mode for that case and reject it when checkpoint trailers already exist.
+For continuation, set the last checkpoint's full commit ID; both recipes verify
+its upstream trailer, reachability, ordered parents, unchanged tree, and linked
+committed review record before accepting the previous tip. Select the latest
+completed checkpoint using ancestry; if competing checkpoint histories exist,
+stop and reconcile them explicitly rather than choosing by date.
+
+Per-commit patches include intermediate changes and reverts even when endpoint
+trees match. Endpoint diffs provide an additional aggregate view only.
 
 To find prior checkpoint candidates, inspect merge commits reachable from the
 fork branch with the `Upstream-Reviewed` trailer. Validate each candidate's two
@@ -216,6 +282,33 @@ fork_branch=main
 git fetch --no-tags "$fork_remote" \
   "refs/heads/$fork_branch:refs/remotes/$fork_remote/$fork_branch"
 fork_before=$(git rev-parse "refs/remotes/$fork_remote/$fork_branch^{commit}")
+boundary_fork=$fork_before
+# Continuation: use the last completed checkpoint reachable from this fork tip.
+# First cycle only: set review_mode=first-cycle and previous_checkpoint=none.
+review_mode=continuation
+previous_checkpoint=<last-checkpoint-full-sha>
+if [ "$review_mode" = first-cycle ]; then
+  test "$previous_checkpoint" = none
+  test -z "$(git log --merges --format=%H --grep='^Upstream-Reviewed: ' "$boundary_fork")"
+  test "$(git merge-base "$boundary_fork" "$reviewed_upstream")" = "$last_reviewed"
+elif [ "$review_mode" = continuation ]; then
+  test "$(git rev-parse "$previous_checkpoint^{commit}")" = "$previous_checkpoint"
+  git merge-base --is-ancestor "$previous_checkpoint" "$boundary_fork"
+  recorded_tip=$(git show -s --format='%(trailers:key=Upstream-Reviewed,valueonly)' "$previous_checkpoint")
+  test "$recorded_tip" = "$last_reviewed"
+  previous_first=$(git rev-parse "$previous_checkpoint^1")
+  test "$(git show -s --format=%P "$previous_checkpoint")" = "$previous_first $recorded_tip"
+  test "$(git rev-parse "$previous_checkpoint^{tree}")" = "$(git rev-parse "$previous_first^{tree}")"
+  previous_record=$(git show -s --format='%(trailers:key=Upstream-Review-Record,valueonly)' "$previous_checkpoint")
+  test -n "$previous_record"
+  test "$(git cat-file -t "$previous_first:$previous_record")" = blob
+  previous_contents=$(git show "$previous_first:$previous_record")
+  test "$(printf '%s\n' "$previous_contents" | grep '^Status: ')" = 'Status: ready for checkpoint'
+  test "$(printf '%s\n' "$previous_contents" | grep '^Reviewed upstream tip: ')" = "Reviewed upstream tip: $recorded_tip"
+else
+  printf '%s\n' 'Unknown review mode; stop.' >&2
+  exit 1
+fi
 test "$(git rev-parse HEAD)" = "$fork_before"
 fork_tree=$(git rev-parse 'HEAD^{tree}')
 git diff --exit-code
