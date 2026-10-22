@@ -12,10 +12,10 @@ Classification priority (deny always wins):
 1.   Session policy deny (deny_tools, deny_commands) → CRITICAL
 1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
 2.   Tool preference deny → CRITICAL
+2.5. Critical command detection (bash/terminal) → CRITICAL
 3.   Tool preference escalate → ESCALATE
 4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
 5.   Tool preference auto-approve → READ
-6.   Critical pattern detection (bash only) → CRITICAL
 7.   Built-in read-only allowlist → READ
 7.5. Path outside project (not in allow_paths) → WRITE
 8.   Default → WRITE
@@ -174,39 +174,6 @@ _READ_ONLY_MCP_TOOLS: set[str] = {
     "sequentialthinking",
     "sequentialthinking_sequentialthinking",  # OpenCode: server_tool format
 }
-
-# ── Critical Patterns ─────────────────────────────────────────────────
-# Commands that are always denied regardless of context.
-
-_CRITICAL_PATTERNS: list[re.Pattern[str]] = [
-    # Destructive filesystem operations
-    re.compile(
-        r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive\s+--force|-[a-zA-Z]*f[a-zA-Z]*r)\s+/\s*$"
-    ),
-    re.compile(
-        r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive\s+--force|-[a-zA-Z]*f[a-zA-Z]*r)\s+/[a-z]+\s*$"
-    ),
-    re.compile(r"\brm\s+-rf\s+\*\s*$"),
-    # Disk destruction
-    re.compile(r"\bdd\s+.*if=/dev/(zero|random|urandom)"),
-    re.compile(r"\bmkfs\b"),
-    re.compile(r"\bfdisk\b"),
-    re.compile(r"\bparted\b"),
-    # Permission escalation on root
-    re.compile(r"\bchmod\s+(-[a-zA-Z]*R[a-zA-Z]*\s+)?777\s+/\s*$"),
-    re.compile(r"\bchown\s+(-[a-zA-Z]*R[a-zA-Z]*\s+)?\S+\s+/\s*$"),
-    # Fork bomb
-    re.compile(r":\(\)\s*\{\s*:\|:&\s*\}\s*;"),
-    # Dangerous network operations
-    re.compile(r"\bcurl\b.*\|\s*(ba)?sh\b"),
-    re.compile(r"\bwget\b.*\|\s*(ba)?sh\b"),
-    # System shutdown/reboot
-    re.compile(r"\b(shutdown|reboot|halt|poweroff|init\s+[06])\b"),
-    # Kernel module manipulation
-    re.compile(r"\b(insmod|rmmod|modprobe)\b"),
-    # iptables flush (drops all firewall rules)
-    re.compile(r"\biptables\s+-F\b"),
-]
 
 # ── Path Policy ───────────────────────────────────────────────────────
 # Filesystem path awareness for tool call classification.
@@ -1080,10 +1047,10 @@ def classify(
     1.   Session policy deny (deny_tools, deny_commands) → CRITICAL
     1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
     2.   Tool preference deny → CRITICAL
+    2.5. Critical command detection (bash/terminal) → CRITICAL
     3.   Tool preference escalate → ESCALATE
     4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
     5.   Tool preference auto-approve → READ
-    6.   Critical pattern detection (bash only) → CRITICAL
     7.   Built-in read-only allowlist or trusted MCP metadata → READ
     7.5. Path outside project (not in allow_paths) → WRITE
     8.   Default → WRITE (goes to LLM evaluation)
@@ -1105,6 +1072,9 @@ def classify(
     Returns:
         Classification enum value.
     """
+    if tool == "skill_view_raw":
+        return _classify_raw_skill_read(args, session_policy, tool_preferences)
+
     metadata_readonly = trusted_readonly is True and ":" in tool
     allowed_script = match_allowed_script(tool, args, session_policy)
     script_paths_known = True
@@ -1152,6 +1122,12 @@ def classify(
     if pref == "deny":
         return Classification.CRITICAL
 
+    # Hard prohibitions precede every allow/escalation shortcut.
+    if tool in {"bash", "terminal"}:
+        command = _extract_bash_command(args)
+        if command and _is_critical(command):
+            return Classification.CRITICAL
+
     # Step 3: Tool preference escalate
     if pref == "escalate":
         return Classification.ESCALATE
@@ -1167,12 +1143,6 @@ def classify(
     # Step 5: Tool preference auto-approve
     if pref == "auto-approve":
         return Classification.READ
-
-    # Step 6: Check critical patterns (bash only)
-    if tool in {"bash", "terminal"}:
-        command = _extract_bash_command(args)
-        if command and _is_critical(command):
-            return Classification.CRITICAL
 
     # Step 7: Check read-only allowlist
     if is_read_only(tool, args) or (metadata_readonly and pref != "evaluate"):
@@ -1198,6 +1168,42 @@ def classify(
 
     # Step 8: Default to WRITE (goes to LLM evaluation)
     return Classification.WRITE
+
+
+def _classify_raw_skill_read(
+    args: dict[str, Any],
+    policy: dict[str, Any] | None,
+    preferences: dict[str, str] | None,
+) -> Classification:
+    """Classify the adapter's raw reader, preserving model-facing tool rules.
+
+    Native skill_view remains WRITE: Hermes' loader may execute shell, install
+    dependencies, or expose credentials. Only the adapter-owned raw operation
+    carries this identity, with its resolved absolute target. Keep it out of
+    is_read_only() so the path approval cache cannot bypass review preferences.
+    """
+    policy = policy or {}
+    names = ("skill_view_raw", "skill_view")
+    if any(_check_session_policy_deny(name, args, policy) for name in names):
+        return Classification.CRITICAL
+    prefs = {_get_tool_preference(name, preferences) for name in names}
+    if "deny" in prefs:
+        return Classification.CRITICAL
+    path = args.get("path")
+    known = isinstance(path, str) and os.path.isabs(path) and not path.startswith("//")
+    if known:
+        path = resolve_path(path, "")
+        if _check_deny_paths([path], policy):
+            return Classification.CRITICAL
+    if "escalate" in prefs:
+        return Classification.ESCALATE
+    if not known or "evaluate" in prefs or policy.get("deny_policies"):
+        return Classification.WRITE
+    if _is_sensitive_path(path):
+        return Classification.WRITE
+    # Skill libraries commonly live outside the project. Inspecting text does
+    # not confer authority to follow it; every later action is evaluated anew.
+    return Classification.READ
 
 
 def resolve_tool_paths(
@@ -1288,16 +1294,319 @@ def _strip_quoted_strings(command: str) -> str:
     return _QUOTED_STRING_RE.sub('""', command)
 
 
-def _is_critical(command: str) -> bool:
-    """Check if a bash command matches any critical pattern."""
-    # Strip quoted strings to prevent false positives from keywords
-    # appearing in arguments (e.g., "shutdown" in a commit message).
-    stripped = _strip_quoted_strings(command)
-    for pattern in _CRITICAL_PATTERNS:
-        if pattern.search(stripped):
-            logger.warning("Critical pattern matched: %s", pattern.pattern)
+def _is_critical(command: str, _depth: int = 0) -> bool:
+    """Recognize prohibited execution, preserving quoted operands and prose.
+
+    This is a bounded literal shell recognizer, not a shell interpreter.
+    Dynamic/unknown commands still take the ordinary WRITE evaluation path.
+    """
+    if _depth > 8:
+        return False
+    raw_segments, heredocs = _shell_segments(command)
+    executable_text = "".join(raw + separator for raw, separator in raw_segments)
+    if re.search(
+        r":\(\)\s*\{\s*:\|:&\s*\}\s*;", _strip_quoted_strings(executable_text)
+    ):
+        # The fork-bomb form is shell syntax rather than an external command.
+        return True
+    for body, expands, executes in heredocs:
+        nested_commands = (
+            [body]
+            if executes
+            else _shell_substitutions(body, literal_quotes=True)
+            if expands
+            else []
+        )
+        if any(_is_critical(nested, _depth + 1) for nested in nested_commands):
+            return True
+    segments: list[tuple[list[str], str]] = []
+    for raw, separator in raw_segments:
+        if any(
+            _is_critical(nested, _depth + 1) for nested in _shell_substitutions(raw)
+        ):
+            return True
+        words = _critical_command_words(raw)
+        segments.append((words, separator))
+        if not words:
+            continue
+        head = os.path.basename(words[0])
+        operands = words[1:]
+        if head in {"sh", "bash", "zsh", "dash", "ksh"}:
+            for index, arg in enumerate(operands[:-1]):
+                if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
+                    if _is_critical(operands[index + 1], _depth + 1):
+                        return True
+        if head == "eval" and _is_critical(" ".join(operands), _depth + 1):
+            return True
+        if head == "rm":
+            recursive = False
+            targets = []
+            options = True
+            for arg in operands:
+                if options and arg == "--":
+                    options = False
+                elif options and arg.startswith("-"):
+                    recursive |= arg == "--recursive" or (
+                        not arg.startswith("--") and bool(set(arg[1:]) & {"r", "R"})
+                    )
+                else:
+                    targets.append(arg)
+            protected = {
+                "/",
+                "/etc",
+                "/usr",
+                "/var",
+                "/home",
+                "/Users",
+                "/System",
+                "/bin",
+                "/sbin",
+                "/lib",
+                "/lib64",
+                "/boot",
+                "/root",
+                "/opt",
+                "/dev",
+                "/tmp",
+                "~",
+                "$HOME",
+                "${HOME}",
+            }
+            if recursive and any(
+                os.path.normpath(t) in protected or t in {"*", "/*"} for t in targets
+            ):
+                return True
+        # Only match executable names. Words in echo/grep/commit arguments
+        # (including unquoted filenames) must never become hard prohibitions.
+        if head in {
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "insmod",
+            "rmmod",
+            "modprobe",
+            "fdisk",
+            "parted",
+        } or head.startswith("mkfs"):
+            return True
+        if head == "init" and operands and operands[0] in {"0", "6"}:
+            return True
+        if head == "dd" and any(
+            arg in {"if=/dev/zero", "if=/dev/random", "if=/dev/urandom"}
+            for arg in operands
+        ):
+            return True
+        if head == "iptables" and "-F" in operands:
+            return True
+        if (
+            head in {"chmod", "chown"}
+            and operands
+            and os.path.normpath(operands[-1]) == "/"
+        ):
+            if head == "chown" or "777" in operands:
+                return True
+    # A pipe into an actual shell is execution; a hash utility is not.
+    for (left, separator), (right, _) in zip(segments, segments[1:]):
+        if (
+            separator in {"|", "|&"}
+            and left
+            and right
+            and os.path.basename(left[0]) in {"curl", "wget"}
+            and os.path.basename(right[0]) in {"sh", "bash"}
+        ):
             return True
     return False
+
+
+def _critical_command_words(command: str) -> list[str]:
+    """Unwrap literal execution prefixes without promoting argument text."""
+    command = re.sub(
+        r"^(?:(?:if|then|elif|else|do|while|until|!|\{)\s+)+", "", command.lstrip()
+    )
+    try:
+        words = shlex.split(command, comments=True)
+    except ValueError:
+        return []
+    option_values = {
+        "sudo": {
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "-T",
+            "-D",
+            "-R",
+            "-r",
+            "-t",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+            "--command-timeout",
+            "--chdir",
+            "--chroot",
+            "--role",
+            "--type",
+        },
+        "nice": {"-n", "--adjustment"},
+        "exec": {"-a"},
+        "command": set(),
+        "nohup": set(),
+        "busybox": set(),
+    }
+    while words:
+        head = os.path.basename(words[0])
+        if _looks_like_env_assignment(words[0]):
+            words = words[1:]
+        elif head == "env":
+            words = _unwrap_read_command(["env", *words[1:]])
+        elif head in option_values:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                option, words = words[0], words[1:]
+                if option == "--":
+                    break
+                if head == "command" and option in {"-v", "-V"}:
+                    return []  # Lookup, not execution.
+                if option in option_values[head] and words:
+                    words = words[1:]
+        else:
+            break
+    return words
+
+
+def _shell_segments(
+    command: str,
+) -> tuple[list[tuple[str, str]], list[tuple[str, bool, bool]]]:
+    """Split unquoted shell operators, preserving literals and heredoc bodies.
+
+    Each segment retains its following operator, so sequence is not confused
+    with a pipe. Heredocs are data unless fed to a shell; unquoted bodies still
+    execute substitutions. This recognizes literal syntax, not shell expansion.
+    """
+    segments, heredocs, pending = [], [], []
+    start = index = 0
+    quote = ""
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if char in {"'", '"'} and (not quote or quote == char):
+            quote = "" if quote else char
+        elif (
+            not quote
+            and char == "#"
+            and (index == start or command[index - 1].isspace())
+        ):
+            # Comments cannot introduce executable commands or heredocs.
+            end = command.find("\n", index)
+            end = len(command) if end < 0 else end
+            command = command[:index] + " " * (end - index) + command[end:]
+            index = end
+            continue
+        elif (
+            not quote
+            and command.startswith("<<", index)
+            and not command.startswith("<<<", index)
+        ):
+            match = re.match(
+                r"""<<(-?)[ \t]*((?:\\.|'[^']*'|"(?:\\.|[^"\\])*"|[^\s;&|()<>])+)(?=\s|[;&|()<>]|$)""",
+                command[index:],
+            )
+            if match:
+                raw_delimiter = match[2]
+                try:
+                    delimiter = shlex.split(raw_delimiter)[0]
+                except (ValueError, IndexError):
+                    return segments, heredocs
+                words = _critical_command_words(command[start:index])
+                executes = bool(
+                    words
+                    and os.path.basename(words[0])
+                    in {"sh", "bash", "zsh", "dash", "ksh"}
+                )
+                pending.append(
+                    (delimiter, match[1] == "-", raw_delimiter == delimiter, executes)
+                )
+                index += match.end()
+                continue
+        elif not quote and char in ";&|()\n":
+            end = index + 1
+            if command[index : end + 1] in {"&&", "||", "|&", ";;", ";&"}:
+                end += 1
+            separator = command[index:end]
+            segments.append((command[start:index], separator))
+            if char == "\n" and pending:
+                for delimiter, strip_tabs, expands, executes in pending:
+                    body_start = end
+                    while end < len(command):
+                        line_end = command.find("\n", end)
+                        line_end = len(command) if line_end < 0 else line_end
+                        line = command[end:line_end]
+                        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                            heredocs.append(
+                                (command[body_start:end], expands, executes)
+                            )
+                            end = min(line_end + 1, len(command))
+                            break
+                        end = min(line_end + 1, len(command))
+                    else:
+                        # An unterminated document is still input, not commands.
+                        heredocs.append((command[body_start:], expands, executes))
+                pending.clear()
+            start = index = end
+            continue
+        index += 1
+    segments.append((command[start:], ""))
+    return segments, heredocs
+
+
+def _shell_substitutions(command: str, *, literal_quotes: bool = False) -> list[str]:
+    """Extract executed substitutions without treating single-quoted text as code."""
+    result: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if not literal_quotes and char in {"'", '"'} and (not quote or quote == char):
+            quote = "" if quote else char
+            index += 1
+            continue
+        if quote != "'" and command.startswith("$(", index):
+            start = index + 2
+            end, depth = start, 1
+            inner_quote = ""
+            while end < len(command) and depth:
+                inner = command[end]
+                if inner == "\\" and inner_quote != "'":
+                    end += 2
+                    continue
+                if inner in {"'", '"', "`"} and (
+                    not inner_quote or inner_quote == inner
+                ):
+                    inner_quote = "" if inner_quote else inner
+                elif not inner_quote:
+                    depth += (inner == "(") - (inner == ")")
+                end += 1
+            if depth == 0:
+                result.append(command[start : end - 1])
+                index = end
+                continue
+        if quote != "'" and char == "`":
+            end = command.find("`", index + 1)
+            if end != -1:
+                result.append(command[index + 1 : end])
+                index = end + 1
+                continue
+        index += 1
+    return result
 
 
 def is_read_only(tool: str, args: dict[str, Any]) -> bool:

@@ -20,6 +20,9 @@ def hermes_host(monkeypatch):
     if not source:
         pytest.skip("HERMES_SOURCE is required for the real host contract")
     monkeypatch.syspath_prepend(source)
+    # test_plugin installs non-package stubs during collection; restore real imports.
+    monkeypatch.delitem(sys.modules, "tools", raising=False)
+    monkeypatch.delitem(sys.modules, "tools.registry", raising=False)
     modules = {
         name: importlib.import_module(name)
         for name in (

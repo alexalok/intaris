@@ -256,13 +256,13 @@ def test_agent_lifecycle_and_admin_approval(client):
         client.post("/api/v1/decision", headers=AGENT, json=decision).status_code == 403
     )
     assert (
-        client.post("/api/v1/decision", headers=ADMIN, json=decision).status_code == 200
+        client.post("/api/v1/decision", headers=ADMIN, json=decision).status_code == 400
     )
     assert (
         client.get(f"/api/v1/audit/{denied['call_id']}", headers=AGENT).json()[
             "resolved_by"
         ]
-        == "user"
+        is None
     )
     for path, body in [
         ("/reasoning", {"session_id": "s", "content": "Inspecting code"}),
@@ -476,15 +476,16 @@ def test_agent_policy_survives_missing_config_fail_closed(client):
     assert result.status_code >= 400
 
 
-def test_human_approval_retry_still_works(client):
+def test_human_approval_cannot_override_mandatory_prohibition(client):
     create(client)
     denied = evaluate(client, command="sudo id")
-    client.post(
+    response = client.post(
         "/api/v1/decision",
         headers=ADMIN,
         json={"call_id": denied["call_id"], "decision": "approve"},
-    ).raise_for_status()
-    assert evaluate(client, command="sudo id")["decision"] == "approve"
+    )
+    assert response.status_code == 400
+    assert evaluate(client, command="sudo id")["decision"] == "deny"
 
 
 def test_prior_judge_approval_cannot_bypass_mandatory_critical(client):
@@ -495,9 +496,10 @@ def test_prior_judge_approval_cannot_bypass_mandatory_critical(client):
     denied = evaluate(client, command="sudo id")
     # Prior judge resolution (e.g. from a less restrictive deployment) is not
     # human approval of the current mandatory deny rule.
-    AuditStore(_get_db()).resolve_escalation(
-        denied["call_id"], "approve", user_id="owner", resolved_by="judge"
-    )
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        AuditStore(_get_db()).resolve_escalation(
+            denied["call_id"], "approve", user_id="owner", resolved_by="judge"
+        )
     assert evaluate(client, command="sudo id")["decision"] == "deny"
 
 

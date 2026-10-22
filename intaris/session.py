@@ -239,6 +239,7 @@ class SessionStore:
         if intention is not None:
             sets.append("intention = ?")
             params.append(intention)
+            sets.append("intent_profile = NULL")
         if details is not None:
             sets.append("details = ?")
             params.append(json.dumps(details))
@@ -445,11 +446,18 @@ class SessionStore:
         expected_user_message_seq: int | None = None,
         guard_user_message_seq: bool = False,
         require_no_user_message: bool = False,
+        intent_profile: dict[str, Any] | None = None,
     ) -> bool:
         """Persist a generated intention only while its durable guard holds."""
         now = datetime.now(timezone.utc).isoformat()
         conditions = ["session_id = ?", "user_id = ?"]
-        params: list[Any] = [intention, intention_source, title, now]
+        params: list[Any] = [
+            intention,
+            intention_source,
+            title,
+            now,
+            json.dumps(intent_profile) if intent_profile is not None else None,
+        ]
         condition_params: list[Any] = [session_id, user_id]
         if guard_user_message_seq:
             if expected_user_message_seq is None:
@@ -466,7 +474,7 @@ class SessionStore:
                 """
                 UPDATE sessions
                 SET intention = ?, intention_source = ?,
-                    title = COALESCE(?, title), updated_at = ?
+                    title = COALESCE(?, title), updated_at = ?, intent_profile = ?
                 WHERE """
                 + " AND ".join(conditions),
                 params,
@@ -1061,7 +1069,7 @@ class SessionStore:
 def _row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, parsing JSON fields."""
     d = dict(row)
-    for json_field in ("details", "policy"):
+    for json_field in ("details", "policy", "intent_profile"):
         if d.get(json_field):
             try:
                 d[json_field] = json.loads(d[json_field])

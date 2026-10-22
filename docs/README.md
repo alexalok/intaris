@@ -12,6 +12,7 @@
 |---|---|
 | [Architecture](architecture.md) | System design, layer responsibilities, and key design decisions |
 | [Evaluation Pipeline](evaluation-pipeline.md) | How tool calls are classified, evaluated, and decided |
+| [Intent Evidence](intent-evidence.md) | Source-linked scope, revocations, hard prohibitions, and validation limits |
 | [Jev Evaluator](jev-evaluator.md) | Experimental L1 backend, Groq comparison, benchmark results, and deployment status |
 
 ## Reference

@@ -308,6 +308,32 @@ The terminal shim is verified against Hermes revision `63d0b94120027d487c9a5235b
 
 The host must grant `tools.override` (or `allow_tool_override: true`); the adapter checks that permission before installation. Legacy hosts without scoped execution middleware retain snapshot-only handler wrapping and an upgrade warning. Their copied entries retain result-size and dynamic-schema metadata where present; no startup or late-registration guarantee applies there.
 
+### Raw skill inspection
+
+With the matching Intaris server, the adapter converts the captured native
+`skill_view` into `skill_view_raw` for evaluation and reads only its resolved
+absolute file. The agent still calls `skill_view`. Dangerous skill text may be
+inspected; executing it requires a separately evaluated tool call. Native
+preprocessing, shell expansion, dependency installation, credential capture,
+quarantine scans, and usage/lifecycle hooks are not invoked. Template expressions
+remain literal. The in-memory background-review read marker is retained.
+
+Tool/path denies and `skill_view` review preferences apply to the raw operation.
+A registered tool cannot claim the reserved raw identity. Native `skill_view`
+without this adapter contract remains an ordinary evaluated loader. The service
+continues to trust authenticated adapters to report their actual operations.
+
+The raw reader is verified against the same Hermes revision above. It requires
+its exact `_skill_view_with_bump` handler, `_skill_lookup_path_error`,
+`_skill_search_dirs`, `_safe_frontmatter`, `_skill_linked_files`, and
+`_mark_background_review_read` helpers, plus POSIX `openat`/`O_NOFOLLOW` support.
+It consults already-registered plugin paths without loading plugins. Lookup
+uses names/paths and existing catalog metadata; uncached frontmatter aliases
+need the exact relative directory path. Unsupported host contracts retain normal
+evaluation. Directory and flat skills are supported; linked files belong only
+to directory skills.
+
+
 ### Latency on every tool call
 
 Every tool call goes through Intaris evaluation, adding network round-trip latency. Read-only tools are fast-pathed by Intaris (<1ms server-side), but the HTTP round-trip adds ~5-20ms depending on network conditions. Write operations that require LLM evaluation add up to 4 seconds.

@@ -430,20 +430,24 @@ def test_evaluator_routes_write_classification_to_jev() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-routing",
+        "user_id": "user-jev-routing",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-routing",
-            "user_id": "user-jev-routing",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-routing",
@@ -467,20 +471,24 @@ def test_evaluator_preserves_explicit_jev_escalation() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-escalation",
+        "user_id": "user-jev-escalation",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-escalation",
-            "user_id": "user-jev-escalation",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-escalation",
@@ -503,20 +511,24 @@ def test_evaluator_preserves_jev_diagnostics_after_decision_matrix() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-diagnostics",
+        "user_id": "user-jev-diagnostics",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-diagnostics",
-            "user_id": "user-jev-diagnostics",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-diagnostics",

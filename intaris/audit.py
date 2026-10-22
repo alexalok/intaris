@@ -30,6 +30,8 @@ _USABLE_APPROVAL_SOURCE = """(
           AND source.resolved_by = 'user' AND source.user_decision = 'approve'
           AND source.expired_at IS NULL
           AND source.approval_scope = 'reusable'
+          AND COALESCE(source.classification, '') != 'critical'
+          AND source.evaluation_path != 'critical'
     )
 )"""
 
@@ -95,6 +97,7 @@ class AuditStore:
         maximum_outcome: str | None = None,
         minimum_outcome: str | None = None,
         outcome_override: str | None = None,
+        intent_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -142,9 +145,9 @@ class AuditStore:
                      evaluation_path, decision, risk, reasoning, latency_ms,
                      args_hash, profile_version, intention, injection_detected,
                      raw_decision, effective_decision, maximum_outcome,
-                     minimum_outcome, outcome_override)
+                     minimum_outcome, outcome_override, intent_evidence)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -172,6 +175,9 @@ class AuditStore:
                     maximum_outcome,
                     minimum_outcome,
                     outcome_override,
+                    json.dumps(intent_evidence)
+                    if intent_evidence is not None
+                    else None,
                 ),
             )
 
@@ -223,6 +229,7 @@ class AuditStore:
             "tool": tool,
             "args_redacted": args_redacted,
             "content": content,
+            "intent_evidence": intent_evidence,
             "classification": classification,
             "evaluation_path": evaluation_path,
             "decision": decision,
@@ -476,6 +483,10 @@ class AuditStore:
                 WHERE user_id = ? AND session_id = ?
                   AND record_type = 'tool_call'
                   AND user_decision IS NOT NULL
+                  AND (user_decision = 'deny' OR (
+                      COALESCE(classification, '') != 'critical'
+                      AND evaluation_path != 'critical'
+                  ))
                   AND (expired_at IS NULL OR user_decision = 'deny')
                   AND resolved_by = 'user'
                   AND approval_scope = 'reusable'
@@ -488,6 +499,33 @@ class AuditStore:
             rows = cur.fetchall()
 
         return [_row_to_dict(row) for row in rows]
+
+    def get_intent_sources(
+        self, session_id: str, *, user_id: str, limit: int = 25
+    ) -> list[dict[str, Any]]:
+        """Get user-channel evidence without displacement by agent chatter."""
+        eligible = (
+            "COALESCE((args_redacted::jsonb -> 'intention_eligible')::text, 'null') != 'false'"
+            if self._db.backend == "postgresql"
+            else "COALESCE(json_type(args_redacted, '$.intention_eligible'), 'null') != 'false'"
+        )
+        with self._db.cursor() as cur:
+            cur.execute(
+                f"""SELECT * FROM audit_log
+                WHERE user_id = ? AND session_id = ? AND (
+                    (record_type = 'reasoning' AND substr(content, 1, 13) = 'User message:'
+                        AND {eligible})
+                    OR (record_type = 'tool_call' AND resolved_by = 'user'
+                        AND user_decision IS NOT NULL AND approval_scope = 'reusable'
+                        AND COALESCE(user_note, '') != 'Resolved via notification action link'
+                        AND (user_decision = 'deny' OR (
+                            expired_at IS NULL
+                            AND COALESCE(classification, '') != 'critical'
+                            AND evaluation_path != 'critical')))
+                ) ORDER BY COALESCE(resolved_at, timestamp) DESC, call_id DESC LIMIT ?""",
+                (user_id, session_id, limit),
+            )
+            return [_row_to_dict(row) for row in cur.fetchall()]
 
     def find_approved_escalation(
         self,
@@ -523,6 +561,8 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  AND COALESCE(classification, '') != 'critical'
+                  AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
                   AND expired_at IS NULL
                   AND {_USABLE_APPROVAL_SOURCE}
@@ -562,6 +602,8 @@ class AuditStore:
                 WHERE user_id = ? AND call_id IN ({placeholders})
                   AND record_type = 'tool_call'
                   AND user_decision = 'approve' AND expired_at IS NULL
+                  AND COALESCE(classification, '') != 'critical'
+                  AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
                   AND {_USABLE_APPROVAL_SOURCE}
                 """,
@@ -705,6 +747,10 @@ class AuditStore:
                   AND decision IN ('escalate', 'deny')
                   AND expired_at IS NULL
                   AND (user_decision IS NULL OR resolved_by = 'judge')
+                  AND (? != 'approve' OR (
+                      COALESCE(classification, '') != 'critical'
+                      AND evaluation_path != 'critical'
+                  ))
                   AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                   AND (CAST(? AS TEXT) IS NULL OR EXISTS (
@@ -713,7 +759,9 @@ class AuditStore:
                         AND source.session_id = audit_log.session_id
                         AND source.resolved_by = 'user'
                         AND source.user_decision = 'approve' AND source.expired_at IS NULL
-                         AND source.approval_scope = 'reusable'
+                        AND source.approval_scope = 'reusable'
+                        AND COALESCE(source.classification, '') != 'critical'
+                        AND source.evaluation_path != 'critical'
                   ))
                 """,
                 (
@@ -729,6 +777,7 @@ class AuditStore:
                     approval_source_call_id,
                     call_id,
                     user_id,
+                    user_decision,
                     int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
@@ -739,6 +788,13 @@ class AuditStore:
             if cur.rowcount == 0:
                 # Determine why the update failed for a clear error message
                 record = self.get_by_call_id(call_id, user_id=user_id)
+                if user_decision == "approve" and (
+                    record.get("classification") == "critical"
+                    or record.get("evaluation_path") == "critical"
+                ):
+                    raise ValueError(
+                        "Hard prohibition cannot be approved; change the rule and evaluate again"
+                    )
                 if record.get("expired_at"):
                     raise ApprovalExpiredError(
                         f"Call {call_id} expired; its invocation is no longer waiting"
@@ -1017,6 +1073,11 @@ class AuditStore:
 def _row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, parsing JSON fields."""
     d = dict(row)
+    if d.get("intent_evidence"):
+        try:
+            d["intent_evidence"] = json.loads(d["intent_evidence"])
+        except (json.JSONDecodeError, TypeError):
+            d["intent_evidence"] = None
     if d.get("args_redacted"):
         try:
             d["args_redacted"] = json.loads(d["args_redacted"])

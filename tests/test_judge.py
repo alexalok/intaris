@@ -152,9 +152,9 @@ def test_judge_maximum_outcome_uses_call_snapshot(
         session_id="test-session",
         agent_id=None,
         tool="bash",
-        args_redacted={"command": "rm -rf /"},
-        classification="critical",
-        evaluation_path="critical",
+        args_redacted={"command": "rm -rf /tmp/build"},
+        classification="write",
+        evaluation_path="llm",
         decision="escalate",
         raw_decision="deny",
         maximum_outcome="escalate",
@@ -1622,10 +1622,10 @@ class TestJudgeReviewer:
 
         asyncio.run(_test())
 
-    def test_advisory_low_risk_defer_becomes_approve(
+    def test_advisory_low_risk_defer_remains_for_human_review(
         self, mock_llm, audit_store, session_store, mock_evaluator, mock_metrics
     ):
-        """In advisory mode, low-risk defer is auto-approved."""
+        """In advisory mode, low-risk defer preserves scope uncertainty."""
 
         async def _test():
             _create_session(session_store)
@@ -1656,18 +1656,18 @@ class TestJudgeReviewer:
             )
 
             record = audit_store.get_by_call_id("test-call", user_id="test-user")
-            assert record["user_decision"] == "approve"
-            assert record["resolved_by"] == "judge"
-            assert record["judge_decision"] == "approve"
+            assert record["user_decision"] is None
+            assert record["resolved_by"] is None
+            assert record["judge_decision"] == "defer"
             assert record["judge_risk"] == "low"
-            assert "auto-approved low-risk call" in record["judge_reasoning"]
+            assert mock_metrics.judge_deferrals_total == 1
 
         asyncio.run(_test())
 
-    def test_advisory_low_risk_deny_becomes_approve(
+    def test_advisory_low_risk_deny_remains_for_human_review(
         self, mock_llm, audit_store, session_store, mock_evaluator, mock_metrics
     ):
-        """In advisory mode, low-risk deny is auto-approved."""
+        """In advisory mode, low-risk deny preserves scope uncertainty."""
 
         async def _test():
             _create_session(session_store)
@@ -1698,11 +1698,11 @@ class TestJudgeReviewer:
             )
 
             record = audit_store.get_by_call_id("test-call", user_id="test-user")
-            assert record["user_decision"] == "approve"
-            assert record["resolved_by"] == "judge"
-            assert record["judge_decision"] == "approve"
+            assert record["user_decision"] is None
+            assert record["resolved_by"] is None
+            assert record["judge_decision"] == "defer"
             assert record["judge_risk"] == "low"
-            assert "auto-approved low-risk call" in record["judge_reasoning"]
+            assert mock_metrics.judge_deferrals_total == 1
 
         asyncio.run(_test())
 
@@ -1871,7 +1871,7 @@ class TestJudgeReviewer:
             assert "unambiguously operationally dangerous" in system_content
             # Risk-level guidance for low-risk approvals
             assert "Low risk" in system_content
-            assert "Approve by default" in system_content
+            assert "Low risk does not itself grant authority" in system_content
 
         asyncio.run(_test())
 
@@ -3014,12 +3014,12 @@ def _create_denied_record(
     audit_store,
     call_id="deny-call",
     user_id="test-user",
-    evaluation_path="critical",
-    classification="critical",
-    risk="critical",
+    evaluation_path="llm",
+    classification="write",
+    risk="high",
     args_hash=None,
 ):
-    """Helper to create a denied audit record."""
+    """Create a model denial, which remains subject to human override."""
     return audit_store.insert(
         call_id=call_id,
         user_id=user_id,

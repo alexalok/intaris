@@ -159,7 +159,7 @@ intaris/
 
 9. **User-driven intention model**: Session intention is immutable except by user action. Agent tool calls never redefine intention. The `IntentionBarrier` pattern ensures the evaluator sees the freshest user-stated intention by coordinating between `/reasoning` (trigger) and `/evaluate` (wait). See [Intention Model](#intention-model) below.
 
-10. **Judge auto-resolution**: Escalated tool calls can be automatically reviewed by a more capable LLM (judge). Fail-open design — judge LLM failure leaves escalation for human review. Deny-if-uncertain in auto mode. Defer-preferring in advisory mode — only unambiguously dangerous calls are denied; everything borderline goes to the human. Shared `resolve_with_side_effects()` handler ensures human and judge resolution paths have identical side effects. Human users can override any judge decision (deny→approve or approve→deny) via the UI; human decisions are final. See [Judge Auto-Resolution](#judge-auto-resolution) below.
+10. **Judge auto-resolution**: Escalated tool calls can be automatically reviewed by a more capable LLM (judge). Fail-open design — judge LLM failure leaves escalation for human review. Deny-if-uncertain in auto mode. Defer-preferring in advisory mode — only unambiguously dangerous calls are denied; everything borderline goes to the human. Shared `resolve_with_side_effects()` handler ensures human and judge resolution paths have identical side effects. Human users can override non-critical judge decisions (deny→approve or approve→deny) via the UI; human decisions are final. See [Judge Auto-Resolution](#judge-auto-resolution) below.
 
 ## Multi-tenancy
 
@@ -642,10 +642,10 @@ When `working_directory` is set in session details (sent by integrations at sess
 | 1 | Session policy `deny_tools` / `deny_commands` | CRITICAL |
 | **1.5** | **Session policy `deny_paths` (fnmatch on resolved paths)** | **CRITICAL** |
 | 2 | Tool preference deny | CRITICAL |
+| 2.5 | Critical commands (bash/terminal) | CRITICAL |
 | 3 | Tool preference escalate | ESCALATE |
 | 4 | Session policy `allow_tools` / `allow_commands` | READ |
 | 5 | Tool preference auto-approve | READ |
-| 6 | Critical patterns (bash) | CRITICAL |
 | 7 | Read-only allowlist | READ |
 | **7.5** | **Path outside project (not in `allow_paths`)** | **WRITE** |
 | 8 | Default | WRITE |
@@ -752,25 +752,25 @@ These are separate from the standard event types (`escalation`, `resolution`, `d
 - **MCP proxy coverage**: Both REST API and MCP proxy escalation paths trigger the judge.
 - **Race condition handling**: If a human resolves before the judge, the atomic WHERE guard prevents double-resolution. The judge catches the `ValueError` and exits gracefully.
 - **Fail-open**: If the judge LLM fails, the escalation remains unresolved for human review. A notification is sent if `notify_mode` allows.
-- **Human override of judge decisions**: Humans can override any judge-resolved decision (deny→approve or approve→deny) via `POST /decision`. The `resolve_escalation()` WHERE clause matches `(user_decision IS NULL OR resolved_by = 'judge')`, allowing re-resolution of judge decisions while keeping human decisions final. `COALESCE(...)` preserves the judge's historical assessment when a human overrides. The UI shows an "Override" button on judge-resolved records in the Resolved section, with an "overridden by user" indicator only when the audit row carries an explicit prior judge resolution (`judge_decision` of `approve` or `deny`). Advisory deferrals keep their judge reasoning visible without being mislabeled as overrides.
+- **Human override of judge decisions**: Humans can override non-critical judge-resolved decisions (deny→approve or approve→deny) via `POST /decision`. The `resolve_escalation()` WHERE clause matches `(user_decision IS NULL OR resolved_by = 'judge')`, allowing re-resolution of judge decisions while keeping human decisions final. `COALESCE(...)` preserves the judge's historical assessment when a human overrides. The UI shows an "Override" button on judge-resolved records in the Resolved section, with an "overridden by user" indicator only when the audit row carries an explicit prior judge resolution (`judge_decision` of `approve` or `deny`). Advisory deferrals keep their judge reasoning visible without being mislabeled as overrides.
 
 ### Ex-post denial overrides (L1 denials)
 
-Parallel to the judge override flow, humans can also override L1 denials — tool calls denied by the critical classifier or LLM evaluation before reaching the judge layer. This provides a recovery path when a critical action is denied but the user explicitly confirms it afterward.
+Humans can override model-assessed L1 denials. Classifier CRITICAL is a hard prohibition and cannot be approved by humans, Judge, caps, cached approvals, or retry. Configured deny rules must be changed by their operator before evaluating a new call. See [Source-linked intent and scoped authorization](docs/intent-evidence.md).
 
 **Flow:**
-1. Tool call denied (critical auto-deny or LLM deny) → audit record with `decision='deny'`, `args_hash` set.
+1. Tool call denied by LLM evaluation → audit record with `decision='deny'`, `args_hash` set.
 2. User approves via `POST /decision` (same endpoint as escalation resolution) → `user_decision='approve'`, `resolved_by='user'`.
 3. Agent retries the same command → evaluator finds the prior approval via `args_hash` (same retry mechanism as escalation retry) → auto-approves within 10 minutes.
 
 **Implementation details:**
 - `resolve_escalation()` SQL WHERE clause: `decision IN ('escalate', 'deny')` — accepts both escalations and denials.
-- The evaluator calls `_check_escalation_retry()` before CRITICAL auto-deny and before LLM evaluation for WRITE classifications.
+- The evaluator handles CRITICAL before retry and allow paths. WRITE retries refuse newer user evidence, incomplete evidence, and parent scope.
 - Session-status denials (completed/suspended/terminated) are NOT overridable in the UI — they lack `args_hash` (computed after the early-return session status check) and are filtered from the "Recent Denials" section by `evaluation_path !== 'fast'`.
 - Human decisions on denials are final (`resolved_by='user'` is not re-resolvable).
 - The original `decision='deny'` column is preserved; `user_decision` records the override.
 
-**UI:** The Approvals tab includes a "Recent Denials" section showing overridable denials (evaluation_path `critical` or `llm`) with Approve/Confirm Deny buttons.
+**UI:** The Approvals tab includes a "Recent Denials" section showing overridable model denials (evaluation_path `llm`) with Approve/Confirm Deny buttons.
 
 ### Database columns
 
@@ -1060,10 +1060,10 @@ Tool preferences (`mcp_tool_preferences` table) allow per-tool overrides of the 
 
 1. Session policy deny → **DENY**
 2. Tool preference deny → **DENY**
+2.5. Critical commands → **CRITICAL** (non-overridable)
 3. Tool preference escalate → **ESCALATE**
 4. Session policy allow → classification from allowlist/patterns
 5. Tool preference auto-approve → **READ** (skip LLM)
-6. Critical patterns → **CRITICAL**
 7. Read-only allowlist → **READ**
 8. Default → **WRITE** (goes through LLM evaluation)
 

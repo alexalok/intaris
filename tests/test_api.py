@@ -805,7 +805,8 @@ def test_maximum_outcome_critical_and_hard_stops(client_no_auth):
     body = {"session_id": "critical", "tool": "bash", "args": {"command": "rm -rf /"}}
     result = client.post("/api/v1/evaluate", headers=headers, json=body).json()
     assert result["raw_decision"] == "deny"
-    assert result["decision"] == "approve"
+    assert result["decision"] == "deny"
+    assert result["outcome_override"] == "hard_stop.classifier_critical"
     body.update(minimum_outcome="escalate", approval_call_id=result["call_id"])
     assert (
         client.post("/api/v1/evaluate", headers=headers, json=body).json()["decision"]
@@ -966,7 +967,7 @@ def test_maximum_outcome_validation_and_refresh(client_no_auth):
     client.post("/api/v1/intention", headers=headers, json=body).raise_for_status()
     call = {"session_id": "refresh", "tool": "bash", "args": {"command": "rm -rf /"}}
     first = client.post("/api/v1/evaluate", headers=headers, json=call).json()
-    assert first["decision"] == "approve"
+    assert first["decision"] == "deny"
     assert (
         client.patch(
             "/api/v1/session/refresh",

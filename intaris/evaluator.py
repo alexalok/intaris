@@ -48,6 +48,7 @@ from intaris.decision import (
     clamp_outcome,
     make_fast_decision,
 )
+from intaris.intent_evidence import allows_legacy_precedent, collect_intent_evidence
 from intaris.llm import LLMClient, parse_json_response
 from intaris.policy import effective_policy_for_evaluator, policy_for_session
 from intaris.precedent import find_authoritative_precedent
@@ -390,6 +391,7 @@ class Evaluator:
                     session_id, "active", user_id=user_id, agent_request=restricted
                 )
                 session_status = "active"
+                session["status"] = session_status
                 logger.debug("Auto-resumed idle session %s", session_id)
             except PermissionError:
                 # A concurrent operator stop won the conditional update.
@@ -764,26 +766,10 @@ class Evaluator:
                     )
             decision = make_fast_decision("read", reasoning)
         elif classification == Classification.CRITICAL:
-            # Check for prior approved override before auto-deny.
-            # If the user explicitly approved the exact same command
-            # (via denial override), bypass the critical auto-deny.
-            retry_decision = (
-                self._check_escalation_retry(
-                    user_id=user_id,
-                    tool=tool,
-                    args_hash=args_hash,
-                    human_only=restricted,
-                )
-                if minimum_outcome is None and not unattended
-                else None
+            decision = make_fast_decision(
+                "critical",
+                f"Hard prohibition: critical pattern or explicit deny rule for {tool}",
             )
-            if retry_decision is not None:
-                decision = retry_decision
-            else:
-                decision = make_fast_decision(
-                    "critical",
-                    f"Critical pattern detected in {tool} call",
-                )
         elif classification == Classification.ESCALATE:
             # Check escalation retry: reuse prior approval if same
             # tool+args was approved within the TTL window.
@@ -793,6 +779,7 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                     human_only=restricted,
+                    session_id=session_id,
                 )
                 if minimum_outcome is None and not unattended
                 else None
@@ -814,6 +801,7 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                     human_only=restricted,
+                    session_id=session_id,
                 )
                 if minimum_outcome is None and not unattended
                 else None
@@ -832,7 +820,10 @@ class Evaluator:
                 )
 
         raw_decision = decision.decision
-        decision.decision = cap_outcome(raw_decision, maximum_outcome)
+        hard_prohibition = classification == Classification.CRITICAL
+        decision.decision = (
+            "deny" if hard_prohibition else cap_outcome(raw_decision, maximum_outcome)
+        )
         policy_overrode = decision.decision != raw_decision
         outcome_override = "session_policy.maximum_outcome" if policy_overrode else None
 
@@ -876,6 +867,7 @@ class Evaluator:
 
         if (
             unattended
+            and not hard_prohibition
             and judge_unattended
             and minimum_outcome is None
             and raw_decision in {"deny", "escalate"}
@@ -896,6 +888,18 @@ class Evaluator:
             decision.reasoning = (
                 f"{decision.reasoning} Escalation is disabled for this unattended task."
             )
+
+        if hard_prohibition:
+            decision.decision = "deny"
+            decision.approval_call_id = None
+            outcome_override = "hard_stop.classifier_critical"
+
+        if decision.evidence_changed and not hard_prohibition:
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.approval_call_id = None
+            outcome_override = "intent_evidence_changed"
 
         # Learn from LLM approvals: cache path prefixes for path-reclassified
         # calls so subsequent reads to the same directory are fast-pathed.
@@ -952,6 +956,7 @@ class Evaluator:
             maximum_outcome=maximum_outcome,
             minimum_outcome=minimum_outcome,
             outcome_override=outcome_override,
+            intent_evidence=decision.intent_evidence,
         )
 
         # Step 8: Update session counters
@@ -1070,6 +1075,7 @@ class Evaluator:
         tool: str,
         args_hash: str,
         human_only: bool = False,
+        session_id: str | None = None,
     ) -> Decision | None:
         """Check if a prior escalation or denial for the same tool+args was approved.
 
@@ -1103,6 +1109,26 @@ class Evaluator:
 
         if row is not None:
             prior_call_id = row["call_id"]
+            if session_id is not None:
+                prior = self._audit.get_by_call_id(prior_call_id, user_id=user_id)
+                current = collect_intent_evidence(
+                    self._sessions.get(session_id, user_id=user_id), self._audit
+                )
+                if (
+                    any(
+                        source["kind"] == "user_message"
+                        and (
+                            prior["session_id"] != session_id
+                            or source["timestamp"]
+                            > (prior.get("resolved_at") or prior["timestamp"])
+                        )
+                        for source in current["sources"]
+                    )
+                    or not current["complete"]
+                    or current.get("parent")
+                    or current.get("parent_unavailable")
+                ):
+                    return None
             logger.info(
                 "Escalation retry: reusing approval from %s for %s",
                 prior_call_id,
@@ -1368,6 +1394,7 @@ class Evaluator:
         )
 
         effective_policy = effective_policy_for_evaluator(session.get("policy"))
+        intent_evidence = collect_intent_evidence(session, self._audit)
         session_stats = {
             "total_calls": session.get("total_calls", 0),
             "approved_count": session.get("approved_count", 0),
@@ -1386,6 +1413,7 @@ class Evaluator:
             agent_id=agent_id,
             context=context,
             parent_intention=parent_intention,
+            intent_evidence=intent_evidence,
         )
 
         messages = [
@@ -1403,6 +1431,7 @@ class Evaluator:
                 evaluation = self._jev.evaluate_tool_call(
                     state={
                         "intention": session["intention"],
+                        "intent_evidence": intent_evidence,
                         "effective_policy": effective_policy,
                         "parent_intention": parent_intention,
                         "recent_history": recent_history,
@@ -1441,12 +1470,28 @@ class Evaluator:
                 user_decisions = self._audit.get_user_decisions(
                     session_id, user_id=user_id, limit=5
                 )
-            evaluation = _apply_authoritative_user_precedent(
-                evaluation,
-                tool=tool,
-                args_redacted=args_redacted,
-                user_decisions=user_decisions,
+            if allows_legacy_precedent(intent_evidence):
+                evaluation = _apply_authoritative_user_precedent(
+                    evaluation,
+                    tool=tool,
+                    args_redacted=args_redacted,
+                    user_decisions=user_decisions,
+                )
+            current_session = self._sessions.get(session_id, user_id=user_id)
+            current_session["policy"] = policy_for_session(
+                current_session, self._agent_policy
             )
+            current_evidence = collect_intent_evidence(current_session, self._audit)
+            if current_evidence["fingerprint"] != intent_evidence["fingerprint"]:
+                return Decision(
+                    decision="escalate",
+                    risk=evaluation.risk,
+                    reasoning="User scope or policy changed during evaluation; review current evidence.",
+                    path="llm",
+                    metadata=evaluation.metadata,
+                    intent_evidence=intent_evidence,
+                    evidence_changed=True,
+                )
             if self._jev is not None and evaluation.decision == "escalate":
                 return Decision(
                     decision="escalate",
@@ -1454,11 +1499,13 @@ class Evaluator:
                     reasoning=evaluation.reasoning,
                     path="llm",
                     metadata=evaluation.metadata,
+                    intent_evidence=intent_evidence,
                 )
 
             decision = apply_decision_matrix(evaluation)
             decision.metadata = evaluation.metadata
             decision.approval_call_id = evaluation.approval_call_id
+            decision.intent_evidence = intent_evidence
             return decision
 
         except Exception:

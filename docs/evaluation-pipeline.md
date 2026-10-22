@@ -66,13 +66,17 @@ Checked in order -- first match wins:
 | 1 | Session policy `deny_tools` / `deny_commands` | **CRITICAL** | Admin-defined deny rules |
 | 1.5 | Session policy `deny_paths` | **CRITICAL** | Filesystem path deny (fnmatch) |
 | 2 | Tool preference deny | **CRITICAL** | Per-tool MCP preference |
+| 2.5 | Critical command detection (bash/terminal) | **CRITICAL** | Non-overridable destructive operations |
 | 3 | Tool preference escalate | **ESCALATE** | Per-tool MCP preference |
 | 4 | Session policy `allow_tools` / `allow_commands` / `allow_scripts` | **READ** | Admin-defined allow rules; script allowances require an exact path and a literal Python invocation |
 | 5 | Tool preference auto-approve | **READ** | Per-tool MCP preference |
-| 6 | Critical pattern detection (bash) | **CRITICAL** | Dangerous commands (rm -rf, etc.) |
 | 7 | Built-in read-only allowlist | **READ** | Known safe tools and commands |
 | 7.5 | Path outside project boundary | **WRITE** | Forces LLM evaluation for out-of-project reads |
 | 8 | Default | **WRITE** | Everything else goes through LLM |
+
+Classifier `CRITICAL` is a hard prohibition, checked before all allow paths. Neither
+outcome caps, cached approval, Judge, nor human resolution can approve it. See
+[Source-linked intent](intent-evidence.md) for authority and evidence semantics.
 
 ### Read-Only Allowlist
 

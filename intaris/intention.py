@@ -27,6 +27,12 @@ from typing import Any, Callable
 
 from intaris.audit import AuditStore
 from intaris.db import Database
+from intaris.intent_evidence import (
+    GENERATION_RULES,
+    collect_intent_evidence,
+    render_intent_evidence,
+    validate_profile,
+)
 from intaris.llm import LLMClient
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
@@ -175,6 +181,7 @@ def generate_intention(
     # is the trusted intention channel; keep prefixes such as
     # ``User message:`` intact so the model can distinguish sources.
     audit_store = AuditStore(db)
+    evidence = collect_intent_evidence(session, audit_store)
     recent_tools = audit_store.get_recent(
         session_id, user_id=user_id, limit=10, record_type="tool_call"
     )
@@ -246,6 +253,7 @@ def generate_intention(
     current_title = session.get("title")
     current_intention = session.get("intention", "unknown")
     prompt_parts = [f"Working directory: {sanitize_for_prompt(wd)}"]
+    prompt_parts.append(render_intent_evidence(evidence))
 
     if latest_user_message:
         safe_latest = sanitize_for_prompt(latest_user_message)
@@ -326,9 +334,11 @@ def generate_intention(
             "content": (
                 "You update a session's title and intention description. "
                 "Sessions are long-lived and cover multiple topics over time.\n\n"
-                "Output a JSON object with exactly two fields:\n"
+                "Output a JSON object with title, intention, and facts:\n"
                 '{"title": "short topic label", '
-                '"intention": "updated intention description"}\n\n'
+                '"intention": "updated intention description", "facts": []}\n\n'
+                + GENERATION_RULES
+                + "\n"
                 "Title rules:\n"
                 "- 50 characters or less, single line\n"
                 "- Describe what the user is working on, not tools used\n"
@@ -384,8 +394,21 @@ def generate_intention(
     ]
 
     try:
-        raw = llm.generate(messages, max_tokens=500)
+        raw = llm.generate(messages, max_tokens=4096)
         title, intention = _parse_title_intention(raw, current_title)
+        # Legacy plain-text and two-field responses remain valid. Preserve
+        # still-current restrictions, never infer facts from that summary.
+        facts = []
+        try:
+            payload = raw.strip()
+            if payload.startswith("```"):
+                payload = "\n".join(payload.splitlines()[1:]).rsplit("```", 1)[0]
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                facts = parsed.get("facts", [])
+        except (TypeError, ValueError):
+            pass
+        profile = validate_profile(facts, evidence, session.get("intent_profile"))
         if not intention or len(intention) < 5:
             logger.info(
                 "LLM returned too-short intention (%d chars) for session=%s",
@@ -405,9 +428,6 @@ def generate_intention(
                 session_id,
             )
             return None
-        if freshness_check is not None and not freshness_check():
-            return None
-
         expected_user_message_seq = source_event_seq
         guard_user_message_seq = intention_source == "user"
         if guard_user_message_seq and source_event_seq is None:
@@ -421,6 +441,7 @@ def generate_intention(
             expected_user_message_seq=expected_user_message_seq,
             guard_user_message_seq=guard_user_message_seq,
             require_no_user_message=intention_source == "bootstrap",
+            intent_profile=profile,
         )
         if not updated:
             logger.info(

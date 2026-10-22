@@ -382,6 +382,10 @@ class Database:
 
     def _migrate_sqlite(self, conn: sqlite3.Connection) -> None:
         """Run schema migrations for SQLite backend."""
+        if not self._sqlite_column_exists(conn, "sessions", "intent_profile"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN intent_profile TEXT")
+        if not self._sqlite_column_exists(conn, "audit_log", "intent_evidence"):
+            conn.execute("ALTER TABLE audit_log ADD COLUMN intent_evidence TEXT")
         if not self._sqlite_column_exists(
             conn, "mcp_servers", "trust_readonly_annotations"
         ):
@@ -979,6 +983,8 @@ class Database:
         try:
             # All columns that may need adding (idempotent with IF NOT EXISTS)
             migrations = [
+                ("sessions", "intent_profile", "TEXT"),
+                ("audit_log", "intent_evidence", "TEXT"),
                 (
                     "mcp_servers",
                     "trust_readonly_annotations",
