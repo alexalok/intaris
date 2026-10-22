@@ -24,6 +24,12 @@ Date: 2026-10-22. Follow-up to the [supporting-read report](2026-10-22-supportin
 
 ## Method and limits
 
+The model replay below is frozen at the source published as `4d39da2`. The
+later deterministic review follow-up at the end of this report changes launcher
+inspection and skill path retention only. It does not rerun model inference;
+all other server source hashes, including prompts, thresholds, evidence, and
+Judge routing, match the frozen replay source.
+
 The final replay uses a frozen copy of the corrected server source, 14 fixed-label
 synthetic controls, and historical #149/#162 with original and saved regenerated
 intent/profile. Historical inputs use the existing immutable snapshot with only
@@ -103,3 +109,34 @@ Private evidence lives in Git-ignored runs/codex-review-20261022: both inference
 phases, frozen source, exact scripts, labels, decisions/reasoning, test receipts,
 historical source hashes, and SHA-256 manifest. Directories are mode 0700 and
 files 0600. Credentials are not saved. Earlier bundles remain unchanged.
+
+
+## Additional deterministic review follow-up
+
+Codex re-review found two gaps after the first fixes:
+
+- `find` execution actions and `xargs` could hide literal prohibited commands
+  behind broad allow rules. The recognizer now inspects their launched argv,
+  including nested commands and GNU/BSD option operands. Data arguments,
+  predicate values, help/version output, and bounded cleanup remain outside
+  hard denial. `xargs` input is not treated as shell source. This remains a
+  bounded literal recognizer, not an interpreter for input-driven commands.
+- Skill selection resolved canonical paths again after containment checks,
+  allowing a directory replacement to move both the target and its boundary.
+  Canonical candidates now remain unchanged through selection and approval.
+  Linked files resolve against the pinned directory, and no-follow component
+  opens reject subsequent replacements. Registered symlink roots and safe
+  internal aliases still work.
+
+The new regressions first reproduced 56 server failures and three skill-read
+failures. A GNU optional-argument control reproduced two additional failing
+variants before correction. Final verification passed 3,335 server tests
+(68 external E2E tests deselected, two existing WebSocket warnings), 1,198
+Hermes tests against the same pinned host, scoped Ruff lint/format, and Git
+whitespace checks. Benign command text, bounded cleanup, and valid aliases
+are included alongside hard-stop and directory/ancestor replacement cases.
+No recorded shell command executes during these tests.
+
+Private follow-up receipts, regressions, scripts, and source hashes live in
+Git-ignored `runs/codex-review-20261022-round3`, with directories mode 0700 and
+files 0600. The prior inference and historical evidence bundles are unchanged.
