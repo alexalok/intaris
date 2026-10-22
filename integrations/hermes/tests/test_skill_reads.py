@@ -378,3 +378,71 @@ def test_candidate_symlink_swap_cannot_change_validated_target(
     assert "Private instructions" not in json.dumps(result)
     assert result.get("content") == "Original instructions" or "error" in result
     assert skill_host.activated == []
+
+
+@pytest.mark.parametrize("kind", ["directory", "ancestor", "flat-file", "linked-file"])
+def test_canonical_path_swap_cannot_redefine_validated_boundary(
+    skill_host, scripted_http, monkeypatch, kind
+):
+    original = skill_host.root / (
+        "original.md" if kind == "flat-file" else "original/SKILL.md"
+    )
+    original.parent.mkdir(exist_ok=True)
+    original.write_text("Original instructions")
+    outside = skill_host.root.parent / "private"
+    outside.mkdir()
+    if kind == "flat-file":
+        target = original
+        replacement = outside / "secret.md"
+        replacement.write_text("Private instructions")
+    elif kind == "ancestor":
+        target = skill_host.root
+        replacement = outside
+        replacement.joinpath("original").mkdir()
+        replacement.joinpath("original/SKILL.md").write_text("Private instructions")
+    else:
+        target = original.parent
+        replacement = outside
+        replacement.joinpath("SKILL.md").write_text("Private instructions")
+        original.parent.joinpath("guide.md").write_text("Original instructions")
+        replacement.joinpath("guide.md").write_text("Private instructions")
+    resolve = Path.resolve
+    swapped = False
+
+    def replacing(path, *args, **kwargs):
+        nonlocal swapped
+        result = resolve(path, *args, **kwargs)
+        # Swap after the candidate directory (or flat file) is canonicalized,
+        # so its old canonical spelling is what passed the containment check.
+        trigger = original if kind == "flat-file" else original.parent
+        if path == trigger and not swapped:
+            target.rename(target.with_name(target.name + "-saved"))
+            target.symlink_to(replacement, target_is_directory=kind != "flat-file")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(Path, "resolve", replacing)
+    transport = scripted_http({"decision": "approve", "call_id": "canonical-swap"})
+    args = {"name": "original"}
+    if kind == "linked-file":
+        args["file_path"] = "guide.md"
+    result = skill_host.call(args)
+    assert swapped
+    assert "Private instructions" not in json.dumps(result)
+    assert "error" in result
+    assert skill_host.activated == skill_host.marks == []
+    for request in transport.call_args_list:
+        evaluation = json.loads(request.args[0].data)
+        assert not Path(evaluation["args"]["path"]).is_relative_to(outside)
+
+
+def test_linked_symlinks_within_skill_remain_readable(skill_host, scripted_http):
+    folder = skill_host.root / "example"
+    folder.mkdir()
+    folder.joinpath("SKILL.md").write_text("Instructions")
+    folder.joinpath("guide.md").write_text("Reference evidence")
+    folder.joinpath("alias.md").symlink_to(folder / "guide.md")
+    scripted_http({"decision": "approve", "call_id": "linked-alias"})
+    result = skill_host.call({"name": "example", "file_path": "alias.md"})
+    assert result["content"] == "Reference evidence"
+    assert skill_host.activated == []

@@ -225,8 +225,10 @@ def prepare_skill_read(
         ):
             skill_md = plugins.get_plugin_manager().find_plugin_skill(name)
             if skill_md is not None:
-                skill_md = Path(skill_md)
-                skill_dir = skill_md.parent
+                # The registered plugin location supplies its own boundary.
+                # Pin it before resolving the target, just like search roots.
+                skill_dir = Path(skill_md).parent.resolve(strict=True)
+                skill_md = Path(skill_md).resolve(strict=True)
     if skill_md is None:
         roots, _active = host._skill_search_dirs()
         directories = [Path(directory) for _tier, directory in roots]
@@ -265,7 +267,7 @@ def prepare_skill_read(
                 "Skill not found; use its exact relative library path for an uncached alias"
             )
         tier = min(entry[0] for entry in ranked)
-        matches = {entry[2].resolve(): entry for entry in ranked if entry[0] == tier}
+        matches = {entry[2]: entry for entry in ranked if entry[0] == tier}
         if len(matches) != 1:
             raise ValueError(
                 "Ambiguous skill name; use its exact relative library path"
@@ -274,10 +276,12 @@ def prepare_skill_read(
 
     if file_path and skill_dir is None:
         raise ValueError("Legacy flat skill has no linked-file directory")
-    skill_dir = Path(skill_dir).resolve() if skill_dir is not None else None
-    target = (skill_dir / file_path) if file_path else Path(skill_md)
-    target = target.resolve(strict=True)
-    boundary = skill_dir or Path(skill_md).parent.resolve()
+    # Canonical candidates and their boundaries were validated above. Never
+    # resolve them again: a directory replacement must fail the no-follow open,
+    # not redefine what was approved. Only a newly requested linked target needs
+    # resolution, and its boundary remains the pinned original skill directory.
+    boundary = skill_dir or skill_md.parent
+    target = (skill_dir / file_path).resolve(strict=True) if file_path else skill_md
     if not target.is_relative_to(boundary):
         raise ValueError("Skill file resolves outside its directory")
     if not target.is_file():
