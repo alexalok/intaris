@@ -196,7 +196,12 @@ class JevClient:
             classification = self._classify(
                 state={
                     "evaluation_rules": evaluation_rules
-                    + ("\n" + SCOPE_RULES if state.get("intent_evidence") else ""),
+                    + (
+                        "\n" + SCOPE_RULES
+                        if state.get("intent_evidence")
+                        and SCOPE_RULES not in evaluation_rules
+                        else ""
+                    ),
                     "tool_call": state,
                 },
                 questions=questions,
