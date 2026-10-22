@@ -852,19 +852,20 @@ def test_conflicting_agent_credentials_rejected(client):
 @pytest.mark.parametrize("classification", ["write", "escalate"])
 @pytest.mark.parametrize("resolved_by", ["judge", "user"])
 @pytest.mark.parametrize("restricted", [True, False], ids=["restricted", "legacy"])
+@pytest.mark.parametrize("history_session", ["s", "history"])
 def test_retry_approval_identity_for_every_classification(
-    client, classification, resolved_by, restricted
+    client, classification, resolved_by, restricted, history_session
 ):
     import intaris.server as srv
     from intaris.audit import AuditStore
     from intaris.decision import Decision
 
-    create(client, "history", headers=ADMIN)
+    create(client, history_session, headers=ADMIN)
     evaluator = srv._get_evaluator()
     args = {"command": "touch /tmp/output"}
     prior = evaluator.evaluate(
         user_id="owner",
-        session_id="history",
+        session_id=history_session,
         agent_id="operator",
         tool="terminal",
         args=args,
@@ -873,7 +874,8 @@ def test_retry_approval_identity_for_every_classification(
     AuditStore(srv._get_db()).resolve_escalation(
         prior["call_id"], "approve", user_id="owner", resolved_by=resolved_by
     )
-    create(client, headers=AGENT if restricted else ADMIN)
+    if history_session != "s":
+        create(client, headers=AGENT if restricted else ADMIN)
     with patch.object(
         evaluator,
         "_llm_evaluate",
@@ -891,13 +893,14 @@ def test_retry_approval_identity_for_every_classification(
             restricted_agent=restricted,
         )
 
-    if restricted and resolved_by == "judge":
+    if history_session != "s" or (restricted and resolved_by == "judge"):
         assert result["decision"] == (
             "deny" if classification == "write" else "escalate"
         ), result
         if classification == "write":
             inference.assert_called_once()
-            assert inference.call_args.kwargs["session"]["policy"] == POLICY
+            if restricted:
+                assert inference.call_args.kwargs["session"]["policy"] == POLICY
         else:
             inference.assert_not_called()
     else:
