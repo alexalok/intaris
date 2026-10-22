@@ -362,3 +362,51 @@ would produce unoverridable false denials.
 
 Private receipts and source hashes are retained in Git-ignored
 `runs/codex-review-20261022-round9` (0700 directories, 0600 files).
+
+
+## Ancestor policy, lifecycle, and revocation follow-up
+
+The next Codex review identified four reproducible unsafe approval paths:
+
+- Literal `unshare` payloads were not unwrapped before command allowances.
+  The recognizer now follows required/optional option operands, clusters,
+  abbreviations, `--`, and default-shell stdin behavior from the
+  [util-linux source](https://kernel.googlesource.com/pub/scm/utils/util-linux/util-linux/+/refs/tags/v2.43-devel/sys-utils/unshare.c).
+  The initial test run had 135 failures and 53 passing controls; all 188 now
+  pass, including destructive execution, benign examples, and bounded cleanup.
+- A pending call could be approved after its session stopped. Approval now
+  checks active/idle status in the atomic write, with no automatic expiration.
+  Denial remains available. Suspended/terminated ancestors also block approval;
+  completed ancestors retain the existing child-lifecycle semantics.
+- An older exact approval could survive a newer human denial. Matching denials
+  now invalidate retry lookup, explicit IDs, path caches, human/Judge guidance,
+  retained profile references, and grants derived from the revoked human source.
+  The final derived-approval write checks the source again. Call-only denials
+  advance scope revisions; call-only approvals do not become reusable authority.
+  Both model-learned and callback-learned caches bind to the granted revisions.
+  Callback snapshots are captured inside the approval transaction after its own
+  revision increment; delayed learning cannot bind an old grant to new scope.
+- Stable ancestor deny rules were fingerprinted but not enforced on child calls.
+  Current tenant-scoped ancestor denies now reach classification, L1/Jev, Judge,
+  and pending approval validation. Parent allows and caps are not inherited.
+  Raw policy, adoption, parent links, lifecycle, and revisions are checked in
+  the approval write. Missing/cyclic/deeper ancestry cannot authorize execution.
+  Paths use the child's invocation directory; absolute denies need no cwd.
+  Relative targets lacking required cwd return a non-executable response.
+
+New checks cover both rejection and legitimate permission: active/idle approval,
+unchanged scope, unrelated/later approvals, tenant isolation, expired-denial
+revocation, exact timestamp ties, child versus parent directories, and empty
+semantic clauses preserving read fast paths. Concurrent changes are exercised
+before evaluation insertion, after approval validation, during source resolution,
+and between transaction commit and callback learning. SQLite transactions are
+executed; PostgreSQL row locking is implemented but no live PostgreSQL run was
+performed. No recorded destructive command was executed.
+
+Final deterministic verification: 4,102 server tests and 1,203 pinned Hermes
+tests passed. 68 external E2E cases remain excluded; two existing WebSocket
+warnings remain. Scoped Ruff lint/format and whitespace checks passed. No live
+service changed. Historical inference was not rerun; the selected frozen-source
+results above are not current population false-positive/negative measurements.
+Private scripts, receipts, source hashes, and manifest remain Git-ignored under
+`runs/codex-review-20261022-round10` (directories 0700, files 0600).

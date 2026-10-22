@@ -94,8 +94,9 @@ language; source binding proves provenance, not semantic correctness.
   takes priority, then retained restrictions. Over-budget text is omitted whole,
   with source IDs and `complete=false`; it is never clipped into permission.
   This is bounded evidence, not a claim to reproduce the full conversation.
-- Current ancestor evidence is included through four parent levels. Missing
-  parents and deeper chains are marked unavailable. Child requests cannot widen
+- Current ancestor evidence is included through four parent levels. Evaluation
+  and approval require a complete, tenant-scoped chain: missing, cyclic, or
+  deeper ancestry cannot authorize execution. Child requests cannot widen
   parent restrictions.
 - L1 stores its server-built snapshot in `audit_log.intent_evidence`. Judge
   collects fresh evidence and can see the original evaluation fingerprint.
@@ -148,6 +149,33 @@ than override the hard rule. No raw secrets are stored to enable review. Shell
 path checks retain the classifier's bounded literal parsing, not full expansion.
 Exact approval retries are confined to the same session: reconnecting with that
 session preserves usable grants, while a new session gets its own scope check.
+
+Ancestor `deny_tools`, `deny_commands`, `deny_paths`, and `deny_policies` are
+inherited by child evaluation and pending approval checks. Restricted ancestors
+use the server-owned policy. Parent allows, outcome caps, and interaction modes
+do not widen child permission. Path rules use the child's actual invocation
+and executor directory, never the parent's directory. Absolute targets remain
+checkable without cwd; unresolved relative targets under path denies return a
+non-executable response requesting sufficient executor metadata. Nonempty
+semantic deny clauses require model assessment even for otherwise read-only
+calls. Empty clauses do not disable read fast paths.
+
+An active or idle session can receive approval. A completed, suspended, or
+terminated session cannot; suspended or terminated ancestors also block child
+approval. Lifecycle, policy, ancestry, and revision comparisons share the atomic
+approval boundary. This is not expiration: records remain pending until explicitly
+resolved, and only client lifecycle signals expire invocations.
+
+A later human denial of the same tool and arguments in the same tenant/session
+invalidates older approval reuse, including explicit approval IDs, cached path
+permissions, and Judge grants derived from that human source. Call-only denials
+also invalidate matching old grants; call-only approvals create no reusable
+permission. Unrelated operations and newer human approvals retain their own
+scope. Historical audit rows remain unchanged. Path caches bind to the revisions
+observed when permission was granted. Callback learning uses a transient snapshot
+captured inside the approval transaction, so a delayed callback cannot stamp an
+old grant with newer authority. Reloaded records lacking that snapshot use fresh
+evaluation or exact retry rather than seeding a cache.
 
 Shell recognition distinguishes executable positions, literal wrappers,
 operators, quoted arguments, substitutions, and heredoc data. For example:
