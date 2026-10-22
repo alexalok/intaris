@@ -541,6 +541,9 @@ class TestLearnFromApprovedEscalation:
             "call_id": "approved-read",
             "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
+            "evaluation_context": {
+                "__intaris_evaluation_directory": "/Users/foo/src/intaris"
+            },
             "tool": "read",
             "args_redacted": {
                 "filePath": "/Users/foo/.cache/opencode/node_modules/pkg/index.js"
@@ -561,6 +564,9 @@ class TestLearnFromApprovedEscalation:
             "call_id": "approved-read",
             "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
+            "evaluation_context": {
+                "__intaris_evaluation_directory": "/Users/foo/src/intaris"
+            },
             "tool": "write",
             "args_redacted": {"filePath": "/tmp/output.txt", "content": "data"},
             "user_id": "user1",
@@ -590,6 +596,9 @@ class TestLearnFromApprovedEscalation:
             "call_id": "approved-read",
             "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
+            "evaluation_context": {
+                "__intaris_evaluation_directory": "/Users/foo/src/intaris"
+            },
             "tool": "read",
             "args_redacted": {"filePath": "/Users/foo/src/intaris/intaris/server.py"},
             "user_id": "user1",
@@ -606,6 +615,9 @@ class TestLearnFromApprovedEscalation:
             "call_id": "approved-read",
             "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
+            "evaluation_context": {
+                "__intaris_evaluation_directory": "/Users/foo/src/intaris"
+            },
             "tool": "read",
             "args_redacted": None,
             "user_id": "user1",
@@ -616,8 +628,8 @@ class TestLearnFromApprovedEscalation:
         key = ("user1", "session1")
         assert key not in evaluator._approved_paths
 
-    def test_ignores_no_working_directory(self, evaluator: Evaluator):
-        """Sessions without working_directory are ignored."""
+    def test_ignores_unknown_invocation_directory(self, evaluator: Evaluator):
+        """Unknown invocation directories cannot seed a reusable path grant."""
         evaluator._sessions.get_with_parent_policy.return_value = {  # type: ignore[attr-defined]
             "session_id": "session1",
             "user_id": "user1",
@@ -628,6 +640,7 @@ class TestLearnFromApprovedEscalation:
             "call_id": "approved-read",
             "_approval_scope_versions": {"session1": 1},
             "user_decision": "approve",
+            "evaluation_context": {"__intaris_evaluation_directory": None},
             "tool": "read",
             "args_redacted": {"filePath": "/tmp/file.txt"},
             "user_id": "user1",

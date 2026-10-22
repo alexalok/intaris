@@ -674,7 +674,7 @@ The evaluator maintains an in-memory cache of approved path prefixes per session
 
 **Two learning paths:**
 - **LLM approval**: When the LLM approves a path-reclassified read, the prefix is cached immediately in the evaluate pipeline.
-- **User-approved escalation**: When a user approves an escalated read via `POST /decision`, the endpoint calls `evaluator.learn_from_approved_escalation()` which extracts file paths from the audit record, looks up the session's `working_directory`, and caches the prefix.
+- **User-approved escalation**: When a user approves an escalated read via `POST /decision`, the endpoint calls `evaluator.learn_from_approved_escalation()`. It resolves audited paths against the evaluator-owned invocation-directory snapshot, including per-call context and shell `workdir`, and caches the prefix only while the approval's transaction scope remains current. Missing or invalid directory snapshots cannot seed the cache; current session defaults are not a substitute.
 
 **Prefix computation** uses a depth-aware heuristic:
 - **Sibling projects** (deep common ancestor with `working_directory`): prefix is one level deeper than the common ancestor. E.g., working in `/src/mnemory`, reading `/src/intaris/file.py` → prefix `/src/intaris`.

@@ -1491,9 +1491,18 @@ class Evaluator:
             or session["_scope_versions"] != granted_scope
         ):
             return
-        details = session.get("details") or {}
-        working_directory = details.get("working_directory")
-        if not working_directory:
+        # Bind cached targets to the invocation that was evaluated. Current
+        # session details may name a different directory; the audit snapshot
+        # already includes per-call context and shell workdir resolution.
+        context = record.get("evaluation_context")
+        if not isinstance(context, dict):
+            return
+        working_directory = context.get("__intaris_evaluation_directory")
+        if not isinstance(working_directory, str) or not os.path.isabs(
+            working_directory
+        ):
+            # Legacy/unknown directories remain reviewable but cannot create
+            # a reusable path grant by guessing the session default.
             return
 
         # Extract and resolve paths
