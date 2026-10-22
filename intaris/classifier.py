@@ -1329,6 +1329,11 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
             continue
         head = os.path.basename(words[0])
         operands = words[1:]
+        if any(
+            _is_critical(shlex.join(launched), _depth + 1)
+            for launched in _literal_launched_commands(words)
+        ):
+            return True
         if head in {"sh", "bash", "zsh", "dash", "ksh"}:
             for index, arg in enumerate(operands[:-1]):
                 if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
@@ -1415,6 +1420,135 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         ):
             return True
     return False
+
+
+def _literal_launched_commands(words: list[str]) -> list[list[str]]:
+    """Extract explicit argv launched by find/xargs, never their input data.
+
+    Keep these separate from transparent execution prefixes: a heredoc or
+    pipeline into xargs is argument data, not stdin of the launched command.
+    Input-dependent replacements are not interpreted here.
+    """
+    head = os.path.basename(words[0])
+    if head in {"xargs", "gxargs"}:
+        # GNU optional values (-e/-i/-l, --eof/--replace/--max-lines) attach;
+        # BSD's -J/-R/-S take required values. Respect grouped short options.
+        required_short = set("adEIJLnPRSs")
+        optional_short = set("eil")
+        long_options = {
+            "arg-file": True,
+            "delimiter": True,
+            "eof": False,
+            "replace": False,
+            "max-lines": False,
+            "max-args": True,
+            "max-procs": True,
+            "max-chars": True,
+            "process-slot-var": True,
+            "null": False,
+            "interactive": False,
+            "verbose": False,
+            "exit": False,
+            "no-run-if-empty": False,
+            "show-limits": False,
+            "help": False,
+            "version": False,
+        }
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            option = words[index]
+            index += 1
+            if option == "--":
+                break
+            if option.startswith("--"):
+                name, equals, _value = option[2:].partition("=")
+                matches = [key for key in long_options if key.startswith(name)]
+                if name not in long_options and len(matches) == 1:
+                    name = matches[0]
+                if name in {"help", "version"}:
+                    return []
+                if long_options.get(name) and not equals:
+                    index += 1
+            else:
+                for position, letter in enumerate(option[1:], start=1):
+                    if letter in required_short | optional_short:
+                        if letter in required_short and position == len(option) - 1:
+                            index += 1
+                        break
+        return [words[index:]] if index < len(words) else []
+    if head not in {"find", "gfind"}:
+        return []
+    # Predicate operands are data even when named '-exec' or '-ok'. -fprintf
+    # takes both an output filename and a format string; the others take one.
+    value_predicates = {
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-regex",
+        "-iregex",
+        "-regextype",
+        "-lname",
+        "-ilname",
+        "-type",
+        "-xtype",
+        "-uid",
+        "-gid",
+        "-user",
+        "-group",
+        "-perm",
+        "-size",
+        "-links",
+        "-inum",
+        "-samefile",
+        "-newer",
+        "-anewer",
+        "-cnewer",
+        "-mtime",
+        "-atime",
+        "-ctime",
+        "-mmin",
+        "-amin",
+        "-cmin",
+        "-fstype",
+        "-maxdepth",
+        "-mindepth",
+        "-printf",
+        "-fprint",
+        "-fprint0",
+        "-fls",
+        "-context",
+        "-files0-from",
+        "-D",
+        "-f",
+    }
+    commands = []
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token in {"-help", "--help", "-version", "--version"}:
+            return []
+        if token in {"-exec", "-execdir", "-ok", "-okdir"}:
+            start = index + 1
+            end = start
+            while (
+                end < len(words)
+                and words[end] != ";"
+                and not (words[end] == "+" and end > start and words[end - 1] == "{}")
+            ):
+                end += 1
+            if start < end < len(words):
+                commands.append(words[start:end])
+            index = end + 1
+        elif token == "-fprintf":
+            index += 3
+        elif token in value_predicates or re.fullmatch(r"-newer[acmBt][acmBt]", token):
+            index += 2
+        else:
+            index += 1
+    return commands
 
 
 def _critical_command_words(command: str) -> list[str]:

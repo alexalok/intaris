@@ -112,7 +112,13 @@ def test_documentation_and_bounded_cleanup_are_not_hard_denials(command):
 @pytest.mark.parametrize("maximum", ["approve", "escalate", "deny"])
 @pytest.mark.parametrize("unattended", [False, True])
 @pytest.mark.parametrize(
-    "command", ["rm -rf /", "timeout 5 setsid stdbuf -oL rm -rf /"]
+    "command",
+    [
+        "rm -rf /",
+        "timeout 5 setsid stdbuf -oL rm -rf /",
+        r"find /tmp -exec rm -rf / \;",
+        "xargs -0 rm -rf /",
+    ],
 )
 def test_hard_deny_survives_caps_and_judge_routing(
     stores, maximum, unattended, command
@@ -245,3 +251,74 @@ def test_judge_cannot_approve_legacy_hard_record(stores, mode):
     )
     record = audit.get_by_call_id("legacy", user_id="u")
     assert record["effective_decision"] != "approve"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"find /tmp -exec rm -rf --no-preserve-root / \;",
+        r"find /tmp -execdir /bin/rm --recursive / \;",
+        r"find /tmp -ok rm -rf / \;",
+        r"find /tmp -okdir rm -rf / \;",
+        "find /tmp -exec rm -rf / {} +",
+        r"find /tmp -exec echo safe \; -exec rm -rf / \;",
+        r"find /tmp -exec bash -c 'rm -rf /' \;",
+        r"timeout 5 find /tmp -name '*.tmp' -exec setsid rm -rf / \;",
+        "xargs rm -rf /",
+        "xargs --max-lines rm -rf /",
+        "xargs --max-lines=2 rm -rf /",
+        "gxargs --max-a 1 rm -rf /",
+        r"gfind /tmp -exec rm -rf / \;",
+        "xargs -0 -n 1 -P 2 /bin/rm -rf /",
+        "xargs -0rn1 -- rm -rf /",
+        "xargs -0rn 1 rm -rf /",
+        "xargs -I {} rm -rf / {}",
+        "xargs -I{} rm -rf / {}",
+        "xargs -a /tmp/paths -d '\\n' -E STOP -s 4096 rm -rf /",
+        "xargs --arg-file /tmp/paths --delimiter='\\n' --max-args 1 rm -rf /",
+        "xargs --eof --replace bash -c 'rm -rf /'",
+        "xargs -i -e -l rm -rf /",
+        "xargs -J {} -R 2 -S 255 rm -rf / {}",
+        "printf '%s' item | xargs timeout 5 rm -rf /",
+        r"find /tmp -exec xargs bash -c 'rm -rf /' \;",
+        r"xargs find /tmp -exec rm -rf / \;",
+    ],
+)
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"allow_tools": ["terminal"]},
+        {"allow_commands": ["*"]},
+    ],
+)
+def test_literal_launchers_cannot_override_hard_stops(command, policy):
+    assert (
+        classify("terminal", {"command": command}, session_policy=policy)
+        == Classification.CRITICAL
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"find /tmp -exec echo 'rm -rf /' \;",
+        r"find /tmp -exec grep 'rm -rf /' {} +",
+        r"find /tmp -name '-exec' -printf 'rm -rf /'",
+        r"find /tmp -fprintf '-exec' 'rm -rf /'",
+        r"find /tmp -path '-exec' -name reboot",
+        r"find /tmp -exec printf '%s' '-exec' rm -rf / \;",
+        r"find /tmp -exec rm -rf /tmp/build \;",
+        "xargs echo 'rm -rf /'",
+        "xargs -I rm echo -rf /",
+        "xargs -E reboot echo safe",
+        "xargs --arg-file rm echo -rf /",
+        "xargs --replace=rm echo -rf /",
+        "xargs --help rm -rf /",
+        "xargs --version reboot",
+        "xargs -n 1 rm -rf /tmp/build",
+        "xargs bash <<'EOF'\nrm -rf /\nEOF",
+        "printf '%s' 'rm -rf /' | xargs echo",
+    ],
+)
+def test_launcher_data_is_not_promoted_to_executable_text(command):
+    assert classify("terminal", {"command": command}) != Classification.CRITICAL
