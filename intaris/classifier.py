@@ -1380,7 +1380,9 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
                 "${HOME}",
             }
             if recursive and any(
-                _protected_target_path(t) in protected | {"*", "/*"} for t in targets
+                _protected_target_path(t) in protected | {"*", "/*"}
+                or re.fullmatch(r"/[a-z]+", _protected_target_path(t)) is not None
+                for t in targets
             ):
                 return True
         # Only match executable names. Words in echo/grep/commit arguments
@@ -1645,6 +1647,42 @@ def _unwrap_ionice_command(words: list[str]) -> list[str]:
     return []
 
 
+def _unwrap_taskset_command(words: list[str]) -> list[str]:
+    """Skip taskset flags and its mask/list operand, preserving non-exec modes."""
+    long_options = {
+        "all-tasks": "a",
+        "cpu-list": "c",
+        "pid": "p",
+        "help": "h",
+        "version": "V",
+    }
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        index += 1
+        if token.startswith("--"):
+            name = token[2:]
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            options = long_options[name]
+        else:
+            options = token[1:]
+        if any(option not in "acphV" for option in options):
+            return []
+        if any(option in "phV" for option in options):
+            return []  # PID mode or informational exit never executes argv.
+    # Both -c lists and default masks occupy exactly one non-option operand.
+    return words[index + 1 :]
+
+
 def _critical_command_words(command: str) -> list[str]:
     """Unwrap literal execution prefixes without promoting argument text."""
     command = re.sub(
@@ -1696,6 +1734,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_read_command(["env", *words[1:]])
         elif head == "ionice":
             words = _unwrap_ionice_command(words)
+        elif head == "taskset":
+            words = _unwrap_taskset_command(words)
         elif head in option_values:
             words = words[1:]
             while words and words[0].startswith("-"):
