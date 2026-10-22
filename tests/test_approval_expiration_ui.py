@@ -541,3 +541,17 @@ assert.equal(stores.ws.ws, null);
 await stores.auth.login('test-key', 'user-1');
 assert(stores.ws.ws, 'Login after logout must reconnect too');
 """)
+
+
+def test_denial_panel_requests_filter_before_result_limit():
+    _run_js(r"""
+api.listAudit = async params => {
+  requests.push(clone(params));
+  assert.equal(params.overridable_denials, true);
+  assert.equal(params.limit, 20);
+  return {items: [{...record, call_id: 'eligible', expired_at: null, user_decision: null, decision: 'deny'}], total: 25, pages: 2};
+};
+await approvals.loadDenials();
+assert.equal(approvals.denials.length, 1);
+assert.equal(approvals.denials[0].call_id, 'eligible');
+""")

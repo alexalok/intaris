@@ -4945,3 +4945,78 @@ def test_pending_decision_rechecks_current_policy(client_no_auth, rule):
         ).status_code
         == 200
     )
+
+
+def test_overridable_denials_filter_precedes_pagination(client_no_auth):
+    from intaris.audit import AuditStore
+    from intaris.server import _get_db
+    from intaris.session import SessionStore
+
+    db = _get_db()
+    sessions, audit = SessionStore(db), AuditStore(db)
+    for tenant in ("u", "other"):
+        sessions.create(session_id="denials", user_id=tenant, intention="Test")
+
+    def denial(
+        call_id,
+        tenant="u",
+        classification="write",
+        path="llm",
+        agent="a",
+        kind="tool_call",
+    ):
+        audit.insert(
+            call_id=call_id,
+            user_id=tenant,
+            session_id="denials",
+            agent_id=agent,
+            tool="edit",
+            args_redacted={},
+            classification=classification,
+            evaluation_path=path,
+            decision="deny",
+            risk="high",
+            reasoning="Review",
+            latency_ms=0,
+            record_type=kind,
+        )
+
+    for n in range(25):
+        denial(f"eligible-{n}")
+    denial("foreign", tenant="other")
+    denial("other-agent", agent="b")
+    denial("reasoning", kind="reasoning")
+    for n in range(30):
+        denial(
+            f"hard-{n}",
+            classification="critical" if n % 2 else "write",
+            path="critical" if n % 3 else "fast",
+        )
+    params = {"overridable_denials": True, "agent_id": "a", "limit": 20}
+    first = client_no_auth.get(
+        "/api/v1/audit", headers={"X-User-Id": "u"}, params=params
+    )
+    assert first.status_code == 200
+    data = first.json()
+    assert len(data["items"]) == 20 and data["total"] == 25 and data["pages"] == 2
+    assert all(item["call_id"].startswith("eligible-") for item in data["items"])
+    second = client_no_auth.get(
+        "/api/v1/audit", headers={"X-User-Id": "u"}, params={**params, "page": 2}
+    ).json()
+    assert len(second["items"]) == 5
+    assert not {r["call_id"] for r in data["items"]} & {
+        r["call_id"] for r in second["items"]
+    }
+    history = client_no_auth.get(
+        "/api/v1/audit",
+        headers={"X-User-Id": "u"},
+        params={"agent_id": "a", "limit": 100},
+    ).json()
+    assert history["total"] == 56
+    assert any(item["call_id"].startswith("hard-") for item in history["items"])
+    events = client_no_auth.get(
+        "/api/v1/audit",
+        headers={"X-User-Id": "u"},
+        params={**params, "source": "events"},
+    ).json()
+    assert events["total"] == 0

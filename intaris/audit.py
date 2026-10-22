@@ -363,6 +363,7 @@ class AuditStore:
         from_ts: str | None = None,
         to_ts: str | None = None,
         resolved: bool | None = None,
+        overridable_denials: bool = False,
         page: int = 1,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -371,6 +372,8 @@ class AuditStore:
         Args:
             user_id: Tenant identifier (always required).
             record_type: Filter by record type (tool_call, reasoning, checkpoint).
+            overridable_denials: Restrict unresolved tool denials to reviewable
+                evaluation paths before pagination, excluding hard prohibitions.
             resolved: Filter by actionable status. ``True`` includes human/judge
                 resolutions and expired invocations. ``False`` excludes both.
                 ``None`` (default) returns the complete evaluation history.
@@ -417,6 +420,20 @@ class AuditStore:
             conditions.append("user_decision IS NULL AND expired_at IS NULL")
             # Judge-only provisional calls must not appear in human approvals.
             conditions.append("(outcome_override IS NULL OR outcome_override != ?)")
+            params.append(UNATTENDED_JUDGE_REVIEW)
+
+        if overridable_denials:
+            # Apply eligibility to both count and rows before LIMIT/OFFSET.
+            # Unfiltered audit history continues to include hard/lifecycle denies.
+            conditions.extend(
+                [
+                    "decision = 'deny' AND record_type = 'tool_call'",
+                    "user_decision IS NULL AND expired_at IS NULL",
+                    "COALESCE(classification, '') != 'critical'",
+                    "evaluation_path NOT IN ('critical', 'fast')",
+                    "(outcome_override IS NULL OR outcome_override != ?)",
+                ]
+            )
             params.append(UNATTENDED_JUDGE_REVIEW)
 
         where = ""

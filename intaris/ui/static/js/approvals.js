@@ -238,6 +238,7 @@ function approvalsTab() {
       try {
         const params = {
           decision: 'deny',
+          overridable_denials: true,
           record_type: 'tool_call',
           resolved: false,
           limit: 20,
