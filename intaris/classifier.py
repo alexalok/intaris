@@ -1299,7 +1299,8 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
     """Recognize prohibited execution, preserving quoted operands and prose.
 
     This is a bounded literal shell recognizer, not a shell interpreter.
-    Dynamic/unknown commands still take the ordinary WRITE evaluation path.
+    Unrecognized syntax follows normal classification, including configured
+    allow shortcuts; this recognizer cannot make a broad allow rule a sandbox.
     """
     if _depth > _MAX_SHELL_DEPTH:
         # Exhausted inspection is not evidence of safety. A broad allow rule
@@ -1683,6 +1684,87 @@ def _unwrap_taskset_command(words: list[str]) -> list[str]:
     return words[index + 1 :]
 
 
+def _unwrap_prlimit_command(words: list[str]) -> list[str]:
+    """Locate prlimit argv, respecting optional limits and non-exec modes.
+
+    util-linux stops at the first operand. Resource values must be attached;
+    only output and PID take a separate argument. A nonzero PID forbids COMMAND,
+    but PID zero still permits execution, matching util-linux's pid check.
+    """
+    resources = {
+        "as",
+        "core",
+        "cpu",
+        "data",
+        "fsize",
+        "locks",
+        "memlock",
+        "msgqueue",
+        "nice",
+        "nofile",
+        "nproc",
+        "rss",
+        "rtprio",
+        "rttime",
+        "sigpending",
+        "stack",
+    }
+    long_options = resources | {
+        "pid",
+        "output",
+        "noheadings",
+        "raw",
+        "verbose",
+        "help",
+        "version",
+    }
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            return words[index:]
+        if token == "-" or not token.startswith("-"):
+            return words[index - 1 :]
+        if token.startswith("--"):
+            name, equals, value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            if name in {"help", "version"}:
+                return []
+            if name in {"pid", "output"}:
+                if not equals:
+                    if index >= len(words):
+                        return []
+                    value = words[index]
+                    index += 1
+                if name == "pid" and not re.fullmatch(r"\s*[+-]?0+", value):
+                    return []
+            elif name not in resources and equals:
+                return []
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hV":
+                    return []
+                if option in "po":
+                    value = token[offset + 1 :]
+                    if not value:
+                        if index >= len(words):
+                            return []
+                        value = words[index]
+                        index += 1
+                    if option == "p" and not re.fullmatch(r"\s*[+-]?0+", value):
+                        return []
+                    break
+                if option in "cdefilmnqrstuvxy":
+                    break  # Optional value consumes the rest of this token only.
+                return []
+    return []
+
+
 def _unwrap_chroot_command(words: list[str]) -> list[str]:
     """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
     long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
@@ -1778,6 +1860,8 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_ionice_command(words)
         elif head == "taskset":
             words = _unwrap_taskset_command(words)
+        elif head == "prlimit":
+            words = _unwrap_prlimit_command(words)
         elif head in {"chroot", "gchroot"}:
             words = _unwrap_chroot_command(words)
         elif head in option_values:
