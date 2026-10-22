@@ -114,7 +114,7 @@ async def submit_reasoning(
             )
 
     try:
-        from intaris.audit import AuditStore
+        from intaris.audit import AuditStore, StaleUserMessageError
         from intaris.session import SessionStore
 
         db = _get_db()
@@ -156,11 +156,6 @@ async def submit_reasoning(
             assistant_context = resolved.assistant_context
             intention_eligible = resolved.intention_eligible
             source_event_seq = resolved.seq
-            session_store.observe_user_message(
-                request.session_id,
-                user_id=ctx.user_id,
-                event_seq=resolved.seq,
-            )
             # Construct the same format as direct callers use
             content = f"User message: {user_content}"
             context = assistant_context
@@ -186,7 +181,7 @@ async def submit_reasoning(
             context_data["intention_eligible"] = intention_eligible
             context_data["source_event_seq"] = source_event_seq
 
-        audit_store.insert(
+        record = audit_store.insert(
             call_id=call_id,
             user_id=ctx.user_id,
             session_id=request.session_id,
@@ -203,6 +198,9 @@ async def submit_reasoning(
             content=sanitized,
         )
 
+        source_inserted = record["call_id"] == call_id
+        call_id = record["call_id"]
+
         # Update session activity
         session_store.update_activity(request.session_id, user_id=ctx.user_id)
 
@@ -211,11 +209,15 @@ async def submit_reasoning(
         # task; the next POST /evaluate will wait for it to complete.
         # Only triggers for user messages, not agent reasoning.
         if sanitized.startswith("User message:"):
-            if not resolved_from_events:
-                session_store.mark_user_message_observed(
-                    request.session_id,
-                    user_id=ctx.user_id,
-                )
+            # Another worker can append a newer event after this transaction.
+            # Do not cancel its intention task with a delayed or duplicate source.
+            source_current = (
+                source_event_seq is None
+                or session_store.get(request.session_id, user_id=ctx.user_id)[
+                    "latest_user_message_seq"
+                ]
+                == source_event_seq
+            )
             logger.info(
                 "Received user message for %s/%s (from_events=%s, context_len=%d)",
                 ctx.user_id,
@@ -226,16 +228,21 @@ async def submit_reasoning(
             barrier = getattr(http_request.app.state, "intention_barrier", None)
             if barrier is not None:
                 try:
-                    if intention_eligible:
-                        trigger_kwargs = {"context": context}
-                        if source_event_seq is not None:
-                            trigger_kwargs["source_event_seq"] = source_event_seq
-                        await barrier.trigger(
-                            ctx.user_id, request.session_id, **trigger_kwargs
-                        )
-                    else:
-                        barrier.invalidate(ctx.user_id, request.session_id)
-                    if request.wait_for_intention and intention_eligible:
+                    if source_inserted and source_current:
+                        if intention_eligible:
+                            trigger_kwargs = {"context": context}
+                            if source_event_seq is not None:
+                                trigger_kwargs["source_event_seq"] = source_event_seq
+                            await barrier.trigger(
+                                ctx.user_id, request.session_id, **trigger_kwargs
+                            )
+                        else:
+                            barrier.invalidate(ctx.user_id, request.session_id)
+                    if (
+                        request.wait_for_intention
+                        and intention_eligible
+                        and source_current
+                    ):
                         timeout_override = None
                         if request.wait_timeout_ms is not None:
                             timeout_override = request.wait_timeout_ms / 1000.0
@@ -286,6 +293,9 @@ async def submit_reasoning(
         return response
     except HTTPException:
         raise
+    except StaleUserMessageError:
+        # The raw event is already recorded; stale refresh requests are no-ops.
+        return ReasoningResponse(ok=True, call_id="")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception:

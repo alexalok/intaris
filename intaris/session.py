@@ -396,41 +396,53 @@ class SessionStore:
         *,
         user_id: str,
         event_seq: int,
+        cursor: Any | None = None,
     ) -> None:
-        """Advance durable user-message state for a pre-migration event."""
-        with self._db.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE sessions
-                SET latest_user_message_seq = CASE
-                        WHEN latest_user_message_seq IS NULL
-                          OR latest_user_message_seq < ?
-                        THEN ?
-                        ELSE latest_user_message_seq
-                    END,
-                    last_event_seq = CASE
-                        WHEN COALESCE(last_event_seq, 0) < ?
-                        THEN ?
-                        ELSE last_event_seq
-                    END,
-                    user_message_observed = TRUE,
-                    scope_version = scope_version + CASE
-                        WHEN latest_user_message_seq IS NULL OR latest_user_message_seq < ?
-                        THEN 1 ELSE 0 END
-                WHERE session_id = ? AND user_id = ?
-                """,
-                (
-                    event_seq,
-                    event_seq,
-                    event_seq,
-                    event_seq,
-                    event_seq,
-                    session_id,
-                    user_id,
-                ),
-            )
-            if cur.rowcount == 0:
-                raise ValueError(f"Session {session_id} not found")
+        """Advance event state using the source insert transaction when supplied.
+
+        Event-backed audit sources must pass their transaction cursor so the
+        pointer and source become visible together, including on PostgreSQL.
+        """
+        if type(event_seq) is not int or event_seq <= 0:
+            raise ValueError("source_event_seq must be a positive integer")
+        if cursor is None:
+            with self._db.cursor() as cur:
+                self.observe_user_message(
+                    session_id, user_id=user_id, event_seq=event_seq, cursor=cur
+                )
+            return
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET latest_user_message_seq = CASE
+                    WHEN latest_user_message_seq IS NULL
+                      OR latest_user_message_seq < ?
+                    THEN ?
+                    ELSE latest_user_message_seq
+                END,
+                last_event_seq = CASE
+                    WHEN COALESCE(last_event_seq, 0) < ?
+                    THEN ?
+                    ELSE last_event_seq
+                END,
+                user_message_observed = TRUE,
+                scope_version = scope_version + CASE
+                    WHEN latest_user_message_seq IS NULL OR latest_user_message_seq < ?
+                    THEN 1 ELSE 0 END
+            WHERE session_id = ? AND user_id = ?
+            """,
+            (
+                event_seq,
+                event_seq,
+                event_seq,
+                event_seq,
+                event_seq,
+                session_id,
+                user_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(f"Session {session_id} not found")
 
     def mark_user_message_observed(
         self,

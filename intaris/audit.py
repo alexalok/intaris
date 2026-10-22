@@ -19,7 +19,7 @@ from weakref import WeakKeyDictionary
 from intaris.approval_policy import validate_approval_policy
 from intaris.db import Database
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
-from intaris.session import load_session_policy_chain
+from intaris.session import SessionStore, load_session_policy_chain
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,10 @@ class ApprovalExpiredError(ValueError):
 
 class ScopeChangedError(ValueError):
     """User authority changed after the Judge collected its evidence."""
+
+
+class StaleUserMessageError(ValueError):
+    """A newer user event superseded this reasoning delivery."""
 
 
 def _check_scope_versions(cur: Any, user_id: str, expected: dict[str, int]) -> None:
@@ -122,6 +126,123 @@ class AuditStore:
 
     def __init__(self, db: Database):
         self._db = db
+
+    def _find_user_message_projection(
+        self,
+        cur: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        event_seq: int,
+    ) -> dict[str, Any] | None:
+        """Find an exact, typed event reference using the caller's cursor."""
+        source_seq_sql = (
+            "jsonb_typeof(args_redacted::jsonb -> 'source_event_seq') = 'number' "
+            "AND args_redacted::jsonb ->> 'source_event_seq' = ?"
+            if self._db.backend == "postgresql"
+            else "json_type(args_redacted, '$.source_event_seq') = 'integer' "
+            "AND json_extract(args_redacted, '$.source_event_seq') = ?"
+        )
+        cur.execute(
+            "SELECT * FROM audit_log WHERE user_id = ? AND session_id = ? "
+            "AND record_type = 'reasoning' "
+            "AND substr(content, 1, 13) = 'User message:' "
+            f"AND {source_seq_sql} ORDER BY timestamp, call_id LIMIT 1",
+            (
+                user_id,
+                session_id,
+                str(event_seq) if self._db.backend == "postgresql" else event_seq,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        record = _row_to_dict(row)
+        metadata = record.get("args_redacted")
+        if not isinstance(metadata, dict):
+            return None
+        stored_seq = metadata.get("source_event_seq")
+        # PostgreSQL jsonb normalizes numeric spellings. Validate the original
+        # JSON too so a float or exponent cannot masquerade as an integer seq.
+        if type(stored_seq) is not int or stored_seq != event_seq:
+            return None
+        return record
+
+    def get_user_message_projection(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        event_seq: int,
+    ) -> dict[str, Any] | None:
+        """Read a user-message projection by tenant, session, and positive seq.
+
+        Return the complete audit record, including original eligibility
+        metadata, or None when no exact projection exists. An explicitly false
+        ``args_redacted.intention_eligible`` means the event was projected but
+        cannot grant authority; it is deliberately absent from intent sources.
+        This lookup does not update session state or promote ineligible content.
+        """
+        if type(event_seq) is not int or event_seq <= 0:
+            raise ValueError("event_seq must be a positive integer")
+        with self._db.cursor() as cur:
+            return self._find_user_message_projection(
+                cur, user_id=user_id, session_id=session_id, event_seq=event_seq
+            )
+
+    def _prepare_user_message(
+        self,
+        cur: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Observe a source and invalidate scope inside its audit transaction.
+
+        The session write serializes duplicate and stale checks across workers,
+        using the same session-before-audit lock order as approval commits.
+        """
+        event_seq = metadata.get("source_event_seq")
+        if "source_event_seq" in metadata and (
+            type(event_seq) is not int or event_seq <= 0
+        ):
+            raise ValueError("source_event_seq must be a positive integer")
+        cur.execute(
+            "UPDATE sessions SET user_message_observed = TRUE "
+            "WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"Session {session_id} not found")
+        advanced = False
+        if event_seq is not None:
+            cur.execute(
+                "SELECT latest_user_message_seq FROM sessions "
+                "WHERE user_id = ? AND session_id = ?",
+                (user_id, session_id),
+            )
+            latest = cur.fetchone()["latest_user_message_seq"]
+            if latest is not None and latest > event_seq:
+                raise StaleUserMessageError("A newer user message is already observed")
+            existing = self._find_user_message_projection(
+                cur, user_id=user_id, session_id=session_id, event_seq=event_seq
+            )
+            advanced = latest is None or latest < event_seq
+            SessionStore(self._db).observe_user_message(
+                session_id, user_id=user_id, event_seq=event_seq, cursor=cur
+            )
+            if existing is not None:
+                return existing
+        if metadata.get("intention_eligible") is not False and not advanced:
+            # Source projection still changes authority when allocation already
+            # published the event pointer. Increment exactly once for this insert.
+            cur.execute(
+                "UPDATE sessions SET scope_version = scope_version + 1 "
+                "WHERE user_id = ? AND session_id = ?",
+                (user_id, session_id),
+            )
+        return None
 
     def insert(
         self,
@@ -230,18 +351,15 @@ class AuditStore:
                 record_type == "reasoning"
                 and isinstance(content, str)
                 and content.startswith("User message:")
-                and not (
-                    isinstance(args_redacted, dict)
-                    and args_redacted.get("intention_eligible") is False
-                )
             ):
-                # Update first: PostgreSQL scope writers take the session lock
-                # before audit rows. The revision and source commit together.
-                cur.execute(
-                    "UPDATE sessions SET scope_version = scope_version + 1 "
-                    "WHERE user_id = ? AND session_id = ?",
-                    (user_id, session_id),
+                existing = self._prepare_user_message(
+                    cur,
+                    user_id=user_id,
+                    session_id=session_id,
+                    metadata=args_redacted if isinstance(args_redacted, dict) else {},
                 )
+                if existing is not None:
+                    return existing
             cur.execute(
                 """
                 INSERT INTO audit_log
