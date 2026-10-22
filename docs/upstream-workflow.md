@@ -199,7 +199,9 @@ remote/default branch, then run the complete subshell block. `set -eu` makes a
 failed fetch, metadata check, merge, or assertion stop before later commands.
 The preflight requires a clean tracked worktree/index at freshly fetched fork
 main and a committed review record with exactly one matching status and each
-boundary field. A local untracked record cannot satisfy these checks.
+boundary field, including the full fork baseline SHA saved at review start.
+That baseline must resolve to a commit and be an ancestor of current fork main.
+A local untracked record cannot satisfy these checks.
 
 ```bash
 (
@@ -207,6 +209,7 @@ set -eu
 reviewed_upstream=<reviewed-upstream-full-sha>
 last_reviewed=<previous-upstream-full-sha>
 review_record=docs/upstream-reviews/<review-file>.md
+fork_baseline=<reviewed-fork-baseline-full-sha>
 fork_remote=fork
 fork_branch=main
 
@@ -217,6 +220,9 @@ test "$(git rev-parse HEAD)" = "$fork_before"
 fork_tree=$(git rev-parse 'HEAD^{tree}')
 git diff --exit-code
 git diff --cached --exit-code
+# Use the full fork baseline recorded when the review started, not current HEAD.
+test "$(git rev-parse "$fork_baseline^{commit}")" = "$fork_baseline"
+git merge-base --is-ancestor "$fork_baseline" "$fork_before"
 
 # Read committed metadata, never an untracked or modified working-copy record.
 test "$(git cat-file -t "$fork_before:$review_record")" = blob
@@ -224,6 +230,7 @@ record_contents=$(git show "$fork_before:$review_record")
 test "$(printf '%s\n' "$record_contents" | grep '^Status: ')" = 'Status: ready for checkpoint'
 test "$(printf '%s\n' "$record_contents" | grep '^Previous upstream tip: ')" = "Previous upstream tip: $last_reviewed"
 test "$(printf '%s\n' "$record_contents" | grep '^Reviewed upstream tip: ')" = "Reviewed upstream tip: $reviewed_upstream"
+test "$(printf '%s\n' "$record_contents" | grep '^Fork baseline: ')" = "Fork baseline: $fork_baseline"
 if ! git merge-base --is-ancestor "$last_reviewed" "$reviewed_upstream"; then
   printf '%s\n' 'Upstream ancestry mismatch; no checkpoint may be created.' >&2
   exit 1
