@@ -1335,10 +1335,9 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         ):
             return True
         if head in {"sh", "bash", "zsh", "dash", "ksh"}:
-            for index, arg in enumerate(operands[:-1]):
-                if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
-                    if _is_critical(operands[index + 1], _depth + 1):
-                        return True
+            payload = _shell_command_string(operands)
+            if payload is not None and _is_critical(payload, _depth + 1):
+                return True
         if head == "eval" and _is_critical(" ".join(operands), _depth + 1):
             return True
         if head == "rm":
@@ -1376,7 +1375,7 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
                 "${HOME}",
             }
             if recursive and any(
-                os.path.normpath(t) in protected or t in {"*", "/*"} for t in targets
+                _protected_target_path(t) in protected | {"*", "/*"} for t in targets
             ):
                 return True
         # Only match executable names. Words in echo/grep/commit arguments
@@ -1405,7 +1404,7 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         if (
             head in {"chmod", "chown"}
             and operands
-            and os.path.normpath(operands[-1]) == "/"
+            and _protected_target_path(operands[-1]) == "/"
         ):
             if head == "chown" or "777" in operands:
                 return True
@@ -1420,6 +1419,44 @@ def _is_critical(command: str, _depth: int = 0) -> bool:
         ):
             return True
     return False
+
+
+def _protected_target_path(target: str) -> str:
+    """Normalize repeated leading slashes for local destructive-target checks."""
+    # normpath preserves exactly two leading slashes for POSIX implementations
+    # that assign them special semantics. On our local Unix targets // is root.
+    if target.startswith("//"):
+        target = "/" + target.lstrip("/")
+    return os.path.normpath(target)
+
+
+def _shell_command_string(operands: list[str]) -> str | None:
+    """Locate a shell -c payload without treating $0/positional args as code."""
+    command_mode = False
+    index = 0
+    while index < len(operands):
+        option = operands[index]
+        index += 1
+        if option in {"-", "--"}:
+            return operands[index] if command_mode and index < len(operands) else None
+        if option in {"--help", "--version"}:
+            return None
+        if option in {"--rcfile", "--init-file"}:
+            index += 1
+            continue
+        if option.startswith("--"):
+            continue
+        if option.startswith(("-", "+")):
+            for position, letter in enumerate(option[1:], start=1):
+                if letter == "c":
+                    command_mode = True
+                if letter in {"o", "O"}:
+                    if position == len(option) - 1:
+                        index += 1
+                    break
+            continue
+        return option if command_mode else None
+    return None
 
 
 def _literal_launched_commands(words: list[str]) -> list[list[str]]:

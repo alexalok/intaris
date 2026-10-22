@@ -322,3 +322,49 @@ def test_literal_launchers_cannot_override_hard_stops(command, policy):
 )
 def test_launcher_data_is_not_promoted_to_executable_text(command):
     assert classify("terminal", {"command": command}) != Classification.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c -- 'rm -rf /'",
+        "sh -c -- 'rm -rf /'",
+        "bash -c -x -- 'rm -rf /'",
+        "bash -c -o pipefail -- 'rm -rf /'",
+        "timeout 5 bash -xc -- 'rm -rf /'",
+        "xargs bash -c -- 'rm -rf /'",
+        "rm -rf --no-preserve-root //",
+        "rm -rf //./",
+        "rm -rf //var/../",
+        "rm -rf //etc",
+        "rm -rf //usr/",
+        "chmod -R 777 //",
+        "chown -R nobody //",
+    ],
+)
+def test_shell_option_terminator_and_double_slash_roots_are_hard_stops(command):
+    assert (
+        classify(
+            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+        )
+        == Classification.CRITICAL
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c -- 'echo rm -rf /'",
+        "bash -c echo -c 'rm -rf /'",
+        "bash -- -c 'rm -rf /'",
+        "bash --rcfile harmless -c 'echo reboot'",
+        "bash -c -- -- 'rm -rf /'",
+        "rm -rf //tmp/build",
+        "rm -rf //work/cache",
+        "printf '%s' '//etc'",
+    ],
+)
+def test_shell_positional_arguments_and_bounded_root_aliases_are_not_hard_stops(
+    command,
+):
+    assert classify("terminal", {"command": command}) != Classification.CRITICAL
