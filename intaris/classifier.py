@@ -458,8 +458,14 @@ def _extract_bash_file_paths(
     return list(dict.fromkeys(paths))
 
 
-def _unwrap_read_command(tokens: list[str]) -> list[str]:
-    """Remove harmless command wrappers before path-sensitive inspection."""
+def _unwrap_read_command(
+    tokens: list[str], *, environment: dict[str, str | None] | None = None
+) -> list[str]:
+    """Remove wrappers, optionally tracking only requested literal env keys.
+
+    Critical inspection tracks POSIXLY_CORRECT to recognize runuser's option
+    order. No inherited environment is read or arbitrary expansion performed.
+    """
     remaining = list(tokens)
     while remaining and remaining[0] in _BASH_COMMAND_WRAPPERS:
         wrapper = remaining.pop(0)
@@ -488,18 +494,42 @@ def _unwrap_read_command(tokens: list[str]) -> list[str]:
                 if token in _ENV_OPTIONS_WITH_SEPARATE_VALUES:
                     remaining.pop(0)
                     if remaining:
-                        remaining.pop(0)
+                        value = remaining.pop(0)
+                        if (
+                            environment is not None
+                            and token in {"-u", "--unset"}
+                            and value in environment
+                        ):
+                            environment[value] = None
                     continue
                 if any(
                     token.startswith(prefix) and token != prefix
                     for prefix in _ENV_OPTIONS_WITH_ATTACHED_VALUES
                 ):
+                    if environment is not None and token.startswith(("-u", "--unset=")):
+                        name = (
+                            token[2:]
+                            if token.startswith("-u")
+                            else token.removeprefix("--unset=")
+                        )
+                        if name in environment:
+                            environment[name] = None
                     remaining.pop(0)
                     continue
                 if token.startswith("-"):
+                    if environment is not None and token in {
+                        "-",
+                        "-i",
+                        "--ignore-environment",
+                    }:
+                        for name in environment:
+                            environment[name] = None
                     remaining.pop(0)
                     continue
                 if _looks_like_env_assignment(token):
+                    name, _, value = token.partition("=")
+                    if environment is not None and name in environment:
+                        environment[name] = value
                     remaining.pop(0)
                     continue
                 break
@@ -1929,6 +1959,102 @@ def _unwrap_setpriv_command(words: list[str]) -> list[str]:
     return []  # Unlike unshare/chroot, a missing program is not a shell launch.
 
 
+def _unwrap_runuser_command(
+    words: list[str], *, posixly_correct: bool = False
+) -> list[str]:
+    """Resolve util-linux runuser's direct argv or shell invocation.
+
+    su-common.c uses GNU getopt permutation, unlike setpriv. A literal
+    POSIXLY_CORRECT assignment instead stops options at the first operand.
+    The -u mode executes argv; otherwise the first operand is a username and
+    the rest are shell arguments, with optional -f and the last -c payload.
+    """
+    long_options = {
+        "command": "c",
+        "session-command": "c",
+        "fast": "f",
+        "login": "l",
+        "preserve-environment": "p",
+        "pty": "P",
+        "no-pty": "T",
+        "shell": "s",
+        "group": "g",
+        "supp-group": "G",
+        "user": "u",
+        "whitelist-environment": "w",
+        "help": "h",
+        "version": "V",
+    }
+    required = set("cgGsuw")
+    options: dict[str, str] = {}
+    operands: list[str] = []
+    index = 1
+    while index < len(words):
+        token = words[index]
+        index += 1
+        if token == "--":
+            operands.extend(words[index:])
+            break
+        if token == "-" or not token.startswith("-"):
+            operands.append(token)
+            if posixly_correct:
+                operands.extend(words[index:])
+                break
+            continue
+        if token.startswith("--"):
+            name, equals, value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [option for option in long_options if option.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            option = long_options[name]
+            if option in "hV":
+                return []
+            if option in required:
+                if not equals:
+                    if index >= len(words):
+                        return []
+                    value = words[index]
+                    index += 1
+            elif equals:
+                return []
+            options[option] = value
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hV":
+                    return []
+                if option in required:
+                    value = token[offset + 1 :]
+                    if not value:
+                        if index >= len(words):
+                            return []
+                        value = words[index]
+                        index += 1
+                    options[option] = value
+                    break
+                if option not in "flmpPT":
+                    return []  # --session-command has no short -C alias.
+                options[option] = ""
+    if operands and operands[0] == "-":
+        options["l"] = ""
+        operands.pop(0)
+    if "w" in options and options.keys() & {"m", "p"}:
+        return []  # Preserve-environment and whitelist are mutually exclusive.
+    if "u" in options:
+        if options.keys() & {"c", "s", "f", "l"}:
+            return []  # Direct exec rejects shell-mode options, even empty values.
+        return operands  # Missing command is an error, not a shell launch.
+    # Do not read the evaluator host's passwd/SHELL. Model the default shell;
+    # an explicit shell is an executable path, not shell source text.
+    shell_words = [options.get("s", "sh")]
+    if "f" in options:
+        shell_words.append("-f")
+    if "c" in options:
+        shell_words.extend(["-c", options["c"]])
+    return shell_words + operands[1:]
+
+
 def _unwrap_chroot_command(words: list[str]) -> list[str]:
     """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
     long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
@@ -2014,12 +2140,16 @@ def _critical_command_words(command: str) -> list[str]:
         "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
         "gstdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     }
+    environment: dict[str, str | None] = {"POSIXLY_CORRECT": None}
     while words:
         head = os.path.basename(words[0])
         if _looks_like_env_assignment(words[0]):
+            name, _, value = words[0].partition("=")
+            if name in environment:
+                environment[name] = value
             words = words[1:]
         elif head == "env":
-            words = _unwrap_read_command(["env", *words[1:]])
+            words = _unwrap_read_command(["env", *words[1:]], environment=environment)
         elif head == "ionice":
             words = _unwrap_ionice_command(words)
         elif head == "taskset":
@@ -2030,6 +2160,10 @@ def _critical_command_words(command: str) -> list[str]:
             words = _unwrap_unshare_command(words)
         elif head == "setpriv":
             words = _unwrap_setpriv_command(words)
+        elif head == "runuser":
+            words = _unwrap_runuser_command(
+                words, posixly_correct=environment["POSIXLY_CORRECT"] is not None
+            )
         elif head in {"chroot", "gchroot"}:
             words = _unwrap_chroot_command(words)
         elif head in option_values:
