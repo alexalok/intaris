@@ -408,3 +408,126 @@ def test_idle_resume_is_not_a_scope_change(setup):
         args={"path": "/work/a"},
     )
     assert value["decision"] == "approve"
+
+
+@pytest.mark.parametrize("backend", ["llm", "jev"])
+def test_new_deny_policy_invalidates_exact_approval_retry(setup, backend):
+    sessions, audit = setup
+    llm, jev = MagicMock(), MagicMock() if backend == "jev" else None
+    answer = dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    llm.generate.return_value = json.dumps(answer)
+    if jev:
+        jev.evaluate_tool_call.return_value = EvaluationResult(**answer)
+    evaluator = Evaluator(llm=llm, jev=jev, session_store=sessions, audit_store=audit)
+    call = dict(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="edit",
+        args={"path": "/work/a"},
+    )
+    first = evaluator.evaluate(**call)
+    audit.resolve_escalation(first["call_id"], "approve", user_id="u")
+    assert evaluator.evaluate(**call)["path"] == "fast"
+    sessions.update_session(
+        "s", user_id="u", policy={"deny_policies": ["Do not edit /work/a"]}
+    )
+    value = evaluator.evaluate(**call)
+    assert value["decision"] != "approve"
+    assert value["path"] == "llm"
+    evidence = audit.get_by_call_id(value["call_id"], user_id="u")["intent_evidence"]
+    assert not any(source["kind"] == "user_message" for source in evidence["sources"])
+
+
+@pytest.mark.parametrize("consumer", ["llm", "jev", "auto", "advisory"])
+def test_deny_policy_cannot_be_overruled_by_legacy_precedent(setup, consumer):
+    sessions, audit = setup
+    prior_approval(audit)
+    sessions.update_session(
+        "s", user_id="u", policy={"deny_policies": ["Do not edit /work/a"]}
+    )
+    llm = MagicMock()
+    if consumer in {"llm", "jev"}:
+        answer = dict(
+            aligned=False,
+            risk="medium",
+            decision="deny",
+            reasoning="Current deny policy",
+        )
+        llm.generate.return_value = json.dumps(answer)
+        jev = MagicMock() if consumer == "jev" else None
+        if jev:
+            jev.evaluate_tool_call.return_value = EvaluationResult(**answer)
+        value = Evaluator(
+            llm=llm, jev=jev, session_store=sessions, audit_store=audit
+        ).evaluate(
+            user_id="u",
+            session_id="s",
+            agent_id=None,
+            tool="edit",
+            args={"path": "/work/a"},
+        )
+        assert value["decision"] != "approve"
+    else:
+        audit.insert(
+            call_id="current",
+            user_id="u",
+            session_id="s",
+            agent_id=None,
+            tool="edit",
+            args_redacted={"path": "/work/a"},
+            classification="write",
+            evaluation_path="llm",
+            decision="escalate",
+            risk="medium",
+            reasoning="Review",
+            latency_ms=0,
+        )
+        llm.generate.return_value = json.dumps(
+            dict(
+                decision="deny",
+                risk="medium",
+                confidence="high",
+                reasoning="Current deny policy",
+            )
+        )
+        judge = JudgeReviewer(
+            config=JudgeConfig(mode=consumer),
+            llm=llm,
+            audit_store=audit,
+            session_store=sessions,
+            evaluator=None,
+        )
+        asyncio.run(
+            judge.review_and_resolve(call_id="current", user_id="u", session_id="s")
+        )
+        assert (
+            audit.get_by_call_id("current", user_id="u")["effective_decision"]
+            != "approve"
+        )
+
+
+def test_unrelated_deny_policy_still_allows_current_model_approval(setup):
+    sessions, audit = setup
+    prior_approval(audit)
+    sessions.update_session(
+        "s", user_id="u", policy={"deny_policies": ["Do not deploy to production"]}
+    )
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(
+            aligned=True,
+            risk="low",
+            decision="approve",
+            reasoning="Local edit, not deployment",
+        )
+    )
+    value = Evaluator(llm=llm, session_store=sessions, audit_store=audit).evaluate(
+        user_id="u",
+        session_id="s",
+        agent_id=None,
+        tool="edit",
+        args={"path": "/work/a"},
+    )
+    assert value["decision"] == "approve"
+    assert value["path"] == "llm"

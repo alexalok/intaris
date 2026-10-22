@@ -358,14 +358,18 @@ def render_intent_evidence(packet: dict[str, Any] | None) -> str:
     )
 
 
-def allows_legacy_precedent(packet: dict[str, Any]) -> bool:
+def allows_legacy_precedent(
+    packet: dict[str, Any], *, policy: dict[str, Any] | None = None
+) -> bool:
     """Keep the old human-only fallback out of source-based scope assessment.
 
     Omitted sources and parent scope cannot prove an absence of restrictions.
-    Human decisions remain in the model prompt even when fallback is disabled.
+    Free-text deny policies also require current interpretation. Human decisions
+    remain in the model prompt even when deterministic fallback is disabled.
     """
     return (
         packet["complete"]
+        and not (policy or {}).get("deny_policies")
         and not packet.get("parent")
         and not packet.get("parent_unavailable")
         and not any(s["kind"] == "user_message" for s in packet["sources"])

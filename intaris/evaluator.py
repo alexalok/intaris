@@ -1111,9 +1111,15 @@ class Evaluator:
             prior_call_id = row["call_id"]
             if session_id is not None:
                 prior = self._audit.get_by_call_id(prior_call_id, user_id=user_id)
-                current = collect_intent_evidence(
-                    self._sessions.get(session_id, user_id=user_id), self._audit
+                current_session = self._sessions.get(session_id, user_id=user_id)
+                current_session["policy"] = policy_for_session(
+                    current_session, self._agent_policy
                 )
+                if (current_session.get("policy") or {}).get("deny_policies"):
+                    # Free-text restrictions require current interpretation;
+                    # an old exact grant contains no policy snapshot proof.
+                    return None
+                current = collect_intent_evidence(current_session, self._audit)
                 if (
                     any(
                         source["kind"] == "user_message"
@@ -1470,7 +1476,7 @@ class Evaluator:
                 user_decisions = self._audit.get_user_decisions(
                     session_id, user_id=user_id, limit=5
                 )
-            if allows_legacy_precedent(intent_evidence):
+            if allows_legacy_precedent(intent_evidence, policy=session.get("policy")):
                 evaluation = _apply_authoritative_user_precedent(
                     evaluation,
                     tool=tool,

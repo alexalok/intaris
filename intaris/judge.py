@@ -1866,7 +1866,9 @@ class JudgeReviewer:
         if (
             not evidence_changed
             and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
-            and allows_legacy_precedent(current_evidence)
+            and allows_legacy_precedent(
+                current_evidence, policy=current_session.get("policy")
+            )
         ):
             # Do not apply a grant that expired while inference was running.
             if user_decisions:
