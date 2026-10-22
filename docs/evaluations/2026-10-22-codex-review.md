@@ -334,3 +334,31 @@ false-positive/negative rates.
 
 Private receipts, scripts, and source hashes are retained in Git-ignored
 `runs/codex-review-20261022-round8`, with directories 0700 and files 0600.
+
+
+## prlimit launcher follow-up
+
+Codex reproduced a missing literal launcher: `prlimit -- rm -rf /` could pass a
+broad allow rule. The parser now follows the executable argument position from
+the [util-linux contract](https://github.com/util-linux/util-linux/blob/v2.42.2/sys-utils/prlimit.c).
+Resource values are optional and attached; PID and output values may be separate.
+Long-option abbreviations, `--`, nested launchers, shell payloads, heredocs, and
+pipe-fed shells retain hard checks. Nonzero PID mode, help/version, invalid
+options, quoted examples, and bounded cleanup are non-critical. PID zero still
+permits command execution and is inspected. Parsing stops at the first operand.
+
+Before the fix, 57 prohibited cases failed while all 21 harmless/non-executing
+controls passed. All 78 now pass. Full server verification: 3,784 tests passed,
+68 external E2E tests excluded, two existing WebSocket warnings. Scoped Ruff
+lint/format and whitespace checks passed. The previously verified 1,203 Hermes
+tests are unchanged; no inference replay or deployment occurred. This remains
+bounded literal-command recognition, not a sandbox for arbitrary programs.
+The classifier docstring now states that unrecognized syntax follows ordinary
+classification, including configured allow shortcuts. Unknown launchers,
+interpreter code, dynamic expansion, and scripts on disk are not exhaustively
+analyzed; a broad command allowance is not a containment boundary. A generic
+scan of every argument was not added because arbitrary operands are data and
+would produce unoverridable false denials.
+
+Private receipts and source hashes are retained in Git-ignored
+`runs/codex-review-20261022-round9` (0700 directories, 0600 files).
