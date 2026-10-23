@@ -19,6 +19,8 @@ from weakref import WeakKeyDictionary
 from intaris.approval_policy import validate_approval_policy
 from intaris.db import Database
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.redactor import redact
+from intaris.semantic_policy import SemanticPolicyClearance
 from intaris.session import SessionStore, load_session_policy_chain
 
 logger = logging.getLogger(__name__)
@@ -968,6 +970,7 @@ class AuditStore:
         pending_only: bool = False,
         approval_source_call_id: str | None = None,
         scope_versions: dict[str, int] | None = None,
+        semantic_policy_clearance: SemanticPolicyClearance | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -993,6 +996,8 @@ class AuditStore:
             approval_source_call_id: Human grant used for a derived judge approval.
             scope_versions: Session and ancestor revisions observed by the Judge.
                 Only Judge approvals use this guard; human overrides stay final.
+            semantic_policy_clearance: Internal policy-only assessment bound to
+                this exact call and current deny clauses; never client input.
             pending_only: Resolve only an unresolved escalation, without the
                 normal human override of a prior judge verdict. Native
                 callbacks use this to make stale buttons inert.
@@ -1142,6 +1147,21 @@ class AuditStore:
                     session,
                     self._agent_policies.get(self._db),
                     ancestors=policy_chain[1:],
+                    semantic_policy_clearance=semantic_policy_clearance,
+                )
+            review_context = None
+            if user_decision == "approve" and isinstance(
+                semantic_policy_clearance, SemanticPolicyClearance
+            ):
+                review_context = json.dumps(
+                    {
+                        **(record.get("evaluation_context") or {}),
+                        "__intaris_deny_policy_review": {
+                            "assessment": "clear",
+                            "fingerprint": semantic_policy_clearance.fingerprint,
+                            "reasoning": redact(semantic_policy_clearance.reasoning),
+                        },
+                    }
                 )
             cur.execute(
                 f"""
@@ -1151,7 +1171,8 @@ class AuditStore:
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
-                    effective_decision = ?, approval_source_call_id = ?
+                    effective_decision = ?, approval_source_call_id = ?,
+                    evaluation_context = COALESCE(?, evaluation_context)
                 WHERE call_id = ? AND user_id = ?
                   AND decision IN ('escalate', 'deny')
                   AND expired_at IS NULL
@@ -1195,6 +1216,7 @@ class AuditStore:
                     judge_risk,
                     user_decision,
                     approval_source_call_id,
+                    review_context,
                     call_id,
                     user_id,
                     user_decision,

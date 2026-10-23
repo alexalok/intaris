@@ -5020,3 +5020,70 @@ def test_overridable_denials_filter_precedes_pagination(client_no_auth):
         params={**params, "source": "events"},
     ).json()
     assert events["total"] == 0
+
+
+@pytest.mark.parametrize("route", ["decision", "notification"])
+@pytest.mark.parametrize("assessment", ["clear", "applies", "unknown"])
+def test_pending_semantic_prohibitions_guard_every_approval_route(
+    client_no_auth, route, assessment
+):
+    from cryptography.fernet import Fernet
+
+    from intaris.audit import AuditStore
+    from intaris.notifications.tokens import generate_action_token, verify_action_token
+    from intaris.server import _get_config, _get_db, _get_evaluator
+    from intaris.session import SessionStore
+
+    user_id = "semantic-user"
+    sessions = SessionStore(_get_db())
+    sessions.create(
+        session_id="semantic-s",
+        user_id=user_id,
+        intention="Maintain project",
+        policy={"deny_policies": ["Do not send email"]},
+    )
+    evaluator = _get_evaluator()
+    call_id = evaluator.evaluate(
+        user_id=user_id,
+        session_id="semantic-s",
+        agent_id=None,
+        tool="terminal",
+        args={"command": "touch /work/a"},
+        tool_preferences={"terminal": "escalate"},
+    )["call_id"]
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            {"assessment": assessment, "reasoning": "Independent policy assessment."}
+        ),
+    ) as generate:
+        if route == "decision":
+            response = client_no_auth.post(
+                "/api/v1/decision",
+                headers={"X-User-Id": user_id},
+                json={
+                    "call_id": call_id,
+                    "decision": "approve",
+                    "semantic_policy_clearance": {
+                        "assessment": "clear",
+                        "fingerprint": "client-forged",
+                    },
+                },
+            )
+        else:
+            key = Fernet.generate_key().decode()
+            _get_config().mcp.encryption_key = key
+            token = generate_action_token(
+                call_id=call_id, user_id=user_id, action="approve", encryption_key=key
+            )
+            payload = verify_action_token(token, encryption_key=key, ttl_seconds=3600)
+            response = client_no_auth.post(
+                f"/api/v1/action/{token}", data={"csrf_token": payload.csrf_token}
+            )
+    assert response.status_code == (200 if assessment == "clear" else 400), (
+        response.text
+    )
+    record = AuditStore(_get_db()).get_by_call_id(call_id, user_id=user_id)
+    assert record["user_decision"] == ("approve" if assessment == "clear" else None)
+    generate.assert_called_once()

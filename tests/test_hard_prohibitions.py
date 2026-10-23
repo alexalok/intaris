@@ -882,8 +882,16 @@ def test_pending_free_text_safe_policy_edits_preserve_review(stores, change):
     elif change == "allow":
         policy["allow_policies"] = ["Allow all safe supporting work"]
     sessions.update_session("s", user_id="u", policy=policy)
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        {"assessment": "clear", "reasoning": "No applicable prohibition."}
+    )
+    evaluator = Evaluator(llm=llm, session_store=sessions, audit_store=audit)
+    clearance = evaluator.prepare_approval_policy(call_id, user_id="u")
     assert (
-        audit.resolve_escalation(call_id, "approve", user_id="u")["user_decision"]
+        audit.resolve_escalation(
+            call_id, "approve", user_id="u", semantic_policy_clearance=clearance
+        )["user_decision"]
         == "approve"
     )
 
@@ -910,8 +918,14 @@ def test_pending_restricted_session_uses_server_free_text_snapshot(stores):
         )["call_id"]
 
     first = evaluate()
+    evaluator._llm.generate.return_value = json.dumps(
+        {"assessment": "clear", "reasoning": "No email is sent."}
+    )
+    clearance = evaluator.prepare_approval_policy(first, user_id="u")
     assert (
-        audit.resolve_escalation(first, "approve", user_id="u")["user_decision"]
+        audit.resolve_escalation(
+            first, "approve", user_id="u", semantic_policy_clearance=clearance
+        )["user_decision"]
         == "approve"
     )
     second = evaluate()

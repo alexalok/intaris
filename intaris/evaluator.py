@@ -30,10 +30,11 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from intaris.approval_policy import (
-    effective_working_directory as _effective_working_directory,
+    deny_policy_fingerprints,
+    make_evaluation_context,
 )
 from intaris.approval_policy import (
-    make_evaluation_context,
+    effective_working_directory as _effective_working_directory,
 )
 from intaris.audit import AuditStore, ScopeChangedError
 from intaris.classifier import (
@@ -77,6 +78,7 @@ from intaris.session import SessionStore
 
 if TYPE_CHECKING:
     from intaris.jev import JevClient
+    from intaris.semantic_policy import SemanticPolicyClearance
 
 # Escalation retry: reuse approval if same tool+args approved within this window.
 _ESCALATION_RETRY_TTL_MINUTES = 10
@@ -296,6 +298,25 @@ class Evaluator:
         # Model-learned prefixes lack a human approval ID. Bind them to the
         # original scope snapshot so later user decisions invalidate them too.
         self._approved_path_scopes: dict[tuple[str, str], dict[str, int]] = {}
+
+    def prepare_approval_policy(
+        self, call_id: str, *, user_id: str
+    ) -> SemanticPolicyClearance | None:
+        """Assess pending-call prohibitions without reevaluating or auditing a call.
+
+        Approval authority is separate from policy applicability. The atomic
+        store binds this assessment to the exact record and current rules.
+        """
+        from intaris.semantic_policy import assess_semantic_policy
+
+        record = self._audit.get_by_call_id(call_id, user_id=user_id)
+        session = self._sessions.get_with_parent_policy(
+            record["session_id"], user_id=user_id, agent_policy=self._agent_policy
+        )
+        policy = session.get("policy") or {}
+        if not deny_policy_fingerprints(policy):
+            return None
+        return assess_semantic_policy(record, policy, llm=self._llm, jev=self._jev)
 
     async def wait_for_alignment(self, user_id: str, session_id: str) -> None:
         """Let MCP metadata calls observe pending alignment checks before evaluation."""

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from intaris.semantic_policy import SemanticPolicyClearance
 
 from intaris.classifier import (
     Classification,
@@ -100,6 +104,7 @@ def validate_approval_policy(
     agent_policy: dict[str, Any] | None,
     *,
     ancestors: list[dict[str, Any]] | None = None,
+    semantic_policy_clearance: SemanticPolicyClearance | None = None,
 ) -> None:
     """Refuse grants that violate current hard rules or cannot be rechecked.
 
@@ -124,6 +129,20 @@ def validate_approval_policy(
         raise ValueError(
             "Free-text deny policies changed or lack evaluation evidence; evaluate the original call again"
         )
+    if current_clauses:
+        from intaris.semantic_policy import (
+            SemanticPolicyClearance,
+            semantic_policy_fingerprint,
+        )
+
+        if not isinstance(semantic_policy_clearance, SemanticPolicyClearance) or (
+            semantic_policy_clearance.fingerprint
+            != semantic_policy_fingerprint(record, policy)
+        ):
+            raise ValueError(
+                "Free-text deny policies require a current semantic assessment; "
+                "approval cannot override an applicable or unresolved prohibition"
+            )
     tool = record.get("tool") or ""
     # This value is evaluator-owned and already includes tool workdir. Do not
     # apply a relative workdir twice or use mutable current session details.
@@ -198,3 +217,20 @@ def validate_approval_policy(
         raise ValueError(
             "Current path policy requires an executor working directory; evaluate again"
         )
+
+
+async def prepare_approval_policy(
+    *, evaluator: Any | None, call_id: str, user_id: str
+) -> SemanticPolicyClearance | None:
+    """Run semantic approval preflight outside the atomic grant transaction.
+
+    Legacy callers without an evaluator receive no proof; the store still
+    rejects their approvals when semantic prohibitions need assessment.
+    """
+    from intaris.semantic_policy import SemanticPolicyClearance
+
+    prepare = getattr(evaluator, "prepare_approval_policy", None)
+    if not callable(prepare):
+        return None
+    clearance = await asyncio.to_thread(prepare, call_id, user_id=user_id)
+    return clearance if isinstance(clearance, SemanticPolicyClearance) else None

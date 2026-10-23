@@ -30,6 +30,7 @@ from datetime import datetime
 from datetime import timezone as tz
 from typing import Any
 
+from intaris.approval_policy import prepare_approval_policy
 from intaris.audit import ScopeChangedError
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
@@ -1203,6 +1204,14 @@ async def resolve_with_side_effects(
         except ValueError:
             pass
 
+    # Policy applicability is independent of the human or Judge's approval.
+    # Inference stays outside the transaction; the store rechecks its binding.
+    clearance = None
+    if user_decision == "approve":
+        clearance = await prepare_approval_policy(
+            evaluator=evaluator, call_id=call_id, user_id=user_id
+        )
+
     # Step 1: Resolve the escalation (atomic DB update)
     resolved = audit_store.resolve_escalation(
         call_id=call_id,
@@ -1217,6 +1226,7 @@ async def resolve_with_side_effects(
         **({"user_note_source": user_note_source} if user_note_source else {}),
         **({"pending_only": True} if pending_only else {}),
         **({"scope_versions": scope_versions} if scope_versions is not None else {}),
+        **({"semantic_policy_clearance": clearance} if clearance is not None else {}),
     )
 
     # Look up the full record for downstream processing

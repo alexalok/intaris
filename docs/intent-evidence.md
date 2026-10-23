@@ -191,9 +191,29 @@ event. Email actions, native callbacks, human review, and Judge share this guard
 New or changed free-text deny clauses require a fresh evaluation before an old
 pending call can be approved. Clause hashes record the effective policy without
 storing its text; removing clauses, reordering them, or changing display IDs does
-not invalidate a grant. Legacy records with no snapshot must be evaluated again
-when free-text denies apply. This freshness guard does not convert natural-language
-model judgments into deterministic hard prohibitions.
+not invalidate the snapshot. Legacy records with no snapshot must be evaluated
+again when free-text denies apply.
+
+A matching snapshot alone does not establish compliance. Approving a pending
+call with nonempty `deny_policies` runs an independent policy-only assessment
+through the configured L1 or Jev backend, outside the database transaction. Its
+result must explicitly say that no current deny clause applies. This separates
+policy applicability from the human or Judge's approval authority and from the
+original alignment/risk decision: an unrelated rule can clear even when the call
+still needed human review. Applicable or uncertain clauses, incomplete inputs,
+and provider failures leave the call non-executable. No new model call is added
+to approvals without semantic deny clauses or to ordinary tool evaluation.
+
+The resulting internal clearance is bound to the tenant, call, tool, recorded
+arguments and invocation context, and current clause fingerprints. The atomic
+store rechecks that binding and current policy/ancestor guards before committing
+the grant, then records the clearance and explanation in `evaluation_context`.
+Client-supplied context or decision fields cannot manufacture clearance. Human,
+Judge, native callback, and notification-link approvals use the same independent
+check; direct store callers without clearance cannot bypass it. These approvals
+incur one additional inference using the existing provider timeout and budget.
+Natural-language applicability still depends on the model; it is not a
+complete deterministic policy interpreter or a measured live-model accuracy claim.
 
 If redacted or compacted argument text prevents checking a relevant command or
 path deny rule, or a relative path lacks its executor directory, approval fails
