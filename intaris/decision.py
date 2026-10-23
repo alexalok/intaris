@@ -60,6 +60,8 @@ class EvaluationResult:
     metadata: dict[str, Any] | None = None
     # Internal provenance for cached permissions; never serialized as API metadata.
     approval_call_id: str | None = None
+    # False when a provider budget prevents inference, not a model judgment.
+    evaluation_complete: bool = True
 
 
 @dataclass
@@ -75,6 +77,7 @@ class Decision:
     approval_call_id: str | None = None
     intent_evidence: dict[str, Any] | None = None
     evidence_changed: bool = False
+    evaluation_complete: bool = True
 
     @property
     def is_approved(self) -> bool:

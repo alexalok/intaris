@@ -114,8 +114,8 @@ def test_judge_prompt_uses_effective_policy_view():
         intention="Review an escalated git commit",
         policy={
             "allow_paths": [
-                "/Users/fpytloun/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                "/Users/demouser/*",
+                "/Users/demouser/src/demoapps/sample/ansible/*",
             ]
         },
         recent_history=[],
@@ -128,8 +128,8 @@ def test_judge_prompt_uses_effective_policy_view():
         agent_id=None,
     )
 
-    assert '"/Users/fpytloun/*"' in prompt
-    assert '"/Users/fpytloun/src/lumilens/beskar/ansible/*"' not in prompt
+    assert '"/Users/demouser/*"' in prompt
+    assert '"/Users/demouser/src/demoapps/sample/ansible/*"' not in prompt
 
 
 @pytest.mark.parametrize("mode", ["auto", "advisory"])
@@ -2629,7 +2629,7 @@ class TestJudgePrompt:
                         "__intaris_context": {
                             "skill": {
                                 "skill_id": "skill_1",
-                                "name": "lumilens-loki-query",
+                                "name": "demoapps-loki-query",
                                 "description": "Query Loki safely",
                             }
                         },
@@ -2642,7 +2642,7 @@ class TestJudgePrompt:
         assert packet["known_skills"] == [
             {
                 "skill_id": "skill_1",
-                "name": "lumilens-loki-query",
+                "name": "demoapps-loki-query",
                 "description": "Query Loki safely",
             }
         ]

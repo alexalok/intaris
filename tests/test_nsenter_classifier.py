@@ -174,14 +174,11 @@ def test_nsenter_optional_short_values_do_not_consume_command(
 )
 @pytest.mark.parametrize("operand", ["'rm -rf /'", "rm"])
 def test_nsenter_required_values_are_data(option: str, operand: str) -> None:
-    assert (
-        classify(
-            "terminal",
-            {"command": f"nsenter {option} {operand} echo -rf /"},
-            session_policy={"allow_commands": ["*"]},
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal",
+        {"command": f"nsenter {option} {operand} echo -rf /"},
+        session_policy={"allow_commands": ["*"]},
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(
@@ -261,12 +258,9 @@ def test_nsenter_required_values_are_data(option: str, operand: str) -> None:
     ],
 )
 def test_nsenter_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize("maximum", ["approve", "escalate", "deny"])

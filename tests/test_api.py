@@ -5043,14 +5043,21 @@ def test_pending_semantic_prohibitions_guard_every_approval_route(
         policy={"deny_policies": ["Do not send email"]},
     )
     evaluator = _get_evaluator()
-    call_id = evaluator.evaluate(
-        user_id=user_id,
-        session_id="semantic-s",
-        agent_id=None,
-        tool="terminal",
-        args={"command": "touch /work/a"},
-        tool_preferences={"terminal": "escalate"},
-    )["call_id"]
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+        ),
+    ):
+        call_id = evaluator.evaluate(
+            user_id=user_id,
+            session_id="semantic-s",
+            agent_id=None,
+            tool="terminal",
+            args={"command": "touch /work/a"},
+            tool_preferences={"terminal": "escalate"},
+        )["call_id"]
     with patch.object(
         evaluator._llm,
         "generate",

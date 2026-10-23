@@ -252,12 +252,21 @@ captured inside the approval transaction, so a delayed callback cannot stamp an
 old grant with newer authority. Reloaded records lacking that snapshot use fresh
 evaluation or exact retry rather than seeding a cache.
 
+### Command inspection boundary
+
+Command inspection keeps two independent facts: whether a hard prohibition was
+positively recognized, and whether inspection is complete enough for an
+existing fast path. The fast-path proof is deliberately narrow: existing
+simple-read checks or an exact `allow_scripts` contract. Recognizing a wrapper
+for a hard prohibition does not certify that wrapper for permission.
+
 Shell recognition distinguishes executable positions, literal wrappers,
 operators, quoted arguments, substitutions, and heredoc data. For example:
 
 | Operation | Deterministic classification |
 |---|---|
-| More than eight recursive shell-inspection steps | Hard denial; simplify the command |
+| More than eight recursive shell-inspection steps | Normal L1 evaluation; inspection incomplete |
+| Unknown wrapper or dynamic command construction | Normal L1 evaluation; inspection incomplete |
 | `sudo -n rm -rf /` | Hard denial |
 | `bash -c 'rm -rf /'` | Hard denial |
 | `if true; then reboot; fi` | Hard denial |
@@ -265,12 +274,44 @@ operators, quoted arguments, substitutions, and heredoc data. For example:
 | `rm -rf /tmp/my-build` | Normal evaluation |
 | Writing a quoted heredoc containing a destructive command | Not a hard denial |
 | Feeding that heredoc to a shell | Destructive command is checked |
+| Feeding that heredoc to an unknown consumer or shell script | Normal L1 evaluation; execution is not proven |
 
-This is a bounded literal recognizer, not a shell interpreter or a sandbox.
-Dynamic programs and unknown tools still rely on ordinary policy and model
-evaluation. A model-assessed denial is distinct from classifier `CRITICAL` and
-can still use the existing human override flow. Judge's low risk rating alone
-does not authorize a call it denied or deferred.
+For `bash` and `terminal`, incomplete inspection returns classifier `WRITE` and
+uses the configured L1 backend (`llm` or Jev/CLEF), with audit path `llm`.
+It precedes broad command/tool allow patterns, auto-approve preferences, and the
+direct `ESCALATE` preference shortcut. Uncertainty alone neither denies the
+call nor skips inference to open an approval request. Explicit deny rules and
+positively recognized critical commands remain unconditional hard stops.
+Other tool names keep their existing classification contracts.
+
+The positive recognizer bounds command input at 65,536 characters, recursive
+inspection at eight levels, simple-command tokens at 512, segments per split at
+512, shared inspection nodes at 512, and accumulated command/segment inspection
+work at 262,144 characters. These are inspection limits, independent of
+CLEF's UTF-8 request-byte limit. Exceeding a limit is incomplete inspection,
+not proof of danger or safety. Shallow hard-stop checks precede recursive body
+work so a large heredoc cannot hide a recognized sibling prohibition. Input
+or nested text beyond inspection limits still depends on L1; this is not a
+complete shell interpreter or a sandbox.
+
+Incomplete commands cannot borrow path-cache permissions, teach new path
+prefixes, or use mechanical similarity precedent to replace an L1 or Judge
+verdict. Exact reusable grants retain their existing authority after current
+L1 evaluation, including the implicit human denial-override contract. They
+still require exact tenant/session/tool/arguments and current scope, lifecycle,
+expiry, and revocation checks. Restricted sessions accept only human grants.
+Explicit approval IDs cannot lift a fresh L1 denial; an L1 escalation requires
+the same reviewed scope, or a new L1 approval, to reuse that explicit grant.
+Inference exceptions propagate, and local Jev input-budget rejection cannot
+become approval through caps or an old grant.
+
+Evaluator-owned `evaluation_context.command_inspection` records `complete`,
+`critical`, and an optional reason. It replaces caller claims and reaches L1
+as context. Audit also retains the original `l1_decision` and any exact
+`approval_call_id` used after inference. Inspection facts describe routing;
+they are not authorization. A model-assessed denial remains distinct from
+classifier `CRITICAL` and retains its existing human override flow. Judge's
+low risk rating alone does not authorize a call it denied or deferred.
 
 ## Verification
 

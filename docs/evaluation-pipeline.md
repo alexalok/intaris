@@ -67,6 +67,7 @@ Checked in order -- first match wins:
 | 1.5 | Session policy `deny_paths` | **CRITICAL** | Filesystem path deny (fnmatch) |
 | 2 | Tool preference deny | **CRITICAL** | Per-tool MCP preference |
 | 2.5 | Critical command detection (bash/terminal) | **CRITICAL** | Non-overridable destructive operations |
+| 2.6 | Incomplete command inspection (bash/terminal) | **WRITE** | Normal configured L1 evaluation before broad allows, tool preferences, or reusable grants |
 | 3 | Tool preference escalate | **ESCALATE** | Per-tool MCP preference |
 | 4 | Session policy `allow_tools` / `allow_commands` / `allow_scripts` | **READ** | Admin-defined allow rules; script allowances require an exact path and a literal Python invocation |
 | 5 | Tool preference auto-approve | **READ** | Per-tool MCP preference |
@@ -77,6 +78,13 @@ Checked in order -- first match wins:
 Classifier `CRITICAL` is a hard prohibition, checked before all allow paths. Neither
 outcome caps, cached approval, Judge, nor human resolution can approve it. See
 [Source-linked intent](intent-evidence.md) for authority and evidence semantics.
+
+Command fast paths require an existing simple-read proof or an exact
+`allow_scripts` match. Unknown wrappers, dynamic or compound shell syntax,
+parse failures, and inspection-budget exhaustion take the normal L1 path.
+They do not use the classifier's direct `ESCALATE` shortcut or become hard
+prohibitions merely because inspection is incomplete. Explicit deny rules and
+positively recognized critical operations retain precedence.
 
 ### Read-Only Allowlist
 

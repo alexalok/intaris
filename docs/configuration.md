@@ -73,6 +73,16 @@ Validation and enforcement:
 
 ### Exact Python script allowances
 
+For `bash` and `terminal`, broad `allow_tools`/`allow_commands` matches and
+auto-approve preferences do not establish that a command was understood.
+Command fast paths also require an existing simple-read proof or a valid exact
+script match. Unknown wrappers, dynamic or compound commands, parse failures,
+and exhausted inspection budgets use the configured L1 evaluator even when an
+allow pattern matches or a tool has an `escalate` preference. Explicit denies
+and recognized hard prohibitions still win. Other tool names keep their
+existing policy behavior. See [command inspection](intent-evidence.md#command-inspection-boundary)
+for budgets, retry semantics, and limitations.
+
 Add `allow_scripts` to the existing `INTARIS_AGENT_POLICY` to fast-approve a
 trusted Python utility without allowing arbitrary terminal commands:
 
@@ -201,7 +211,7 @@ JEV_BASE_URL=https://openrouter.ai/api
 JEV_MODEL=typesafe/jev-1.13-20260917
 JEV_API_KEY=<OpenRouter API key>
 LLM_MODEL=gpt-oss-20b
-LLM_BASE_URL=https://openai.fpy.cz/v1
+LLM_BASE_URL=https://llm.example.com/v1
 ANALYSIS_LLM_MODEL=gpt-oss-120b
 JUDGE_LLM_MODEL=gpt-oss-120b
 ```

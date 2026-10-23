@@ -318,7 +318,7 @@ EVALUATOR_BACKEND=llm \
 JUDGE_MODE=disabled \
 INTARIS_API_KEY="$INTARIS_API_KEY" \
 LLM_API_KEY="$LLM_API_KEY" \
-LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_BASE_URL=https://llm.example.com/v1 \
 LLM_MODEL=gpt-oss-20b \
 intaris
 
@@ -332,7 +332,7 @@ JEV_MODEL=typesafe/jev-1.13-20260917 \
 JUDGE_MODE=disabled \
 INTARIS_API_KEY="$INTARIS_API_KEY" \
 LLM_API_KEY="$LLM_API_KEY" \
-LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_BASE_URL=https://llm.example.com/v1 \
 LLM_MODEL=gpt-oss-20b \
 intaris
 ```
@@ -343,7 +343,7 @@ Start with the deterministic gold calibration category:
 python -m tools.benchmark \
   --url http://localhost:8060 --api-key "$INTARIS_API_KEY" run \
   --llm-api-key "$LLM_API_KEY" \
-  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-base-url https://llm.example.com/v1 \
   --llm-model gpt-oss-20b \
   --category gold \
   --eval-model gpt-oss-120b \
@@ -352,7 +352,7 @@ python -m tools.benchmark \
 python -m tools.benchmark \
   --url http://localhost:8061 --api-key "$INTARIS_API_KEY" run \
   --llm-api-key "$LLM_API_KEY" \
-  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-base-url https://llm.example.com/v1 \
   --llm-model gpt-oss-20b \
   --category gold \
   --eval-model gpt-oss-120b \

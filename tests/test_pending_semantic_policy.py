@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -34,15 +34,24 @@ def pending(setup, *, clauses=None, command="touch /work/a", context=None):
             "deny_policies": clauses if clauses is not None else ["Do not edit /work/a"]
         },
     )
-    return evaluator.evaluate(
-        user_id="u",
-        session_id="s",
-        agent_id=None,
-        tool="terminal",
-        args={"command": command},
-        context=context,
-        tool_preferences={"terminal": "escalate"},
-    )["call_id"]
+    # Creating the pending shell call now performs L1; the outer mock remains
+    # dedicated to the independent approval-policy assessment under test.
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+        ),
+    ):
+        return evaluator.evaluate(
+            user_id="u",
+            session_id="s",
+            agent_id=None,
+            tool="terminal",
+            args={"command": command},
+            context=context,
+            tool_preferences={"terminal": "escalate"},
+        )["call_id"]
 
 
 def resolve(setup, call_id, *, resolved_by="user", event_bus=None):
@@ -227,6 +236,9 @@ def test_pending_child_approval_assesses_inherited_semantic_rules(setup, assessm
         user_id="u",
         parent_session_id="s",
         intention="Maintain project",
+    )
+    llm.generate.return_value = json.dumps(
+        dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
     )
     call_id = evaluator.evaluate(
         user_id="u",

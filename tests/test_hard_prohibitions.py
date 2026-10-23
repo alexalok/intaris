@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -439,9 +439,11 @@ def test_unrelated_new_hard_rule_does_not_block_pending_approval(stores, rule):
 
 def _pending_for_policy(stores, *, args=None, context=None):
     sessions, audit = stores
-    return Evaluator(
-        llm=MagicMock(), session_store=sessions, audit_store=audit
-    ).evaluate(
+    llm = MagicMock()
+    llm.generate.return_value = json.dumps(
+        dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+    )
+    return Evaluator(llm=llm, session_store=sessions, audit_store=audit).evaluate(
         user_id="u",
         session_id="s",
         agent_id=None,
@@ -907,15 +909,27 @@ def test_pending_restricted_session_uses_server_free_text_snapshot(stores):
     )
 
     def evaluate():
-        return evaluator.evaluate(
-            user_id="u",
-            session_id="s",
-            agent_id=None,
-            restricted_agent=True,
-            tool="terminal",
-            args={"command": "touch /work/a"},
-            tool_preferences={"terminal": "escalate"},
-        )["call_id"]
+        with patch.object(
+            evaluator._llm,
+            "generate",
+            return_value=json.dumps(
+                dict(
+                    aligned=False,
+                    risk="medium",
+                    decision="escalate",
+                    reasoning="Review",
+                )
+            ),
+        ):
+            return evaluator.evaluate(
+                user_id="u",
+                session_id="s",
+                agent_id=None,
+                restricted_agent=True,
+                tool="terminal",
+                args={"command": "touch /work/a"},
+                tool_preferences={"terminal": "escalate"},
+            )["call_id"]
 
     first = evaluate()
     evaluator._llm.generate.return_value = json.dumps(

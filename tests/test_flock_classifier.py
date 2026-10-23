@@ -248,12 +248,9 @@ def test_flock_literal_execution_is_prohibited(command: str) -> None:
     ],
 )
 def test_flock_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(
@@ -271,14 +268,11 @@ def test_flock_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> N
 )
 @pytest.mark.parametrize("operand", ["'rm -rf /'", "rm", "-c"])
 def test_flock_required_values_are_data(option: str, operand: str) -> None:
-    assert (
-        classify(
-            "terminal",
-            {"command": f"flock {option} {operand} /tmp/guard echo -rf /"},
-            session_policy={"allow_commands": ["*"]},
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal",
+        {"command": f"flock {option} {operand} /tmp/guard echo -rf /"},
+        session_policy={"allow_commands": ["*"]},
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(

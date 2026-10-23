@@ -13,6 +13,7 @@ Classification priority (deny always wins):
 1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
 2.   Tool preference deny → CRITICAL
 2.5. Critical command detection (bash/terminal) → CRITICAL
+2.6. Incomplete command inspection (bash/terminal) → WRITE
 3.   Tool preference escalate → ESCALATE
 4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
 5.   Tool preference auto-approve → READ
@@ -28,6 +29,7 @@ import logging
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -43,6 +45,103 @@ class Classification(Enum):
     WRITE = "write"
     CRITICAL = "critical"
     ESCALATE = "escalate"
+
+
+@dataclass(frozen=True)
+class CommandInspection:
+    """Independent proof of a hard stop and eligibility for command fast paths.
+
+    Complete means sufficient for an existing read or exact-script contract,
+    not full shell interpretation. An incomplete command needs current L1.
+    Non-shell tools have no command boundary and return complete by default.
+    """
+
+    complete: bool
+    critical: bool = False
+    reason: str | None = None
+
+
+_MAX_COMMAND_CHARS = 65_536
+_MAX_SHELL_WORDS = 512
+_MAX_SHELL_SEGMENTS = 512
+_MAX_SHELL_WORK_CHARS = 262_144
+
+
+@dataclass
+class _ShellInspectionBudget:
+    remaining: int = _MAX_SHELL_WORK_CHARS
+    nodes: int = _MAX_SHELL_SEGMENTS
+    exhausted: bool = False
+
+    def take(self, amount: int, *, node: bool = False) -> bool:
+        if amount > self.remaining or (node and self.nodes <= 0):
+            self.exhausted = True
+            return False
+        self.remaining -= amount
+        self.nodes -= int(node)
+        return True
+
+
+def inspect_command(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    session_policy: dict[str, Any] | None = None,
+    working_directory: str | None = None,
+) -> CommandInspection:
+    """Bound literal inspection; never interpret missing proof as permission.
+
+    Existing wrapper recognizers are positive hard-stop detectors only. No
+    unknown executable, wrapper, language, or compound shell syntax becomes
+    understood merely because no prohibition was found. Exact script grants
+    keep their separate explicit trust contract and path checks in classify().
+    """
+    if tool not in {"bash", "terminal"}:
+        return CommandInspection(complete=True)
+    command = args.get("command") or args.get("cmd")
+    if not isinstance(command, str) or not command.strip():
+        return CommandInspection(False, reason="missing_or_invalid_command")
+    if len(command) > _MAX_COMMAND_CHARS:
+        return CommandInspection(False, reason="inspection_budget")
+    budget = _ShellInspectionBudget()
+    critical = _is_critical(command, _budget=budget)
+    if critical:
+        return CommandInspection(False, critical=True, reason="hard_prohibition")
+    if budget.exhausted:
+        return CommandInspection(False, reason="inspection_budget")
+    script = match_allowed_script(tool, args, session_policy)
+    if script and (session_policy or {}).get("deny_paths"):
+        if not _script_policy_paths(args, working_directory)[1]:
+            return CommandInspection(False, reason="unresolved_script_paths")
+    if _shell_command_tokens(command) is not None and (
+        _is_read_only_bash(args) or script
+    ):
+        return CommandInspection(True)
+    return CommandInspection(False, reason="unsupported_command")
+
+
+def _script_policy_paths(
+    args: dict[str, Any],
+    working_directory: str | None,
+) -> tuple[list[str], bool]:
+    """Keep exact-script grants subject to their original path-proof contract."""
+    candidates, options_known = script_path_candidates(_extract_bash_command(args))
+    resolved = resolve_tool_paths("terminal", args, working_directory or "")
+    resolved.extend(
+        resolve_path(path, working_directory or "")
+        for path in candidates
+        if working_directory or os.path.isabs(path)
+    )
+    known = (
+        options_known
+        and all(
+            not path.startswith(("//", "~"))
+            and (working_directory or os.path.isabs(path))
+            for path in candidates
+        )
+        and all(os.path.isabs(path) and not path.startswith("//") for path in resolved)
+    )
+    return resolved, bool(known)
 
 
 # ── Read-Only Allowlist ───────────────────────────────────────────────
@@ -1075,6 +1174,7 @@ def classify(
     tool_preferences: dict[str, str] | None = None,
     working_directory: str | None = None,
     trusted_readonly: bool = False,
+    _command_inspection: CommandInspection | None = None,
 ) -> Classification:
     """Classify a tool call as READ, WRITE, CRITICAL, or ESCALATE.
 
@@ -1083,6 +1183,7 @@ def classify(
     1.5. Session policy deny_paths (fnmatch on resolved paths) → CRITICAL
     2.   Tool preference deny → CRITICAL
     2.5. Critical command detection (bash/terminal) → CRITICAL
+    2.6. Incomplete command inspection (bash/terminal) → WRITE
     3.   Tool preference escalate → ESCALATE
     4.   Session policy allow (allow_tools, allow_commands, allow_scripts) → READ
     5.   Tool preference auto-approve → READ
@@ -1110,6 +1211,9 @@ def classify(
     if tool == "skill_view_raw":
         return _classify_raw_skill_read(args, session_policy, tool_preferences)
 
+    inspection = _command_inspection or inspect_command(
+        tool, args, session_policy=session_policy, working_directory=working_directory
+    )
     metadata_readonly = trusted_readonly is True and ":" in tool
     allowed_script = match_allowed_script(tool, args, session_policy)
     script_paths_known = True
@@ -1126,29 +1230,8 @@ def classify(
         if allowed_script:
             # The generic shell extractor splits at raw delimiters, including
             # quoted ones. Use intact literal argv for this narrower fast path.
-            candidates, options_known = script_path_candidates(
-                _extract_bash_command(args)
-            )
-            resolved.extend(
-                resolve_path(path, working_directory or "")
-                for path in candidates
-                if working_directory or os.path.isabs(path)
-            )
-            if session_policy.get("deny_paths"):
-                script_paths_known = (
-                    options_known
-                    and all(
-                        not path.startswith(("//", "~"))
-                        and (working_directory or os.path.isabs(path))
-                        for path in candidates
-                    )
-                    and all(
-                        # Relative operands can inherit a double-leading slash
-                        # from cwd, so validate resolved paths as well as argv.
-                        os.path.isabs(path) and not path.startswith("//")
-                        for path in resolved
-                    )
-                )
+            resolved, paths_known = _script_policy_paths(args, working_directory)
+            script_paths_known = not session_policy.get("deny_paths") or paths_known
         if resolved and _check_deny_paths(resolved, session_policy):
             return Classification.CRITICAL
 
@@ -1158,10 +1241,13 @@ def classify(
         return Classification.CRITICAL
 
     # Hard prohibitions precede every allow/escalation shortcut.
-    if tool in {"bash", "terminal"}:
-        command = _extract_bash_command(args)
-        if command and _is_critical(command):
-            return Classification.CRITICAL
+    if inspection.critical:
+        return Classification.CRITICAL
+
+    # Unknown structure is neither a prohibition nor an approval request.
+    # Run normal L1 before every permissive or direct-escalation shortcut.
+    if not inspection.complete:
+        return Classification.WRITE
 
     # Step 3: Tool preference escalate
     if pref == "escalate":
@@ -1330,40 +1416,51 @@ def _strip_quoted_strings(command: str) -> str:
 _MAX_SHELL_DEPTH = 8
 
 
-def _is_critical(command: str, _depth: int = 0, *, _time_keyword: bool = True) -> bool:
+def _is_critical(
+    command: str,
+    _depth: int = 0,
+    *,
+    _time_keyword: bool = True,
+    _budget: _ShellInspectionBudget | None = None,
+) -> bool:
     """Recognize prohibited execution, preserving quoted operands and prose.
 
     This is a bounded literal shell recognizer, not a shell interpreter.
-    Unrecognized syntax follows normal classification, including configured
-    allow shortcuts; this recognizer cannot make a broad allow rule a sandbox.
+    A negative result does not establish completeness. inspect_command() keeps
+    unsupported forms and inspection exhaustion out of permission shortcuts.
     """
-    if _depth > _MAX_SHELL_DEPTH:
-        # Exhausted inspection is not evidence of safety. A broad allow rule
-        # must not authorize an uninspected nested payload.
-        return True
-    raw_segments, heredocs = _shell_segments(command, time_keyword=_time_keyword)
+    budget = _budget if _budget is not None else _ShellInspectionBudget()
+    if _depth > _MAX_SHELL_DEPTH or len(command) > _MAX_COMMAND_CHARS:
+        budget.exhausted = True
+        return False
+    if not budget.take(len(command) + 1, node=True):
+        return False
+    raw_segments, heredocs = _shell_segments(
+        command, time_keyword=_time_keyword, _budget=budget
+    )
     executable_text = "".join(raw + separator for raw, separator in raw_segments)
     if re.search(
         r":\(\)\s*\{\s*:\|:&\s*\}\s*;", _strip_quoted_strings(executable_text)
     ):
         # The fork-bomb form is shell syntax rather than an external command.
         return True
+    nested_commands: list[tuple[str, bool]] = []
     for body, expands, executes in heredocs:
-        nested_commands = (
-            [body]
-            if executes
-            else _shell_substitutions(body, literal_quotes=True)
-            if expands
-            else []
+        nested_commands.extend(
+            (nested, True)
+            for nested in (
+                [body]
+                if executes
+                else _shell_substitutions(body, literal_quotes=True)
+                if expands
+                else []
+            )
         )
-        if any(_is_critical(nested, _depth + 1) for nested in nested_commands):
-            return True
     segments: list[tuple[list[str], str]] = []
     for segment_index, (raw, separator) in enumerate(raw_segments):
-        if any(
-            _is_critical(nested, _depth + 1) for nested in _shell_substitutions(raw)
-        ):
-            return True
+        if not budget.take(len(raw) + 1, node=True):
+            break
+        nested_commands.extend((nested, True) for nested in _shell_substitutions(raw))
         # Bash recognizes time before a pipeline, not after a pipe operator.
         words = _critical_command_words(
             raw,
@@ -1378,17 +1475,16 @@ def _is_critical(command: str, _depth: int = 0, *, _time_keyword: bool = True) -
             continue
         head = os.path.basename(words[0])
         operands = words[1:]
-        if any(
-            _is_critical(shlex.join(launched), _depth + 1, _time_keyword=False)
+        nested_commands.extend(
+            (shlex.join(launched), False)
             for launched in _literal_launched_commands(words)
-        ):
-            return True
+        )
         if head in {"sh", "bash", "zsh", "dash", "ksh"}:
             payload = _shell_command_string(operands)
-            if payload is not None and _is_critical(payload, _depth + 1):
-                return True
-        if head == "eval" and _is_critical(" ".join(operands), _depth + 1):
-            return True
+            if payload is not None:
+                nested_commands.append((payload, True))
+        if head == "eval":
+            nested_commands.append((" ".join(operands), True))
         if head == "rm":
             recursive = False
             targets = []
@@ -1469,7 +1565,13 @@ def _is_critical(command: str, _depth: int = 0, *, _time_keyword: bool = True) -
             and os.path.basename(right[0]) in {"sh", "bash"}
         ):
             return True
-    return False
+    # Nested bodies cannot consume the budget before already-tokenized sibling
+    # commands receive positive hard-stop checks. Exhaustion is uncertainty,
+    # but never cancels a prohibition recognized in the bounded shallow pass.
+    return any(
+        _is_critical(nested, _depth + 1, _time_keyword=time_keyword, _budget=budget)
+        for nested, time_keyword in nested_commands
+    )
 
 
 def _protected_target_path(target: str) -> str:
@@ -1516,8 +1618,9 @@ def _literal_stdio_command(words: list[str]) -> list[str]:
     A wrapper's shell is not necessarily its stdin consumer: `sh -c cat`
     reads data, while `sh -c sh` executes it. Critical payload inspection still
     examines the full original shell text separately. Only known shells,
-    downloaders, and literal data consumers can replace the endpoint. Other
-    programs, compound syntax, and substitutions keep its conservative identity.
+    downloaders, and literal data consumers can replace the endpoint. Unknown
+    consumers do not prove that stdin will execute; normal L1 assesses them.
+    Literal eval/source forms that execute inherited stdin remain shell endpoints.
     """
     for _ in range(_MAX_SHELL_DEPTH + 1):
         if not words or os.path.basename(words[0]) not in {
@@ -1529,10 +1632,50 @@ def _literal_stdio_command(words: list[str]) -> list[str]:
         }:
             return words
         payload = _shell_command_string(words[1:])
+        if payload is None:
+            # No -c payload does not prove stdin execution: a script operand,
+            # missing -c argument, help, or no-exec mode can all reach here.
+            # Recognize only literal stdin modes; leave other options to L1.
+            stdin_mode = False
+            for index, option in enumerate(words[1:], start=1):
+                if option in {"-", "--"}:
+                    return words if stdin_mode or index == len(words) - 1 else []
+                if re.fullmatch(r"-[iseufvx]+", option):
+                    stdin_mode |= "s" in option
+                    continue
+                if option.startswith(("-", "+")):
+                    return []
+                return words if stdin_mode else []
+            return words
+        # Recognize this bounded execution proof before the dynamic-syntax
+        # fallback. Match the whole payload, preserving quote provenance and
+        # excluding redirections that would replace the inherited stdin.
+        cat_stdin = r"cat(?:[ \t]+(?:-|/dev/stdin|/dev/fd/0))?"
+        stdin_read = rf"(?:\$\([ \t]*{cat_stdin}[ \t]*\)|`[ \t]*{cat_stdin}[ \t]*`)"
+        if re.fullmatch(rf'eval[ \t]+(?:{stdin_read}|"{stdin_read}")', payload.strip()):
+            return words
+        if re.search(r"[$`]", payload) or re.search(
+            r"[;&|()<>\n]", _strip_quoted_strings(payload)
+        ):
+            return []
+        # Builtins must be invoked by this shell itself. An external wrapper
+        # such as env cannot launch source/eval, and '#' within a filename is
+        # literal rather than the start of a shell comment.
+        parsed = _shell_command_tokens(payload)
+        try:
+            literal = shlex.split(" ".join(parsed[0])) if parsed is not None else []
+        except ValueError:
+            return []
         if (
-            payload is None
-            or re.search(r"[$`]", payload)
-            or re.search(r"[;&|()<>\n]", _strip_quoted_strings(payload))
+            len(literal) == 2
+            and literal[0] in {".", "source"}
+            and literal[1] in {"/dev/stdin", "/dev/fd/0"}
+        ):
+            return words
+        if (
+            len(literal) == 2
+            and literal[0] == "eval"
+            and literal[1] in {"sh", "bash", "zsh", "dash", "ksh"}
         ):
             return words
         launched = _critical_command_words(payload)
@@ -1549,11 +1692,11 @@ def _literal_stdio_command(words: list[str]) -> list[str]:
             "printf",
             "sha256sum",
         }:
-            # eval/source or an unknown interpreter may execute stdin. Do not
-            # infer that a simple spelling makes an unknown consumer inert.
-            return words
+            # Unknown does not mean inert, but is not positive evidence of
+            # shell execution either. The whole call remains subject to L1.
+            return []
         words = launched
-    return words  # Full critical recursion independently rejects excess depth.
+    return []  # Full inspection independently routes excess depth to L1.
 
 
 def _literal_launched_commands(words: list[str]) -> list[list[str]]:
@@ -2493,6 +2636,8 @@ def _shell_command_tokens(
     redirects: list[tuple[str, str, str, int]] = []
     index = 0
     while index < len(command):
+        if len(words) + len(redirects) >= _MAX_SHELL_WORDS:
+            return None
         if command[index].isspace():
             index += 1
             continue
@@ -2669,7 +2814,10 @@ def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[
 
 
 def _shell_segments(
-    command: str, *, time_keyword: bool = True
+    command: str,
+    *,
+    time_keyword: bool = True,
+    _budget: _ShellInspectionBudget | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, bool, bool]]]:
     """Split unquoted shell operators, preserving literals and heredoc bodies.
 
@@ -2681,6 +2829,10 @@ def _shell_segments(
     start = index = 0
     quote = ""
     while index < len(command):
+        if len(segments) >= _MAX_SHELL_SEGMENTS:
+            if _budget is not None:
+                _budget.exhausted = True
+            return segments, heredocs
         char = command[index]
         if char == "\\" and quote != "'":
             index += 2
@@ -2695,6 +2847,8 @@ def _shell_segments(
             # Comments cannot introduce executable commands or heredocs.
             end = command.find("\n", index)
             end = len(command) if end < 0 else end
+            if _budget is not None and not _budget.take(len(command)):
+                return segments, heredocs
             command = command[:index] + " " * (end - index) + command[end:]
             index = end
             continue
@@ -2824,6 +2978,9 @@ def _shell_substitutions(command: str, *, literal_quotes: bool = False) -> list[
                 result.append(command[start : end - 1])
                 index = end
                 continue
+            # No closing delimiter remains. Rescanning each nested opener
+            # would turn malformed input into quadratic inspection work.
+            break
         if quote != "'" and char == "`":
             end = command.find("`", index + 1)
             if end != -1:

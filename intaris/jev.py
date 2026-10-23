@@ -208,7 +208,11 @@ class JevClient:
             )
         except DecisionInputTooLarge as exc:
             return EvaluationResult(
-                aligned=False, risk="high", decision="escalate", reasoning=str(exc)
+                aligned=False,
+                risk="high",
+                decision="escalate",
+                reasoning=str(exc),
+                evaluation_complete=False,
             )
         risk_threshold = (
             self._approval_risk_confidence

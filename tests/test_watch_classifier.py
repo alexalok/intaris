@@ -175,12 +175,9 @@ def test_watch_literal_execution_is_prohibited(command: str) -> None:
     ],
 )
 def test_watch_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize("command", ["watch -x rm -rf /", "watch 'rm -rf /'"])
@@ -262,12 +259,9 @@ def test_watch_stdio_shell_consumers_remain_prohibited(command: str) -> None:
     ],
 )
 def test_watch_stdio_data_consumers_do_not_execute_input(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(
@@ -281,7 +275,7 @@ def test_watch_stdio_data_consumers_do_not_execute_input(command: str) -> None:
         "watch '. /dev/stdin' <<'EOF'\nrm -rf /\nEOF",
     ],
 )
-def test_watch_dynamic_stdin_consumers_keep_conservative_boundary(command: str) -> None:
+def test_watch_literal_stdin_execution_remains_prohibited(command: str) -> None:
     assert (
         classify(
             "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
