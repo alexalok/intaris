@@ -2137,6 +2137,105 @@ def _unwrap_runuser_command(
     return shell_words + operands[1:]
 
 
+def _unwrap_flock_command(words: list[str]) -> list[str]:
+    """Locate util-linux flock's argv or exact -c/--command shell payload.
+
+    getopt_long("+:sexnoFuw:E:hV?") stops at the first operand. The command
+    switch is handled separately, not a normal getopt option: it only accepts
+    exact spellings and exactly one payload. A lone FD never launches a shell.
+    """
+    long_options = {
+        "shared": "s",
+        "exclusive": "x",
+        "unlock": "u",
+        "nonblocking": "n",
+        "nb": "n",
+        "timeout": "w",
+        "wait": "w",
+        "conflict-exit-code": "E",
+        "close": "o",
+        "no-fork": "F",
+        "verbose": "verbose",
+        "fcntl": "fcntl",
+        "start": "start",
+        "length": "length",
+        "fd": "fd",
+        "help": "h",
+        "version": "V",
+    }
+    required = {"w", "E", "start", "length", "fd"}
+    options: set[str] = set()
+    command_switch = False
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        index += 1
+        if token in {"-c", "--command"}:
+            command_switch = True
+            continue
+        if token.startswith("--"):
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                matches = {
+                    option
+                    for name_option, option in long_options.items()
+                    if name_option.startswith(name)
+                }
+                if len(matches) != 1:
+                    return []
+                option = matches.pop()
+            else:
+                option = long_options[name]
+            if option in {"h", "V"}:
+                return []
+            if option in required:
+                if not equals:
+                    if index >= len(words):
+                        return []
+                    index += 1
+            elif equals:
+                return []
+            options.add(option)
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hV":
+                    return []
+                if option in "wE":
+                    if offset == len(token) - 1:
+                        if index >= len(words):
+                            return []
+                        index += 1
+                    options.add(option)
+                    break
+                if option not in "sexnouF":
+                    return []
+                options.add(option)
+    if {"o", "F"} <= options:
+        return []  # --close and --no-fork cannot be combined.
+    operands = words[index:]
+    if command_switch:
+        if "fd" not in options or len(operands) != 1:
+            return []
+        return ["sh", "-c", operands[0]]
+    if "fd" in options:
+        launched = operands
+    elif len(operands) > 1:
+        # The first operand is the lock path, even when it looks like an FD.
+        launched = operands[1:]
+        if launched[0] in {"-c", "--command"}:
+            return ["sh", "-c", launched[1]] if len(launched) == 2 else []
+    else:
+        return []  # FD-only locking (or missing/invalid path), never a shell.
+    if launched and _looks_like_env_assignment(launched[0]):
+        return []  # Direct execution does not evaluate assignment syntax.
+    return launched
+
+
 def _unwrap_chroot_command(words: list[str]) -> list[str]:
     """Skip GNU/BSD chroot options and NEWROOT before inspecting its command."""
     long_options = {"groups", "userspec", "skip-chdir", "help", "version"}
@@ -2317,6 +2416,8 @@ def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[
             words = _unwrap_unshare_command(words)
         elif head == "nsenter":
             words = _unwrap_nsenter_command(words)
+        elif head == "flock":
+            words = _unwrap_flock_command(words)
         elif head == "setpriv":
             words = _unwrap_setpriv_command(words)
         elif head == "runuser":
