@@ -237,9 +237,12 @@ def test_watch_hard_deny_survives_permission_and_judge(
     ],
 )
 def test_watch_stdio_shell_consumers_remain_prohibited(command: str) -> None:
-    assert classify(
-        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-    ) == (Classification.WRITE if "eval" in command else Classification.CRITICAL)
+    assert (
+        classify(
+            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+        )
+        == Classification.CRITICAL
+    )
 
 
 @pytest.mark.parametrize(
@@ -272,10 +275,10 @@ def test_watch_stdio_data_consumers_do_not_execute_input(command: str) -> None:
         "watch '. /dev/stdin' <<'EOF'\nrm -rf /\nEOF",
     ],
 )
-def test_watch_dynamic_stdin_consumers_require_l1(command: str) -> None:
+def test_watch_literal_stdin_execution_remains_prohibited(command: str) -> None:
     assert (
         classify(
             "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
         )
-        == Classification.WRITE
+        == Classification.CRITICAL
     )

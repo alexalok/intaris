@@ -70,13 +70,28 @@ and in the evaluator with approving mocked L1. Reordering shallow checks before
 recursive work fixed it. Regressions cover the prohibition both before and
 after the heredoc, and prove no L1 call or permissive cap can approve it.
 
+Codex PR review found that the uncertainty fallback also discarded literal
+stdin-execution endpoints such as `sh -c 'eval "$(cat)"'` and
+`sh -c '. /dev/stdin'`. Both download pipelines and destructive heredocs
+reproduced the regression. These bounded forms, literal stdin sourcing, and
+`eval sh` now retain shell endpoint classification before the fallback. This
+matches the documented execution semantics of
+[eval and dot](https://www.gnu.org/software/bash/manual/html_node/Bourne-Shell-Builtins.html).
+Tests prove that approving L1 responses, permissive caps, and human/Judge
+resolution cannot override their hard prohibition. Quoted examples, other
+input sources, external `env` invocations of builtin names, and literal `#`
+filenames retain normal L1 routing. The fix adds 39 boundary cases and restores
+eight existing hard-stop assertions.
+
 ## Verification
 
 | Check | Result |
 |---|---|
-| Full server suite, `pytest -q -p no:cacheprovider tests/` | 6,221 passed; 68 E2E cases deselected; two existing WebSocket deprecation warnings |
-| New command-boundary coverage within the server suite | 166 cases |
+| Full server suite, `pytest -q -p no:cacheprovider tests/` | 6,260 passed; 68 E2E cases deselected; two existing WebSocket deprecation warnings |
+| New command-boundary coverage within the server suite | 205 cases |
+| Focused stdin review-fix suite | 378 passed across command-boundary and watch tests |
 | Hermes adapter suite, `pytest -q -p no:cacheprovider integrations/hermes/tests` | 1,023 passed; 190 skipped without the optional external Hermes source matrix |
+| Additional real-Hermes source matrix | 1,173 passed; 40 setup errors in `test_cron_owner.py` because the available host checkout lacks `cron.approval_relay_scope` |
 | Post-anonymization fixture checks | 289 passed across intention, path policy, redactor, and Judge tests |
 | Ruff check and format check | All 26 changed/new Python files passed |
 | Whitespace check | `git diff --check` passed |
@@ -85,9 +100,10 @@ after the heredoc, and prove no L1 call or permissive cap can approve it.
 Tests used the existing dependency environment, `PYTHONDONTWRITEBYTECODE=1`,
 the current worktree on `PYTHONPATH` (the Hermes integration directory for
 adapter tests), and a temporary `DATA_DIR` ending in `.intaris`. No dependency
-installation was needed. The full server suite includes the review fix and the
-interactive-shell regression fix. Later publication cleanup changed only docs
-and synthetic fixture values; all 289 affected tests passed again afterward.
+installation was needed. The full server suite includes the local review fix,
+the interactive-shell regression fix, the later Codex stdin-execution fix, and
+publication anonymization. All 289 affected fixture tests also passed separately
+after anonymization.
 
 ## Limits
 
@@ -100,7 +116,10 @@ Incomplete commands incur L1 latency even on exact retries. Broad shell
 allowances no longer bypass L1 for ordinary mutating/package-manager commands
 or wrappers. The bounded recognizer can leave dangerous code unrecognized;
 remaining risk is assessed by the configured model and existing policy flow.
-The optional real-Hermes source matrix requires its external dependencies.
+The optional real-Hermes source matrix requires both its external dependencies
+and the host modules exercised by each contract. The additional run used host
+revision `63d0b94120027d487c9a5235b9ec64b696af1b26`; its missing cron module
+prevented those 40 cases from running. This is not a passing full source matrix.
 
 The initial implementation and verification were local only. A later explicit
 request authorized fork PR publication and Codex review. Pre-publication

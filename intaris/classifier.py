@@ -1620,6 +1620,7 @@ def _literal_stdio_command(words: list[str]) -> list[str]:
     examines the full original shell text separately. Only known shells,
     downloaders, and literal data consumers can replace the endpoint. Unknown
     consumers do not prove that stdin will execute; normal L1 assesses them.
+    Literal eval/source forms that execute inherited stdin remain shell endpoints.
     """
     for _ in range(_MAX_SHELL_DEPTH + 1):
         if not words or os.path.basename(words[0]) not in {
@@ -1646,10 +1647,37 @@ def _literal_stdio_command(words: list[str]) -> list[str]:
                     return []
                 return words if stdin_mode else []
             return words
+        # Recognize this bounded execution proof before the dynamic-syntax
+        # fallback. Match the whole payload, preserving quote provenance and
+        # excluding redirections that would replace the inherited stdin.
+        cat_stdin = r"cat(?:[ \t]+(?:-|/dev/stdin|/dev/fd/0))?"
+        stdin_read = rf"(?:\$\([ \t]*{cat_stdin}[ \t]*\)|`[ \t]*{cat_stdin}[ \t]*`)"
+        if re.fullmatch(rf'eval[ \t]+(?:{stdin_read}|"{stdin_read}")', payload.strip()):
+            return words
         if re.search(r"[$`]", payload) or re.search(
             r"[;&|()<>\n]", _strip_quoted_strings(payload)
         ):
             return []
+        # Builtins must be invoked by this shell itself. An external wrapper
+        # such as env cannot launch source/eval, and '#' within a filename is
+        # literal rather than the start of a shell comment.
+        parsed = _shell_command_tokens(payload)
+        try:
+            literal = shlex.split(" ".join(parsed[0])) if parsed is not None else []
+        except ValueError:
+            return []
+        if (
+            len(literal) == 2
+            and literal[0] in {".", "source"}
+            and literal[1] in {"/dev/stdin", "/dev/fd/0"}
+        ):
+            return words
+        if (
+            len(literal) == 2
+            and literal[0] == "eval"
+            and literal[1] in {"sh", "bash", "zsh", "dash", "ksh"}
+        ):
+            return words
         launched = _critical_command_words(payload)
         if launched and os.path.basename(launched[0]) not in {
             "sh",
