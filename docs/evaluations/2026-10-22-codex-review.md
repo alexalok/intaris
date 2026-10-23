@@ -560,3 +560,48 @@ are not simulated. Missing invocation metadata can require normal reevaluation
 instead of cache reuse; this is not a measured live false-positive rate.
 Private receipts remain ignored under `runs/codex-review-20261022-round14`
 (0700 directories, 0600 files).
+
+
+## Flock and newer human scope notes (2026-10-23)
+
+Codex's re-requested review found two further bypasses:
+
+- `flock /tmp/guard rm -rf /` became READ under a broad command allowance.
+  Flock's lock/options operands are now separated from its launched argv or
+  exact `-c`/`--command` shell payload before allow shortcuts. FD-only forms
+  launch no command. Option data, quoted examples, invalid option combinations,
+  informational exits, and bounded cleanup retain benign controls. Grammar
+  follows the [util-linux source](https://raw.githubusercontent.com/util-linux/util-linux/master/sys-utils/flock.c)
+  and [manual](https://raw.githubusercontent.com/util-linux/util-linux/master/sys-utils/flock.1.adoc).
+  All 242 dedicated cases pass, including 12 permission/Judge/audit hard-stop
+  controls; before correction, 121 failed and 121 controls passed. The focused
+  launcher suite passes 2,714 cases. No destructive command was executed.
+- An exact human grant could survive a later human note on different arguments
+  that restricted the originally approved operation. Shared evidence checking
+  now compares reusable human-authored notes against the selected human grant.
+  Newer notes prevent mechanical exact retry, explicit-ID promotion, and
+  L1/Judge similarity fallback. A derived Judge grant uses its original human
+  source time so it cannot hide an intervening restriction. Parent notes also
+  apply to explicit child approval IDs. Normal model assessment can still
+  approve a call the current note permits.
+
+The scope-note suite passes 56 real-store cases across L1/Jev and Judge modes,
+including new restrictions, operator preferences, explicit IDs, parent scope,
+derived grants, and independent model approval. Compatibility cases preserve
+own/older notes, unrelated bare decisions, call-only/system/Judge notes, other
+tenants/sessions, and renewed exact grants. Equal timestamps between distinct
+human decisions require interpretation. Six Judge cases also fail against
+the pre-fix source: fallback overwrote current decisions or falsely attributed
+an independent approval to the old grant.
+The combined scope/approval/Judge regression suite passes 657 cases.
+
+Final verification: 5,445 server tests passed, 68 external E2E cases excluded,
+two existing WebSocket warnings. Scoped Ruff lint/format and whitespace checks
+passed. Previously verified 1,203 Hermes tests have unchanged source hashes.
+These are deterministic routing and outcome tests with stubbed models, not a
+fresh historical inference run or population false-positive/negative estimate.
+Flock recognition remains bounded literal parsing; runtime lock/path/FD
+availability, numeric option validity, inherited SHELL/PATH, and arbitrary
+execution are not simulated. No live PostgreSQL test, deployment, or upstream
+checkpoint merge was performed. Private receipts remain ignored under
+`runs/codex-review-20261022-round15` (0700 directories, 0600 files).
