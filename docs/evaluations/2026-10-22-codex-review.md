@@ -648,3 +648,52 @@ program behavior remain outside bounded literal recognition. Broad allow rules
 are not an execution sandbox. No live PostgreSQL test, deployment, or upstream
 checkpoint merge was performed. Private receipts remain ignored under
 `runs/codex-review-20261022-round16` (0700 directories, 0600 files).
+
+
+## Leading redirections and semantic deny approval checks (2026-10-23)
+
+Codex found two independent approval bypasses. Both were reproduced before
+correction, with benign and unrelated-policy controls preserved.
+
+- Leading shell redirections could hide the executable from hard-stop detection:
+  `>/dev/null rm -rf /` and `</dev/null shutdown now` became allowlisted reads.
+  Raw shell tokenization now consumes actual redirect prefixes before executable
+  inspection and preserves compound redirect operators. Quoted words and argv
+  passed through explicit executors remain data. Literal heredoc FD links and
+  decimal FD aliases are recognized. Grammar follows the
+  [GNU Bash redirection reference](https://www.gnu.org/s/bash/manual/html_node/Redirections.html).
+  Refined RED: 132 failures, 54 passing controls; four additional FD-alias
+  regressions failed before their correction. Final dedicated suite: 190 passed;
+  existing focused classifier/launcher suite: 3,072 passed. This remains bounded
+  literal recognition: runtime files, FDs, environment, expansions, and arbitrary
+  program behavior are not simulated. Here-string operands are parsed as redirect
+  data without adding shell-input evaluation. No destructive command ran.
+- An unchanged free-text deny-policy snapshot did not prove that the pending call
+  complied. Human, Judge, and notification-link approvals now run an independent
+  policy-only check through the configured L1 or Jev backend. Only explicit
+  `clear` yields internal clearance. Applicable, uncertain, incomplete, malformed,
+  or failed assessments cannot commit a grant. The atomic store checks clearance
+  against the exact call/context and current clauses, then records its explanation.
+  Missing/forged/stale proof cannot bypass that guard. Existing deterministic
+  prohibitions and policy/ancestor/expiration guards still dominate.
+
+The new real-store tests initially had 16 failures and two passing controls;
+all 21 final cases pass, including unrelated-policy approval of both escalations
+and ordinary model denials, inherited policy, policy races, expiration, direct
+store bypass, and structured-hard-rule precedence. Both HTTP approval routes
+have clear/applies/unknown controls. The assessor has 35 passing tests, including
+Jev model pin, input budget, confidence, and malformed-output checks. Redacted
+argument text stays non-approvable; unrelated redacted context remains model
+assessable, with missing policy-relevant facts requiring unknown. Prior or client
+clearance text is excluded from model input and cannot grant authority.
+
+This pending-approval check adds one inference only when free-text deny clauses
+exist; normal tool evaluation and rule-free approvals keep their existing flow.
+Natural-language applicability still depends on the model. These deterministic
+controls do not measure live semantic false-positive/negative rates or rerun the
+historical comparison. Full verification: 6,055 server tests passed, 68 external
+E2E cases excluded, two existing WebSocket warnings. Scoped Ruff/format and
+whitespace checks passed. Previously verified 1,203 Hermes tests have unchanged
+source hashes. No live PostgreSQL test, deployment, merge, or upstream checkpoint
+was performed. Private receipts remain ignored under
+`runs/codex-review-20261022-round17` (0700 directories, 0600 files).
