@@ -605,3 +605,46 @@ availability, numeric option validity, inherited SHELL/PATH, and arbitrary
 execution are not simulated. No live PostgreSQL test, deployment, or upstream
 checkpoint merge was performed. Private receipts remain ignored under
 `runs/codex-review-20261022-round15` (0700 directories, 0600 files).
+
+
+## Su/watch launchers and stdin data controls (2026-10-23)
+
+Codex found `su -c 'rm -rf /' root` and `watch -x rm -rf /` bypassing
+hard prohibitions under broad command allowances. Both now enter recursive
+payload inspection before allowances and tool preferences.
+
+- Su reuses the [util-linux runuser/su parser](https://raw.githubusercontent.com/util-linux/util-linux/master/login-utils/su-common.c),
+  preserving shell option arity, GNU option permutation, and explicit literal
+  POSIXLY_CORRECT handling. Su rejects runuser-only `-u`/`--user` direct-exec
+  mode. All 185 dedicated cases pass (103 failed, 82 controls passed before
+  correction), including permission/Judge/audit hard-stop controls.
+- Watch follows the [procps source](https://gitlab.com/procps-ng/procps/-/raw/master/src/watch.c)
+  and [manual](https://gitlab.com/procps-ng/procps/-/raw/master/man/watch.1).
+  Default mode joins remaining arguments with spaces for shell evaluation;
+  `-x`/`--exec` preserves direct argv. Options stop at the first operand, required
+  values remain data, and optional difference values must be attached. Help,
+  version, missing operands, invalid options, and conflicting follow/change
+  options do not create executable payloads.
+- Pipe/heredoc endpoint checks follow simple shell command strings at bounded
+  depth. This distinguishes `watch cat` reading data from `watch sh` executing
+  it and recognizes `watch curl ... | sh`. Full critical-payload inspection
+  remains independent. Unknown programs, compound shell syntax, and substitutions keep the existing
+  conservative endpoint behavior. No destructive command was executed.
+
+The initial watch suite had 95 failures and 56 passing controls. Adding watch's
+shell wrapper exposed two benign stdin false positives; 16 more stdin controls
+then reproduced nine further failures before correction. All 173 final watch
+cases pass. The focused watch/shell-depth/flock/runuser/hard-prohibition/classifier
+suite passes 1,675 cases. Six additional regressions preserve the existing
+conservative stdin boundary for eval/source and unknown interpreters.
+
+Final verification: 5,803 server tests passed, 68 external E2E cases excluded,
+two existing WebSocket warnings. Scoped Ruff lint/format and whitespace checks
+passed. Previously verified 1,203 Hermes tests have unchanged source hashes.
+These checks do not rerun historical model inference or estimate population
+false-positive/negative rates. Runtime authentication, account defaults, inherited
+environment, terminal/FD availability, numeric option validity, and arbitrary
+program behavior remain outside bounded literal recognition. Broad allow rules
+are not an execution sandbox. No live PostgreSQL test, deployment, or upstream
+checkpoint merge was performed. Private receipts remain ignored under
+`runs/codex-review-20261022-round16` (0700 directories, 0600 files).
