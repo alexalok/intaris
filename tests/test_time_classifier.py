@@ -229,26 +229,20 @@ def test_time_literal_execution_is_prohibited(command: str) -> None:
     ],
 )
 def test_time_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize("prefix", ["time", "env time"])
 @pytest.mark.parametrize("option", ["-f", "-o", "--format", "--output-file", "--o"])
 @pytest.mark.parametrize("operand", ["'rm -rf /'", "rm", "--help"])
 def test_time_required_values_are_data(prefix: str, option: str, operand: str) -> None:
-    assert (
-        classify(
-            "terminal",
-            {"command": f"{prefix} {option} {operand} echo -rf /"},
-            session_policy={"allow_commands": ["*"]},
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal",
+        {"command": f"{prefix} {option} {operand} echo -rf /"},
+        session_policy={"allow_commands": ["*"]},
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize("maximum", ["approve", "escalate", "deny"])

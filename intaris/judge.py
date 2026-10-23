@@ -32,6 +32,7 @@ from typing import Any
 
 from intaris.approval_policy import prepare_approval_policy
 from intaris.audit import ScopeChangedError
+from intaris.classifier import inspect_command
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
 from intaris.intent_evidence import (
@@ -1975,6 +1976,11 @@ class JudgeReviewer:
             not evidence_changed
             and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
             and record.get("tool") != "skill_view_raw"
+            and inspect_command(
+                record.get("tool", ""),
+                record.get("args_redacted") or {},
+                session_policy=current_session.get("policy"),
+            ).complete
             and allows_legacy_precedent(
                 current_evidence, policy=current_session.get("policy")
             )

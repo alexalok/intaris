@@ -40,6 +40,7 @@ from intaris.audit import AuditStore, ScopeChangedError
 from intaris.classifier import (
     Classification,
     classify,
+    inspect_command,
     is_path_within,
     is_read_only,
     resolve_tool_paths,
@@ -744,6 +745,22 @@ class Evaluator:
         )
 
         # Step 1-2: Classify (with path awareness via working_directory)
+        command_inspection = inspect_command(
+            tool,
+            classification_args,
+            session_policy=session_policy,
+            working_directory=working_directory,
+        )
+        command_review = not command_inspection.complete
+        if tool in {"bash", "terminal"}:
+            # Evaluator-owned facts replace any caller-supplied claim. They
+            # explain routing, not authorization, to both L1 backends and audit.
+            context = dict(context or {})
+            context["command_inspection"] = {
+                "complete": command_inspection.complete,
+                "critical": command_inspection.critical,
+                "reason": command_inspection.reason,
+            }
         classification = classify(
             tool,
             classification_args,
@@ -751,6 +768,7 @@ class Evaluator:
             tool_preferences=tool_preferences,
             working_directory=working_directory,
             trusted_readonly=trusted_readonly,
+            _command_inspection=command_inspection,
         )
 
         # Path approval cache override: if the classifier reclassified a
@@ -761,6 +779,7 @@ class Evaluator:
         resolved_paths: list[str] = []
         if (
             not restricted
+            and not command_review
             and classification == Classification.WRITE
             and working_directory
             and is_read_only(tool, classification_args)
@@ -834,6 +853,7 @@ class Evaluator:
                     policy=session_policy,
                 )
 
+        l1_decision: str | None = None
         # Step 3-5: Fast paths for read-only, critical, and escalate
         if unresolved_path_policy and classification != Classification.CRITICAL:
             decision = Decision(
@@ -898,7 +918,10 @@ class Evaluator:
                     human_only=restricted,
                     session_id=session_id,
                 )
-                if minimum_outcome is None and not unattended and not read_scope_review
+                if minimum_outcome is None
+                and not unattended
+                and not read_scope_review
+                and not command_review
                 else None
             )
             if retry_decision is not None:
@@ -912,8 +935,39 @@ class Evaluator:
                     agent_id=agent_id,
                     context=redact(context) if context else None,
                     parent_intention=parent_intention,
-                    allow_legacy_precedent=not read_scope_review,
+                    allow_legacy_precedent=not (read_scope_review or command_review),
                 )
+                l1_decision = decision.decision
+
+                # An exact reusable grant is independent human authority, not
+                # proof that a command was parsed. Preserve its existing scope
+                # and denial-override contract, but only after current L1 ran.
+                # Inference failures propagate; changed evidence never reuses
+                # a grant. The returned/audited evaluation path stays "llm".
+                if (
+                    command_review
+                    and minimum_outcome is None
+                    and not unattended
+                    and not read_scope_review
+                    and not decision.evidence_changed
+                    and decision.evaluation_complete
+                    and decision.decision != "approve"
+                ):
+                    retry_decision = self._check_escalation_retry(
+                        user_id=user_id,
+                        tool=tool,
+                        args_hash=args_hash,
+                        human_only=restricted,
+                        session_id=session_id,
+                    )
+                    if retry_decision is not None:
+                        decision.decision = retry_decision.decision
+                        decision.reasoning = (
+                            f"{retry_decision.reasoning}. Current L1 assessment: "
+                            f"{decision.reasoning}"
+                        )
+                        decision.approval_call_id = retry_decision.approval_call_id
+                        decision.intent_evidence = retry_decision.intent_evidence
 
         if (
             read_scope_review or classification == Classification.ESCALATE
@@ -968,7 +1022,7 @@ class Evaluator:
                 )
                 and raw_decision != "deny"
                 and (
-                    not read_scope_review
+                    not (read_scope_review or command_review)
                     or raw_decision == "approve"
                     or _unchanged_human_read_scope(
                         record, scope_versions, working_directory
@@ -1031,6 +1085,15 @@ class Evaluator:
             decision.approval_call_id = None
             outcome_override = "intent_evidence_changed"
 
+        if not decision.evaluation_complete and not hard_prohibition:
+            # No model judgment exists. Caps and exact approvals cannot turn
+            # a provider/input failure into automatic permission.
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.approval_call_id = None
+            outcome_override = "evaluation_incomplete"
+
         if (
             decision.decision == "approve"
             and decision.intent_evidence is not None
@@ -1054,6 +1117,11 @@ class Evaluator:
         audit_context = make_evaluation_context(
             tool=tool, args=classification_args, context=context, session=session
         )
+        if tool in {"bash", "terminal"}:
+            audit_context["command_inspection"]["l1_decision"] = l1_decision
+            audit_context["command_inspection"]["approval_call_id"] = (
+                decision.approval_call_id
+            )
         audit_args = dict(
             call_id=call_id,
             user_id=user_id,
@@ -1119,6 +1187,7 @@ class Evaluator:
         # learn_from_approved_escalation() called from POST /decision.
         if (
             path_reclassified
+            and not command_review
             and decision.decision == "approve"
             and not policy_overrode
             and working_directory
@@ -1531,6 +1600,10 @@ class Evaluator:
             or session["_scope_versions"] != granted_scope
         ):
             return
+        if not inspect_command(
+            tool, args_redacted, session_policy=session.get("policy")
+        ).complete:
+            return
         # Bind cached targets to the invocation that was evaluated. Current
         # session details may name a different directory; the audit snapshot
         # already includes per-call context and shell workdir resolution.
@@ -1759,12 +1832,14 @@ class Evaluator:
                     path="llm",
                     metadata=evaluation.metadata,
                     intent_evidence=intent_evidence,
+                    evaluation_complete=evaluation.evaluation_complete,
                 )
 
             decision = apply_decision_matrix(evaluation)
             decision.metadata = evaluation.metadata
             decision.approval_call_id = evaluation.approval_call_id
             decision.intent_evidence = intent_evidence
+            decision.evaluation_complete = evaluation.evaluation_complete
             return decision
 
         except Exception:

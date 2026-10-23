@@ -2006,7 +2006,7 @@ class TestIntentionSourceColumn:
             '"reasoning": "Safe", "decision": "approve"}'
         )
         working_directory = (
-            "/Users/fpytloun/src/lumilens/beskar/.worktrees/feat-bisync-edge-server-ha"
+            "/Users/demouser/src/demoapps/sample/.worktrees/feat-sample-edge-server-ha"
         )
         session_store.create(
             user_id="user-1",
@@ -2016,8 +2016,8 @@ class TestIntentionSourceColumn:
             policy={
                 "allow_paths": [
                     "/tmp/*",
-                    "/Users/fpytloun/*",
-                    "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                    "/Users/demouser/*",
+                    "/Users/demouser/src/demoapps/sample/ansible/*",
                 ]
             },
         )
@@ -2041,15 +2041,15 @@ class TestIntentionSourceColumn:
         assert '"working_directory_allowed_by_policy": true' in user_prompt
         assert '"working_directory_denied_by_policy": false' in user_prompt
         assert f'"working_directory": "{working_directory}"' in user_prompt
-        assert '"/Users/fpytloun/*"' in user_prompt
-        assert '"/Users/fpytloun/src/lumilens/beskar/ansible/*"' not in user_prompt
+        assert '"/Users/demouser/*"' in user_prompt
+        assert '"/Users/demouser/src/demoapps/sample/ansible/*"' not in user_prompt
 
         session = session_store.get("sess-policy-cwd", user_id="user-1")
         assert session["policy"] == {
             "allow_paths": [
                 "/tmp/*",
-                "/Users/fpytloun/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                "/Users/demouser/*",
+                "/Users/demouser/src/demoapps/sample/ansible/*",
             ]
         }
 
@@ -2176,7 +2176,7 @@ class TestIntentionSourceColumn:
             '{"aligned": true, "risk": "low", '
             '"reasoning": "Safe", "decision": "approve"}'
         )
-        target = "/home/riker/src/cognis/.worktrees/fix/tests/test_agent.py"
+        target = "/home/guest/src/cognis/.worktrees/fix/tests/test_agent.py"
         patch = f"""*** Begin Patch
 *** Update File: {target}
 @@
@@ -2187,7 +2187,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-target",
             intention="Apply the requested source change",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/guest/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2220,14 +2220,14 @@ class TestIntentionSourceColumn:
             '{"aligned": false, "risk": "high", '
             '"reasoning": "Denied path", "decision": "deny"}'
         )
-        target = "/home/riker/.ssh/config"
+        target = "/home/guest/.ssh/config"
         session_store.create(
             user_id="user-1",
             session_id="sess-policy-denied-target",
             intention="Apply the requested source change",
             policy={
-                "allow_paths": ["/home/riker/*"],
-                "deny_paths": ["/home/riker/.ssh/*"],
+                "allow_paths": ["/home/guest/*"],
+                "deny_paths": ["/home/guest/.ssh/*"],
             },
         )
         evaluator = Evaluator(
@@ -2268,7 +2268,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-relative-target",
             intention="Apply the requested source change",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/guest/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2309,7 +2309,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-mixed-targets",
             intention="Apply the requested source changes",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/guest/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2326,7 +2326,7 @@ class TestIntentionSourceColumn:
             args={
                 "patchText": (
                     "*** Begin Patch\n"
-                    "*** Update File: /home/riker/src/app.py\n"
+                    "*** Update File: /home/guest/src/app.py\n"
                     "@@\n-old\n+new\n"
                     "*** Update File: ../other.py\n"
                     "@@\n-old\n+new\n"

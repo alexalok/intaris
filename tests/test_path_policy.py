@@ -97,31 +97,31 @@ class TestPathPolicyContext:
             "allow_paths": [
                 "/tmp/*",
                 "/var/tmp/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
-                "/Users/fpytloun/*",
+                "/Users/demouser/src/demoapps/sample/ansible/*",
+                "/Users/demouser/*",
                 "/Users/*/complex/*",
             ],
-            "deny_paths": ["/Users/fpytloun/.ssh/*"],
+            "deny_paths": ["/Users/demouser/.ssh/*"],
         }
 
         assert effective_policy_for_evaluator(policy) == {
             "allow_paths": [
                 "/tmp/*",
                 "/var/tmp/*",
-                "/Users/fpytloun/*",
+                "/Users/demouser/*",
                 "/Users/*/complex/*",
             ],
-            "deny_paths": ["/Users/fpytloun/.ssh/*"],
+            "deny_paths": ["/Users/demouser/.ssh/*"],
         }
         assert policy["allow_paths"][2] == (
-            "/Users/fpytloun/src/lumilens/beskar/ansible/*"
+            "/Users/demouser/src/demoapps/sample/ansible/*"
         )
 
     def test_effective_policy_preserves_first_duplicate_allow_path(self):
-        policy = {"allow_paths": ["/Users/fpytloun/*", "/Users/fpytloun/*"]}
+        policy = {"allow_paths": ["/Users/demouser/*", "/Users/demouser/*"]}
 
         assert effective_policy_for_evaluator(policy) == {
-            "allow_paths": ["/Users/fpytloun/*"]
+            "allow_paths": ["/Users/demouser/*"]
         }
 
     def test_normalized_policy_clauses_support_strings_and_objects(self):
@@ -183,9 +183,9 @@ class TestPathPolicyContext:
 
     def test_bash_context_marks_nested_worktree_cwd_allowed_by_home_policy(self):
         working_directory = (
-            "/Users/fpytloun/src/lumilens/beskar/.worktrees/feat-bisync-edge-server-ha"
+            "/Users/demouser/src/demoapps/sample/.worktrees/feat-sample-edge-server-ha"
         )
-        policy = {"allow_paths": ["/Users/fpytloun/*"]}
+        policy = {"allow_paths": ["/Users/demouser/*"]}
 
         resolved = _resolve_tool_paths_for_context(
             "bash", {"command": "git commit -m test"}, working_directory
@@ -204,12 +204,12 @@ class TestPathPolicyContext:
         assert context["all_targets_allowed_by_policy"] is False
 
     def test_path_policy_context_exposes_reduced_allow_paths_only(self):
-        working_directory = "/Users/fpytloun/src/lumilens/beskar/.worktrees/fix"
+        working_directory = "/Users/demouser/src/demoapps/sample/.worktrees/fix"
         policy = {
             "allow_paths": [
                 "/tmp/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
-                "/Users/fpytloun/*",
+                "/Users/demouser/src/demoapps/sample/ansible/*",
+                "/Users/demouser/*",
             ]
         }
 
@@ -220,7 +220,7 @@ class TestPathPolicyContext:
         )
 
         assert context["working_directory_allowed_by_policy"] is True
-        assert context["allow_paths"] == ["/tmp/*", "/Users/fpytloun/*"]
+        assert context["allow_paths"] == ["/tmp/*", "/Users/demouser/*"]
 
     def test_apply_patch_context_detects_denied_move_destination(self):
         working_directory = "/home/user/src/cognis"

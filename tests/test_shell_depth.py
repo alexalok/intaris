@@ -1,4 +1,4 @@
-"""Fail closed on executable nesting, while preserving quoted data and shallow use."""
+"""Bound inspection without treating exhausted proof as permission or prohibition."""
 
 import shlex
 
@@ -22,21 +22,21 @@ def _nested(payload: str, levels: int, kind: str) -> str:
 
 @pytest.mark.parametrize("kind", ["shell", "heredoc"])
 @pytest.mark.parametrize(
-    "levels,leaf,blocked",
+    "levels,leaf,expected",
     [
-        (8, "echo safe", False),
-        (9, "echo safe", True),
-        (8, "rm -rf /", True),
-        (9, "rm -rf /", True),
+        (8, "echo safe", Classification.WRITE),
+        (9, "echo safe", Classification.WRITE),
+        (8, "rm -rf /", Classification.CRITICAL),
+        (9, "rm -rf /", Classification.WRITE),
     ],
 )
-def test_executable_nesting_limit(kind, levels, leaf, blocked):
+def test_executable_nesting_limit(kind, levels, leaf, expected):
     result = classify(
         "terminal",
         {"command": _nested(leaf, levels, kind)},
         session_policy={"allow_commands": ["*"]},
     )
-    assert (result == Classification.CRITICAL) is blocked
+    assert result == expected
 
 
 @pytest.mark.parametrize("kind", ["shell", "runner", "substitution", "heredoc"])

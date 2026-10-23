@@ -464,13 +464,13 @@ class TestClassifierWithPreferences:
         assert result == Classification.ESCALATE
 
     def test_preference_auto_approve(self):
-        """Auto-approve makes a write tool read-only."""
+        """Auto-approve cannot certify uninspected package-runner code."""
         result = classify(
             "bash",
             {"command": "npm install"},
             tool_preferences={"bash": "auto-approve"},
         )
-        assert result == Classification.READ
+        assert result == Classification.WRITE
 
     def test_preference_evaluate_is_default(self):
         """Evaluate preference doesn't change classification."""

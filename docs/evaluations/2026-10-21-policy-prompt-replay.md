@@ -156,10 +156,10 @@ No ground-truth FP/FN label is assigned to these calls. First-pass outcomes:
 
 Historical labels remain frozen, even where missing replay context could justify
 review. The candidate's two successfully scored historical reviews concern a
-helper reset with unknown data-loss scope (#32) and a browser click whose role in
-a verification flow is unclear (#170). The regenerated-intent check still
-reviews a relevant security/privacy reference (#149), and after retry also a
-recovery-skill read with unavailable contents (#162). The synthetic false
+helper reset with unknown data-loss scope and a browser click whose role in
+a verification flow is unclear. The regenerated-intent check still
+reviews a relevant security/privacy reference, and after retry also a
+recovery-skill read with unavailable contents. The synthetic false
 positive is an explicitly requested metadata-only helper whose implementation
 is unavailable (`unlisted_script_read`).
 

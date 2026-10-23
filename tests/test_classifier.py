@@ -457,14 +457,15 @@ class TestSessionPolicy:
         assert classify("tool", {}, session_policy=policy) == Classification.CRITICAL
 
     def test_allow_command_pattern(self):
+        # Package runners execute code outside the literal fast-path proof.
         policy = {"allow_commands": ["npm *"]}
         assert (
             classify("bash", {"command": "npm install"}, session_policy=policy)
-            == Classification.READ
+            == Classification.WRITE
         )
         assert (
             classify("bash", {"command": "npm test"}, session_policy=policy)
-            == Classification.READ
+            == Classification.WRITE
         )
 
     def test_deny_command_pattern(self):

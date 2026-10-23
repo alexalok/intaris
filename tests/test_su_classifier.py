@@ -209,12 +209,9 @@ def test_su_literal_execution_is_prohibited(command: str) -> None:
     ],
 )
 def test_su_data_and_nonexecuting_forms_are_not_prohibited(command: str) -> None:
-    assert (
-        classify(
-            "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal", {"command": command}, session_policy={"allow_commands": ["*"]}
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(

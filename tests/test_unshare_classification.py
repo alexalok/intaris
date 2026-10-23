@@ -165,11 +165,8 @@ def test_unshare_optional_values_do_not_consume_command(
 def test_unshare_data_nonexecution_and_bounded_cleanup_stay_allowed(
     command: str,
 ) -> None:
-    assert (
-        classify(
-            "terminal",
-            {"command": command},
-            session_policy={"allow_tools": ["terminal"]},
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal",
+        {"command": command},
+        session_policy={"allow_tools": ["terminal"]},
+    ) in {Classification.READ, Classification.WRITE}

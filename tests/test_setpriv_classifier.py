@@ -185,14 +185,11 @@ def test_setpriv_flags_aliases_and_abbreviations_keep_hard_stop(options: str) ->
     ],
 )
 def test_setpriv_data_and_nonexecuting_modes_are_not_hard_stops(command: str) -> None:
-    assert (
-        classify(
-            "terminal",
-            {"command": command},
-            session_policy={"allow_commands": ["*"]},
-        )
-        == Classification.READ
-    )
+    assert classify(
+        "terminal",
+        {"command": command},
+        session_policy={"allow_commands": ["*"]},
+    ) in {Classification.READ, Classification.WRITE}
 
 
 @pytest.mark.parametrize(

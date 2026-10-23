@@ -863,14 +863,21 @@ def test_retry_approval_identity_for_every_classification(
     create(client, history_session, headers=ADMIN)
     evaluator = srv._get_evaluator()
     args = {"command": "touch /tmp/output"}
-    prior = evaluator.evaluate(
-        user_id="owner",
-        session_id=history_session,
-        agent_id="operator",
-        tool="terminal",
-        args=args,
-        tool_preferences={"terminal": "escalate"},
-    )
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+        ),
+    ):
+        prior = evaluator.evaluate(
+            user_id="owner",
+            session_id=history_session,
+            agent_id="operator",
+            tool="terminal",
+            args=args,
+            tool_preferences={"terminal": "escalate"},
+        )
     AuditStore(srv._get_db()).resolve_escalation(
         prior["call_id"], "approve", user_id="owner", resolved_by=resolved_by
     )
@@ -893,20 +900,15 @@ def test_retry_approval_identity_for_every_classification(
             restricted_agent=restricted,
         )
 
+    # Both uncertain shell classifications now run current L1 before reuse.
+    assert result["path"] == "llm"
+    inference.assert_called_once()
+    if restricted:
+        assert inference.call_args.kwargs["session"]["policy"] == POLICY
     if history_session != "s" or (restricted and resolved_by == "judge"):
-        assert result["decision"] == (
-            "deny" if classification == "write" else "escalate"
-        ), result
-        if classification == "write":
-            inference.assert_called_once()
-            if restricted:
-                assert inference.call_args.kwargs["session"]["policy"] == POLICY
-        else:
-            inference.assert_not_called()
+        assert result["decision"] == "deny", result
     else:
         assert result["decision"] == "approve", result
-        assert result["path"] == "fast"
-        inference.assert_not_called()
 
 
 @pytest.mark.parametrize("history_session", ["history", "s"])
@@ -916,14 +918,21 @@ def test_agent_write_cannot_reuse_old_judge_approval(client, history_session):
 
     create(client, history_session, headers=ADMIN)
     evaluator = srv._get_evaluator()
-    prior = evaluator.evaluate(
-        user_id="owner",
-        session_id=history_session,
-        agent_id="operator",
-        tool="terminal",
-        args={"command": "touch /tmp/output"},
-        tool_preferences={"terminal": "escalate"},
-    )
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            dict(aligned=False, risk="medium", decision="escalate", reasoning="Review")
+        ),
+    ):
+        prior = evaluator.evaluate(
+            user_id="owner",
+            session_id=history_session,
+            agent_id="operator",
+            tool="terminal",
+            args={"command": "touch /tmp/output"},
+            tool_preferences={"terminal": "escalate"},
+        )
     AuditStore(srv._get_db()).resolve_escalation(
         prior["call_id"], "approve", user_id="owner", resolved_by="judge"
     )
