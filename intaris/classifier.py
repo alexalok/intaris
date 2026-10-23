@@ -1373,7 +1373,7 @@ def _is_critical(command: str, _depth: int = 0, *, _time_keyword: bool = True) -
                 or raw_segments[segment_index - 1][1] not in {"|", "|&"}
             ),
         )
-        segments.append((words, separator))
+        segments.append((_literal_stdio_command(words), separator))
         if not words:
             continue
         head = os.path.basename(words[0])
@@ -1508,6 +1508,52 @@ def _shell_command_string(operands: list[str]) -> str | None:
             continue
         return option if command_mode else None
     return None
+
+
+def _literal_stdio_command(words: list[str]) -> list[str]:
+    """Follow simple shell -c commands for pipe/heredoc endpoint detection.
+
+    A wrapper's shell is not necessarily its stdin consumer: `sh -c cat`
+    reads data, while `sh -c sh` executes it. Critical payload inspection still
+    examines the full original shell text separately. Only known shells,
+    downloaders, and literal data consumers can replace the endpoint. Other
+    programs, compound syntax, and substitutions keep its conservative identity.
+    """
+    for _ in range(_MAX_SHELL_DEPTH + 1):
+        if not words or os.path.basename(words[0]) not in {
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ksh",
+        }:
+            return words
+        payload = _shell_command_string(words[1:])
+        if (
+            payload is None
+            or re.search(r"[$`]", payload)
+            or re.search(r"[;&|()<>\n]", _strip_quoted_strings(payload))
+        ):
+            return words
+        launched = _critical_command_words(payload)
+        if launched and os.path.basename(launched[0]) not in {
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ksh",
+            "curl",
+            "wget",
+            "cat",
+            "echo",
+            "printf",
+            "sha256sum",
+        }:
+            # eval/source or an unknown interpreter may execute stdin. Do not
+            # infer that a simple spelling makes an unknown consumer inert.
+            return words
+        words = launched
+    return words  # Full critical recursion independently rejects excess depth.
 
 
 def _literal_launched_commands(words: list[str]) -> list[list[str]]:
@@ -2044,12 +2090,13 @@ def _unwrap_setpriv_command(words: list[str]) -> list[str]:
 def _unwrap_runuser_command(
     words: list[str], *, posixly_correct: bool = False
 ) -> list[str]:
-    """Resolve util-linux runuser's direct argv or shell invocation.
+    """Resolve the shared util-linux runuser/su launch modes.
 
     su-common.c uses GNU getopt permutation, unlike setpriv. A literal
     POSIXLY_CORRECT assignment instead stops options at the first operand.
-    The -u mode executes argv; otherwise the first operand is a username and
-    the rest are shell arguments, with optional -f and the last -c payload.
+    Only runuser's -u mode executes argv; otherwise the first operand is a
+    username and the rest are shell arguments, with optional -f and the
+    last -c payload. su rejects -u/--user even though getopt accepts it.
     """
     long_options = {
         "command": "c",
@@ -2124,6 +2171,8 @@ def _unwrap_runuser_command(
     if "w" in options and options.keys() & {"m", "p"}:
         return []  # Preserve-environment and whitelist are mutually exclusive.
     if "u" in options:
+        if os.path.basename(words[0]) == "su":
+            return []  # The direct-exec user option is runuser-only.
         if options.keys() & {"c", "s", "f", "l"}:
             return []  # Direct exec rejects shell-mode options, even empty values.
         return operands  # Missing command is an error, not a shell launch.
@@ -2135,6 +2184,89 @@ def _unwrap_runuser_command(
     if "c" in options:
         shell_words.extend(["-c", options["c"]])
     return shell_words + operands[1:]
+
+
+def _unwrap_watch_command(words: list[str]) -> list[str]:
+    """Inspect procps watch's shell command or -x/--exec argv.
+
+    POSIX option processing stops at the first operand. Shell mode joins
+    remaining argv with literal spaces, not shell quoting; exec mode preserves
+    each argument. Option values remain data in both modes.
+    """
+    long_options = {
+        "color": "c",
+        "no-color": "C",
+        "differences": "d",
+        "help": "h",
+        "interval": "n",
+        "beep": "b",
+        "errexit": "e",
+        "follow": "f",
+        "chgexit": "g",
+        "equexit": "q",
+        "exec": "x",
+        "precise": "p",
+        "no-rerun": "r",
+        "shotsdir": "s",
+        "no-title": "t",
+        "no-wrap": "w",
+        "version": "v",
+    }
+    required = {"n", "q", "s"}
+    options: set[str] = set()
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-" or not token.startswith("-"):
+            break
+        index += 1
+        if token.startswith("--"):
+            name, equals, _value = token[2:].partition("=")
+            if name not in long_options:
+                matches = [key for key in long_options if key.startswith(name)]
+                if len(matches) != 1:
+                    return []
+                name = matches[0]
+            option = long_options[name]
+            if option in {"h", "v"}:
+                return []
+            if option in required and not equals:
+                if index >= len(words):
+                    return []
+                index += 1
+            elif option not in required | {"d"} and equals:
+                return []
+            options.add(option)
+        else:
+            for offset, option in enumerate(token[1:], start=1):
+                if option in "hv":
+                    return []
+                if option in required:
+                    if offset == len(token) - 1:
+                        if index >= len(words):
+                            return []
+                        index += 1
+                    options.add(option)
+                    break
+                if option == "d":
+                    options.add(option)
+                    break  # Optional value consumes only the rest of this token.
+                if option not in "bCcefgprtwx":
+                    return []
+                options.add(option)
+    if "f" in options and options & {"d", "g", "q"}:
+        return []  # Follow conflicts with screen-change tracking.
+    launched = words[index:]
+    if not launched:
+        return []
+    if "x" in options:
+        if _looks_like_env_assignment(launched[0]):
+            return []  # Exec mode treats assignments as executable names.
+        return launched
+    return ["sh", "-c", " ".join(launched)]
 
 
 def _unwrap_flock_command(words: list[str]) -> list[str]:
@@ -2416,11 +2548,13 @@ def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[
             words = _unwrap_unshare_command(words)
         elif head == "nsenter":
             words = _unwrap_nsenter_command(words)
+        elif head == "watch":
+            words = _unwrap_watch_command(words)
         elif head == "flock":
             words = _unwrap_flock_command(words)
         elif head == "setpriv":
             words = _unwrap_setpriv_command(words)
-        elif head == "runuser":
+        elif head in {"runuser", "su"}:
             words = _unwrap_runuser_command(
                 words, posixly_correct=environment["POSIXLY_CORRECT"] is not None
             )
@@ -2499,6 +2633,7 @@ def _shell_segments(
                     time_keyword=time_keyword
                     and (not segments or segments[-1][1] not in {"|", "|&"}),
                 )
+                words = _literal_stdio_command(words)
                 executes = bool(
                     words
                     and os.path.basename(words[0])
