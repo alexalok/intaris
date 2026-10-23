@@ -143,8 +143,17 @@ language; source binding proves provenance, not semantic correctness.
   lifecycle protocol.
 - Legacy mechanical same-tool precedent is disabled when user messages, omitted
   evidence, or parent scope are present. Existing exact-call retry also refuses
-  newer messages, incomplete evidence, and parent scope. Human decisions remain
-  model context. Scope-aware reads also disable exact automatic retry and
+  newer messages, incomplete evidence, and parent scope. A newer reusable
+  human-authored note, even on another tool or target, also requires current
+  assessment: it may contain a session-wide restriction. Exact retries,
+  explicit approval IDs, and L1/Judge similarity fallback cannot mechanically
+  restore the older grant over that note. Derived Judge retries compare against
+  their original human grant's resolution time. The grant's own note, strictly
+  older notes, unrelated bare decisions, and system/Judge annotations do not
+  trigger this check; equal timestamps between different decisions require
+  assessment. A current model approval remains possible when the note permits
+  the operation. Human decisions remain model context. Scope-aware reads also
+  disable exact automatic retry and
   similarity fallback so a conditional human note cannot be mechanically
   expanded to another target. Explicit client approval expiration is preserved.
   Explicit approval-ID retries can still use a fresh bare human grant when

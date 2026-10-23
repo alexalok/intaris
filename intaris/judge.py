@@ -37,6 +37,7 @@ from intaris.intent_evidence import (
     SCOPE_RULES,
     allows_legacy_precedent,
     collect_intent_evidence,
+    has_newer_human_scope_note,
     intent_evidence_complete,
     render_intent_evidence,
 )
@@ -93,13 +94,17 @@ def _apply_authoritative_user_precedent(
     args_redacted: dict[str, Any] | None,
     risk: str | None,
     user_decisions: list[dict[str, Any]],
+    intent_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, str, str | None]:
     """Apply final human precedent to low/medium-risk judge outputs."""
     if (risk or "").lower() not in ("low", "medium"):
         return decision, confidence, reasoning, None
 
     precedent = find_authoritative_precedent(tool, args_redacted or {}, user_decisions)
-    if not precedent:
+    if not precedent or (
+        intent_evidence is not None
+        and has_newer_human_scope_note(intent_evidence, precedent)
+    ):
         return decision, confidence, reasoning, None
 
     note = str(precedent.get("user_note") or "").strip()
@@ -1981,6 +1986,7 @@ class JudgeReviewer:
                     args_redacted=record.get("args_redacted") or {},
                     risk=judge_risk,
                     user_decisions=user_decisions,
+                    intent_evidence=current_evidence,
                 )
             )
 

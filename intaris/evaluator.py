@@ -57,6 +57,7 @@ from intaris.decision import (
 from intaris.intent_evidence import (
     allows_legacy_precedent,
     collect_intent_evidence,
+    has_newer_human_scope_note,
     intent_evidence_complete,
     requires_read_scope_review,
 )
@@ -97,6 +98,7 @@ def _apply_authoritative_user_precedent(
     tool: str,
     args_redacted: dict[str, Any],
     user_decisions: list[dict[str, Any]],
+    intent_evidence: dict[str, Any],
 ) -> EvaluationResult:
     """Apply final human same-tool precedent to low/medium-risk evaluations.
 
@@ -110,7 +112,7 @@ def _apply_authoritative_user_precedent(
         return evaluation
 
     precedent = find_authoritative_precedent(tool, args_redacted, user_decisions)
-    if not precedent:
+    if not precedent or has_newer_human_scope_note(intent_evidence, precedent):
         return evaluation
 
     note = str(precedent.get("user_note") or "").strip()
@@ -934,9 +936,15 @@ class Evaluator:
                     decision.decision = "deny"
                     decision.reasoning = "Approval does not match this evaluation."
                     outcome_override = "invalid_approval"
+            if approved and decision.intent_evidence is None:
+                decision.intent_evidence = collect_intent_evidence(session, self._audit)
             if (
                 approved
                 and minimum_outcome == "escalate"
+                and (
+                    raw_decision == "approve"
+                    or not has_newer_human_scope_note(decision.intent_evidence, record)
+                )
                 and raw_decision != "deny"
                 and (
                     not read_scope_review
@@ -1282,8 +1290,19 @@ class Evaluator:
                     # an old exact grant contains no policy snapshot proof.
                     return None
                 current = collect_intent_evidence(current_session, self._audit)
+                authority = prior
+                if prior.get("approval_source_call_id"):
+                    # A derived Judge row cannot make an older human grant
+                    # newer than a restriction written between the two rows.
+                    try:
+                        authority = self._audit.get_by_call_id(
+                            prior["approval_source_call_id"], user_id=user_id
+                        )
+                    except ValueError:
+                        return None
                 if (
-                    any(
+                    has_newer_human_scope_note(current, authority)
+                    or any(
                         source["kind"] == "user_message"
                         and (
                             prior["session_id"] != session_id
@@ -1695,6 +1714,7 @@ class Evaluator:
                     tool=tool,
                     args_redacted=args_redacted,
                     user_decisions=user_decisions,
+                    intent_evidence=intent_evidence,
                 )
             current_session = self._sessions.get_with_parent_policy(
                 session_id, user_id=user_id, agent_policy=self._agent_policy

@@ -442,6 +442,34 @@ def render_intent_evidence(packet: dict[str, Any] | None) -> str:
     )
 
 
+def has_newer_human_scope_note(packet: dict[str, Any], grant: dict[str, Any]) -> bool:
+    """Require interpretation of human notes not covered by the selected grant.
+
+    Normalized source text excludes system/Judge attribution. A different
+    operation can carry a session-wide restriction, so tool/path similarity
+    cannot establish that its note is irrelevant. Bare decisions, the grant's
+    own note, and notes strictly older than the grant do not invalidate reuse.
+    Equal timestamps do not prove ordering between different decisions.
+    """
+    granted_at = grant.get("resolved_at") or grant.get("timestamp")
+    for source in packet.get("sources", []):
+        if (
+            source.get("kind") != "human_decision"
+            or source.get("id") == grant.get("call_id")
+            or not str(source.get("text") or "").strip()
+        ):
+            continue
+        noted_at = source.get("timestamp")
+        if (
+            not isinstance(granted_at, str)
+            or not isinstance(noted_at, str)
+            or noted_at >= granted_at
+        ):
+            return True
+    parent = packet.get("parent")
+    return isinstance(parent, dict) and has_newer_human_scope_note(parent, grant)
+
+
 def allows_legacy_precedent(
     packet: dict[str, Any], *, policy: dict[str, Any] | None = None
 ) -> bool:

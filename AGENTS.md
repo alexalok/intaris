@@ -765,7 +765,7 @@ Humans can override model-assessed L1 denials. Classifier CRITICAL is a hard pro
 
 **Implementation details:**
 - `resolve_escalation()` SQL WHERE clause: `decision IN ('escalate', 'deny')` — accepts both escalations and denials.
-- The evaluator handles CRITICAL before retry and allow paths. WRITE retries refuse newer user evidence, incomplete evidence, and parent scope.
+- The evaluator handles CRITICAL before retry and allow paths. WRITE retries refuse newer user evidence, incomplete evidence, and parent scope. Newer reusable human-authored scope notes on any operation also require fresh assessment. Exact retries, explicit IDs, and L1/Judge similarity fallback compare the note against the selected human grant; derived Judge grants retain the original human grant timestamp. Own/older notes, bare unrelated decisions, and system/Judge annotations preserve compatible reuse.
 - Session-status denials (completed/suspended/terminated) are NOT overridable in the UI — they lack `args_hash` (computed after the early-return session status check) and are filtered from the "Recent Denials" section by `evaluation_path !== 'fast'`.
 - Human decisions on denials are final (`resolved_by='user'` is not re-resolvable).
 - The original `decision='deny'` column is preserved; `user_decision` records the override.
