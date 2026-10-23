@@ -2468,6 +2468,88 @@ def _unwrap_time_command(words: list[str]) -> list[str]:
     return launched
 
 
+# Keep operators intact before splitting shell control syntax. Descriptor
+# prefixes are recognized only when unquoted and adjacent to < or >.
+_SHELL_REDIRECT_OPERATOR_RE = re.compile(r"<<<|<<-|<<|&>>|&>|>>|>\||<>|>&|<&|>|<")
+_SHELL_REDIRECT_RE = re.compile(
+    r"(?:(?P<fd>[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})(?=[<>]))?"
+    r"(?P<operator>" + _SHELL_REDIRECT_OPERATOR_RE.pattern + r")"
+)
+_SHELL_LITERAL_WORD_RE = re.compile(
+    r"""(?:\\.|'[^']*'|"(?:\\.|[^"\\])*"|[^\s;&|()<>'"\\])+"""
+)
+
+
+def _shell_command_tokens(
+    command: str,
+) -> tuple[list[str], list[tuple[str, str, str, int]]] | None:
+    """Separate raw shell words from redirects without losing quote provenance.
+
+    Run once on shell source, before any explicit-argv wrapper is unwrapped.
+    A quoted/escaped operator is a word, and every redirect consumes exactly
+    one shell word as data. This does not expand variables or execute syntax.
+    """
+    words: list[str] = []
+    redirects: list[tuple[str, str, str, int]] = []
+    index = 0
+    while index < len(command):
+        if command[index].isspace():
+            index += 1
+            continue
+        if command[index] == "#":
+            break
+        redirect = _SHELL_REDIRECT_RE.match(command, index)
+        if redirect is not None:
+            index = redirect.end()
+            while index < len(command) and command[index].isspace():
+                index += 1
+            operand = _SHELL_LITERAL_WORD_RE.match(command, index)
+            if operand is None or command[index] == "#":
+                return None  # Missing redirect target is not executable argv.
+            try:
+                target = shlex.split(operand[0])[0]
+            except (ValueError, IndexError):
+                return None
+            operator = redirect["operator"]
+            descriptor = redirect["fd"] or ("0" if operator.startswith("<") else "1")
+            if descriptor.isdecimal():
+                descriptor = descriptor.lstrip("0") or "0"
+            redirects.append((descriptor, operator, target, redirect.start("operator")))
+            index = operand.end()
+            continue
+        word = _SHELL_LITERAL_WORD_RE.match(command, index)
+        if word is None:
+            return None
+        words.append(word[0])
+        index = word.end()
+    return words, redirects
+
+
+def _shell_stdin_redirect(command: str) -> int | None:
+    """Find the literal redirect supplying stdin, including numeric FD copies.
+
+    Source positions identify heredocs without inspecting files or host FDs.
+    Unknown descriptors/expanded FD names do not establish a heredoc source.
+    """
+    parsed = _shell_command_tokens(command)
+    if parsed is None:
+        return None
+    sources: dict[str, int | None] = {}
+    for descriptor, operator, target, position in parsed[1]:
+        if operator in {"<&", ">&"} and re.fullmatch(r"[0-9]+-?", target):
+            copied = target.rstrip("-").lstrip("0") or "0"
+            sources[descriptor] = sources.get(copied)
+            if target.endswith("-"):
+                sources[copied] = None
+        elif operator in {"<&", ">&"} and target == "-":
+            sources[descriptor] = None
+        else:
+            sources[descriptor] = position
+            if operator in {"&>", "&>>"}:
+                sources["2"] = position
+    return sources.get("0")
+
+
 def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[str]:
     """Unwrap literal execution prefixes without promoting argument text."""
     while True:
@@ -2486,8 +2568,11 @@ def _critical_command_words(command: str, *, time_keyword: bool = True) -> list[
         if remainder.startswith("-"):
             break  # Parse GNU/BSD timing options below instead.
         command = remainder
+    parsed = _shell_command_tokens(command)
+    if parsed is None:
+        return []
     try:
-        words = shlex.split(command, comments=True)
+        words = shlex.split(" ".join(parsed[0]), comments=True)
     except ValueError:
         return []
     option_values = {
@@ -2628,8 +2713,29 @@ def _shell_segments(
                     delimiter = shlex.split(raw_delimiter)[0]
                 except (ValueError, IndexError):
                     return segments, heredocs
+                # Resolve stdin after the whole simple-command header is known:
+                # a heredoc may precede its command or be replaced by a later FD.
+                pending.append(
+                    (
+                        delimiter,
+                        match[1] == "-",
+                        raw_delimiter == delimiter,
+                        index,
+                        None,
+                    )
+                )
+                index += match.end()
+                continue
+        elif not quote and (
+            redirect := _SHELL_REDIRECT_OPERATOR_RE.match(command, index)
+        ):
+            index = redirect.end()
+            continue  # &, | and << inside redirect operators are not separators.
+        elif not quote and char in ";&|()\n":
+            if pending and any(item[4] is None for item in pending):
+                header = command[start:index]
                 words = _critical_command_words(
-                    command[start:index],
+                    header,
                     time_keyword=time_keyword
                     and (not segments or segments[-1][1] not in {"|", "|&"}),
                 )
@@ -2639,19 +2745,28 @@ def _shell_segments(
                     and os.path.basename(words[0])
                     in {"sh", "bash", "zsh", "dash", "ksh"}
                 )
-                pending.append(
-                    (delimiter, match[1] == "-", raw_delimiter == delimiter, executes)
-                )
-                index += match.end()
-                continue
-        elif not quote and char in ";&|()\n":
+                stdin_source = _shell_stdin_redirect(header)
+                pending = [
+                    (
+                        delimiter,
+                        strip_tabs,
+                        expands,
+                        position,
+                        resolved
+                        if resolved is not None
+                        else executes
+                        and stdin_source is not None
+                        and position == start + stdin_source,
+                    )
+                    for delimiter, strip_tabs, expands, position, resolved in pending
+                ]
             end = index + 1
             if command[index : end + 1] in {"&&", "||", "|&", ";;", ";&"}:
                 end += 1
             separator = command[index:end]
             segments.append((command[start:index], separator))
             if char == "\n" and pending:
-                for delimiter, strip_tabs, expands, executes in pending:
+                for delimiter, strip_tabs, expands, _position, executes in pending:
                     body_start = end
                     while end < len(command):
                         line_end = command.find("\n", end)
