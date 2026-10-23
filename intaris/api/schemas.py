@@ -221,6 +221,7 @@ class SessionResponse(BaseModel):
     agent_id: str | None = None
     title: str | None = None
     intention: str
+    intent_profile: dict[str, Any] | None = None
     details: dict[str, Any] | None = None
     policy: dict[str, Any] | None = None
     total_calls: int = 0
@@ -274,6 +275,8 @@ class AuditRecord(BaseModel):
     """
 
     id: str
+    intent_evidence: dict[str, Any] | None = None
+    evaluation_context: dict[str, Any] | None = None
     call_id: str | None = None
     record_type: str = "tool_call"
     source: Literal["evaluation", "event"] = "evaluation"

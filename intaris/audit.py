@@ -11,17 +11,40 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
+from weakref import WeakKeyDictionary
 
+from intaris.approval_policy import validate_approval_policy
 from intaris.db import Database
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.redactor import redact
+from intaris.semantic_policy import SemanticPolicyClearance
+from intaris.session import SessionStore, load_session_policy_chain
 
 logger = logging.getLogger(__name__)
 
+
+def _not_revoked_sql(alias: str = "audit_log") -> str:
+    """Match exact later human denials using only fixed internal SQL aliases."""
+    assert alias in {"audit_log", "source"}
+    return f"""NOT EXISTS (
+        SELECT 1 FROM audit_log AS denial
+        WHERE denial.user_id = {alias}.user_id
+          AND denial.session_id = {alias}.session_id
+          AND denial.record_type = 'tool_call'
+          AND denial.tool = {alias}.tool
+          AND denial.args_hash = {alias}.args_hash
+          AND denial.resolved_by = 'user'
+          AND denial.user_decision = 'deny'
+          AND denial.resolved_at >= {alias}.resolved_at
+    )"""
+
+
 # Judge grants mechanically derived from a human approval retain that one-hop
 # dependency for future reuse. Their original waiting invocation is unaffected.
-_USABLE_APPROVAL_SOURCE = """(
+_USABLE_APPROVAL_SOURCE = f"""(
     approval_source_call_id IS NULL OR EXISTS (
         SELECT 1 FROM audit_log AS source
         WHERE source.call_id = audit_log.approval_source_call_id
@@ -30,12 +53,37 @@ _USABLE_APPROVAL_SOURCE = """(
           AND source.resolved_by = 'user' AND source.user_decision = 'approve'
           AND source.expired_at IS NULL
           AND source.approval_scope = 'reusable'
+          AND COALESCE(source.classification, '') != 'critical'
+          AND source.evaluation_path != 'critical'
+          AND {_not_revoked_sql("source")}
     )
 )"""
 
 
 class ApprovalExpiredError(ValueError):
     """The originating client has retired this guarded invocation."""
+
+
+class ScopeChangedError(ValueError):
+    """User authority changed after the Judge collected its evidence."""
+
+
+class StaleUserMessageError(ValueError):
+    """A newer user event superseded this reasoning delivery."""
+
+
+def _check_scope_versions(cur: Any, user_id: str, expected: dict[str, int]) -> None:
+    """Compare tenant-scoped revisions using the approval transaction cursor."""
+    for session_id, version in expected.items():
+        cur.execute(
+            "SELECT scope_version FROM sessions WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        row = cur.fetchone()
+        if row is None or row["scope_version"] != version:
+            raise ScopeChangedError(
+                "User scope changed during review; reassess current evidence"
+            )
 
 
 class ApprovalNotFoundError(ValueError):
@@ -67,8 +115,136 @@ class AuditStore:
         if cls._search_service is service:
             cls._search_service = None
 
+    # Runtime policy is shared by stores using the same DB, never across app
+    # instances. Weak keys release configuration when that DB is discarded.
+    _agent_policies: WeakKeyDictionary[Database, dict[str, Any] | None] = (
+        WeakKeyDictionary()
+    )
+
+    @classmethod
+    def set_agent_policy(cls, db: Database, policy: dict[str, Any] | None) -> None:
+        """Bind the server-owned policy used to resolve restricted approvals."""
+        cls._agent_policies[db] = deepcopy(policy)
+
     def __init__(self, db: Database):
         self._db = db
+
+    def _find_user_message_projection(
+        self,
+        cur: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        event_seq: int,
+    ) -> dict[str, Any] | None:
+        """Find an exact, typed event reference using the caller's cursor."""
+        source_seq_sql = (
+            "jsonb_typeof(args_redacted::jsonb -> 'source_event_seq') = 'number' "
+            "AND args_redacted::jsonb ->> 'source_event_seq' = ?"
+            if self._db.backend == "postgresql"
+            else "json_type(args_redacted, '$.source_event_seq') = 'integer' "
+            "AND json_extract(args_redacted, '$.source_event_seq') = ?"
+        )
+        cur.execute(
+            "SELECT * FROM audit_log WHERE user_id = ? AND session_id = ? "
+            "AND record_type = 'reasoning' "
+            "AND substr(content, 1, 13) = 'User message:' "
+            f"AND {source_seq_sql} ORDER BY timestamp, call_id LIMIT 1",
+            (
+                user_id,
+                session_id,
+                str(event_seq) if self._db.backend == "postgresql" else event_seq,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        record = _row_to_dict(row)
+        metadata = record.get("args_redacted")
+        if not isinstance(metadata, dict):
+            return None
+        stored_seq = metadata.get("source_event_seq")
+        # PostgreSQL jsonb normalizes numeric spellings. Validate the original
+        # JSON too so a float or exponent cannot masquerade as an integer seq.
+        if type(stored_seq) is not int or stored_seq != event_seq:
+            return None
+        return record
+
+    def get_user_message_projection(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        event_seq: int,
+    ) -> dict[str, Any] | None:
+        """Read a user-message projection by tenant, session, and positive seq.
+
+        Return the complete audit record, including original eligibility
+        metadata, or None when no exact projection exists. An explicitly false
+        ``args_redacted.intention_eligible`` means the event was projected but
+        cannot grant authority; it is deliberately absent from intent sources.
+        This lookup does not update session state or promote ineligible content.
+        """
+        if type(event_seq) is not int or event_seq <= 0:
+            raise ValueError("event_seq must be a positive integer")
+        with self._db.cursor() as cur:
+            return self._find_user_message_projection(
+                cur, user_id=user_id, session_id=session_id, event_seq=event_seq
+            )
+
+    def _prepare_user_message(
+        self,
+        cur: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Observe a source and invalidate scope inside its audit transaction.
+
+        The session write serializes duplicate and stale checks across workers,
+        using the same session-before-audit lock order as approval commits.
+        """
+        event_seq = metadata.get("source_event_seq")
+        if "source_event_seq" in metadata and (
+            type(event_seq) is not int or event_seq <= 0
+        ):
+            raise ValueError("source_event_seq must be a positive integer")
+        cur.execute(
+            "UPDATE sessions SET user_message_observed = TRUE "
+            "WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"Session {session_id} not found")
+        advanced = False
+        if event_seq is not None:
+            cur.execute(
+                "SELECT latest_user_message_seq FROM sessions "
+                "WHERE user_id = ? AND session_id = ?",
+                (user_id, session_id),
+            )
+            latest = cur.fetchone()["latest_user_message_seq"]
+            if latest is not None and latest > event_seq:
+                raise StaleUserMessageError("A newer user message is already observed")
+            existing = self._find_user_message_projection(
+                cur, user_id=user_id, session_id=session_id, event_seq=event_seq
+            )
+            advanced = latest is None or latest < event_seq
+            SessionStore(self._db).observe_user_message(
+                session_id, user_id=user_id, event_seq=event_seq, cursor=cur
+            )
+            if existing is not None:
+                return existing
+        if metadata.get("intention_eligible") is not False and not advanced:
+            # Source projection still changes authority when allocation already
+            # published the event pointer. Increment exactly once for this insert.
+            cur.execute(
+                "UPDATE sessions SET scope_version = scope_version + 1 "
+                "WHERE user_id = ? AND session_id = ?",
+                (user_id, session_id),
+            )
+        return None
 
     def insert(
         self,
@@ -95,6 +271,9 @@ class AuditStore:
         maximum_outcome: str | None = None,
         minimum_outcome: str | None = None,
         outcome_override: str | None = None,
+        intent_evidence: dict[str, Any] | None = None,
+        evaluation_context: dict[str, Any] | None = None,
+        scope_versions: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -115,6 +294,11 @@ class AuditStore:
             record_type: Record type: "tool_call", "reasoning", "checkpoint",
                 or "summary".
             content: Reasoning or checkpoint text (null for tool_call records).
+            scope_versions: Observed revisions required to commit an approval.
+                A mismatch inserts nothing and raises ScopeChangedError so the
+                evaluator can persist its non-executable fallback exactly once.
+            evaluation_context: Redacted server evaluation metadata, kept separate
+                from arbitrary tool argument keys.
             args_hash: SHA-256 hash of canonical args for escalation retry.
             profile_version: Behavioral profile version at time of evaluation.
             intention: Session intention at time of evaluation (for tracking).
@@ -132,8 +316,52 @@ class AuditStore:
 
         record_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+        if decision != "approve" or record_type != "tool_call":
+            scope_versions = None
+        if scope_versions is not None and (
+            session_id not in scope_versions
+            or any(
+                not isinstance(key, str) or type(value) is not int or value < 0
+                for key, value in scope_versions.items()
+            )
+        ):
+            raise ScopeChangedError("User scope changed or its revision is unavailable")
+        scope_predicates = [
+            "EXISTS (SELECT 1 FROM sessions WHERE user_id = ? "
+            "AND session_id = ? AND scope_version = ?)"
+            for _ in (scope_versions or {})
+        ]
+        scope_params = [
+            item
+            for key, value in (scope_versions or {}).items()
+            for item in (user_id, key, value)
+        ]
 
         with self._db.cursor() as cur:
+            if scope_versions is not None and self._db.backend == "postgresql":
+                ids = sorted(scope_versions)
+                placeholders = ", ".join("?" for _ in ids)
+                cur.execute(
+                    "SELECT session_id FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders}) "
+                    "ORDER BY session_id FOR UPDATE",
+                    [user_id, *ids],
+                )
+                cur.fetchall()
+                _check_scope_versions(cur, user_id, scope_versions)
+            if (
+                record_type == "reasoning"
+                and isinstance(content, str)
+                and content.startswith("User message:")
+            ):
+                existing = self._prepare_user_message(
+                    cur,
+                    user_id=user_id,
+                    session_id=session_id,
+                    metadata=args_redacted if isinstance(args_redacted, dict) else {},
+                )
+                if existing is not None:
+                    return existing
             cur.execute(
                 """
                 INSERT INTO audit_log
@@ -142,10 +370,16 @@ class AuditStore:
                      evaluation_path, decision, risk, reasoning, latency_ms,
                      args_hash, profile_version, intention, injection_detected,
                      raw_decision, effective_decision, maximum_outcome,
-                     minimum_outcome, outcome_override)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?)
-                """,
+                     minimum_outcome, outcome_override, intent_evidence,
+                     evaluation_context)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?
+                """
+                + (
+                    " WHERE " + " AND ".join(scope_predicates)
+                    if scope_predicates
+                    else ""
+                ),
                 (
                     record_id,
                     call_id,
@@ -172,8 +406,19 @@ class AuditStore:
                     maximum_outcome,
                     minimum_outcome,
                     outcome_override,
+                    json.dumps(intent_evidence)
+                    if intent_evidence is not None
+                    else None,
+                    json.dumps(evaluation_context)
+                    if evaluation_context is not None
+                    else None,
+                    *scope_params,
                 ),
             )
+            if scope_versions is not None and cur.rowcount != 1:
+                raise ScopeChangedError(
+                    "User scope changed during evaluation; review current evidence"
+                )
 
         # Fan out to the search indexer (vector tier only). Lexical
         # search reads canonical tables directly via tsvector — no
@@ -223,6 +468,8 @@ class AuditStore:
             "tool": tool,
             "args_redacted": args_redacted,
             "content": content,
+            "intent_evidence": intent_evidence,
+            "evaluation_context": evaluation_context,
             "classification": classification,
             "evaluation_path": evaluation_path,
             "decision": decision,
@@ -300,6 +547,7 @@ class AuditStore:
         from_ts: str | None = None,
         to_ts: str | None = None,
         resolved: bool | None = None,
+        overridable_denials: bool = False,
         page: int = 1,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -308,6 +556,8 @@ class AuditStore:
         Args:
             user_id: Tenant identifier (always required).
             record_type: Filter by record type (tool_call, reasoning, checkpoint).
+            overridable_denials: Restrict unresolved tool denials to reviewable
+                evaluation paths before pagination, excluding hard prohibitions.
             resolved: Filter by actionable status. ``True`` includes human/judge
                 resolutions and expired invocations. ``False`` excludes both.
                 ``None`` (default) returns the complete evaluation history.
@@ -354,6 +604,20 @@ class AuditStore:
             conditions.append("user_decision IS NULL AND expired_at IS NULL")
             # Judge-only provisional calls must not appear in human approvals.
             conditions.append("(outcome_override IS NULL OR outcome_override != ?)")
+            params.append(UNATTENDED_JUDGE_REVIEW)
+
+        if overridable_denials:
+            # Apply eligibility to both count and rows before LIMIT/OFFSET.
+            # Unfiltered audit history continues to include hard/lifecycle denies.
+            conditions.extend(
+                [
+                    "decision = 'deny' AND record_type = 'tool_call'",
+                    "user_decision IS NULL AND expired_at IS NULL",
+                    "COALESCE(classification, '') != 'critical'",
+                    "evaluation_path NOT IN ('critical', 'fast')",
+                    "(outcome_override IS NULL OR outcome_override != ?)",
+                ]
+            )
             params.append(UNATTENDED_JUDGE_REVIEW)
 
         where = ""
@@ -467,7 +731,7 @@ class AuditStore:
         """
         with self._db.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT call_id, session_id, tool, args_redacted, decision,
                        user_decision, user_note, resolved_at, resolved_by,
                        risk, reasoning, evaluation_path, intention, args_hash,
@@ -476,6 +740,11 @@ class AuditStore:
                 WHERE user_id = ? AND session_id = ?
                   AND record_type = 'tool_call'
                   AND user_decision IS NOT NULL
+                  AND (user_decision = 'deny' OR (
+                      COALESCE(classification, '') != 'critical'
+                      AND evaluation_path != 'critical'
+                      AND {_not_revoked_sql()}
+                  ))
                   AND (expired_at IS NULL OR user_decision = 'deny')
                   AND resolved_by = 'user'
                   AND approval_scope = 'reusable'
@@ -489,6 +758,45 @@ class AuditStore:
 
         return [_row_to_dict(row) for row in rows]
 
+    def get_intent_sources(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        limit: int = 25,
+        include_bare_approvals: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Get user-channel evidence without displacement by agent chatter.
+
+        Read-scope checks can omit bare positive grants, which contain no user
+        restriction text. Filter before LIMIT so a new bare approval cannot hide
+        an older user message, denial, or human-authored scope note.
+        """
+        eligible = (
+            "COALESCE((args_redacted::jsonb -> 'intention_eligible')::text, 'null') != 'false'"
+            if self._db.backend == "postgresql"
+            else "COALESCE(json_type(args_redacted, '$.intention_eligible'), 'null') != 'false'"
+        )
+        with self._db.cursor() as cur:
+            cur.execute(
+                f"""SELECT * FROM audit_log
+                WHERE user_id = ? AND session_id = ? AND (
+                    (record_type = 'reasoning' AND substr(content, 1, 13) = 'User message:'
+                        AND {eligible})
+                    OR (record_type = 'tool_call' AND resolved_by = 'user'
+                        AND user_decision IS NOT NULL AND approval_scope = 'reusable'
+                        AND COALESCE(user_note, '') != 'Resolved via notification action link'
+                        {"" if include_bare_approvals else "AND (user_decision = 'deny' OR (TRIM(COALESCE(user_note, '')) != '' AND COALESCE(user_note_source, 'user') = 'user'))"}
+                        AND (user_decision = 'deny' OR (
+                            expired_at IS NULL
+                            AND COALESCE(classification, '') != 'critical'
+                            AND evaluation_path != 'critical'
+                            AND {_not_revoked_sql()})))
+                ) ORDER BY COALESCE(resolved_at, timestamp) DESC, call_id DESC LIMIT ?""",
+                (user_id, session_id, limit),
+            )
+            return [_row_to_dict(row) for row in cur.fetchall()]
+
     def find_approved_escalation(
         self,
         *,
@@ -497,6 +805,7 @@ class AuditStore:
         args_hash: str,
         cutoff: str,
         human_only: bool = False,
+        session_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Find a prior approved override for the same tool+args.
 
@@ -513,6 +822,7 @@ class AuditStore:
             tool: Tool name.
             args_hash: SHA-256 hash of canonical args.
             cutoff: ISO timestamp — only consider approvals after this time.
+            session_id: If supplied, restrict retry grants to this session.
 
         Returns:
             Audit record dict if a matching approval is found, else None.
@@ -523,6 +833,9 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  {"AND session_id = ?" if session_id is not None else ""}
+                  AND COALESCE(classification, '') != 'critical'
+                  AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
                   AND expired_at IS NULL
                   AND {_USABLE_APPROVAL_SOURCE}
@@ -533,11 +846,20 @@ class AuditStore:
                       OR COALESCE(maximum_outcome, 'deny') = 'deny'
                   )
                   AND resolved_at >= ?
+                  AND {_not_revoked_sql()}
                   AND (? = FALSE OR resolved_by = 'user')
                 ORDER BY resolved_at DESC
                 LIMIT 1
                 """,
-                (user_id, tool, args_hash, UNATTENDED_JUDGE_REVIEW, cutoff, human_only),
+                (
+                    user_id,
+                    tool,
+                    args_hash,
+                    *((session_id,) if session_id is not None else ()),
+                    UNATTENDED_JUDGE_REVIEW,
+                    cutoff,
+                    human_only,
+                ),
             )
             row = cur.fetchone()
 
@@ -562,8 +884,11 @@ class AuditStore:
                 WHERE user_id = ? AND call_id IN ({placeholders})
                   AND record_type = 'tool_call'
                   AND user_decision = 'approve' AND expired_at IS NULL
+                  AND COALESCE(classification, '') != 'critical'
+                  AND evaluation_path != 'critical'
                   AND approval_scope = 'reusable'
                   AND {_USABLE_APPROVAL_SOURCE}
+                  AND {_not_revoked_sql()}
                 """,
                 (user_id, *sorted(call_ids)),
             )
@@ -592,6 +917,11 @@ class AuditStore:
             raise ValueError("Expiration requires the originating session_id")
         now = datetime.now(timezone.utc).isoformat()
         with self._db.cursor() as cur:
+            if self._db.backend == "postgresql":
+                cur.execute(
+                    "SELECT session_id FROM sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+                    (user_id, session_id),
+                )
             cur.execute(
                 """
                 UPDATE audit_log SET expired_at = ?, expiration_reason = ?
@@ -601,6 +931,7 @@ class AuditStore:
                 """,
                 (now, reason, call_id, user_id, session_id),
             )
+            changed = cur.rowcount == 1
             cur.execute(
                 "SELECT * FROM audit_log WHERE call_id = ? AND user_id = ? AND session_id = ?",
                 (call_id, user_id, session_id),
@@ -611,6 +942,17 @@ class AuditStore:
             if row["decision"] != "escalate" or row["record_type"] != "tool_call":
                 raise ValueError("Only escalated tool calls can expire")
             record = _row_to_dict(row)
+            if (
+                changed
+                and record.get("resolved_by") in {"user", "judge"}
+                and record.get("user_decision") == "approve"
+                and record.get("approval_scope") == "reusable"
+            ):
+                cur.execute(
+                    "UPDATE sessions SET scope_version = scope_version + 1 "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, session_id),
+                )
         return record
 
     def resolve_escalation(
@@ -627,6 +969,8 @@ class AuditStore:
         judge_risk: str | None = None,
         pending_only: bool = False,
         approval_source_call_id: str | None = None,
+        scope_versions: dict[str, int] | None = None,
+        semantic_policy_clearance: SemanticPolicyClearance | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -650,6 +994,10 @@ class AuditStore:
             judge_decision: Historical judge recommendation.
             judge_risk: Historical judge risk assessment.
             approval_source_call_id: Human grant used for a derived judge approval.
+            scope_versions: Session and ancestor revisions observed by the Judge.
+                Only Judge approvals use this guard; human overrides stay final.
+            semantic_policy_clearance: Internal policy-only assessment bound to
+                this exact call and current deny clauses; never client input.
             pending_only: Resolve only an unresolved escalation, without the
                 normal human override of a prior judge verdict. Native
                 callbacks use this to make stale buttons inert.
@@ -685,6 +1033,76 @@ class AuditStore:
             approval_source_call_id = None
         now = datetime.now(timezone.utc).isoformat()
 
+        record = self.get_by_call_id(call_id, user_id=user_id)
+        if resolved_by != "judge" or user_decision != "approve":
+            scope_versions = None
+        if scope_versions is not None and (
+            record["session_id"] not in scope_versions
+            or any(
+                not isinstance(key, str) or type(value) is not int or value < 0
+                for key, value in scope_versions.items()
+            )
+        ):
+            raise ScopeChangedError("User scope changed or its revision is unavailable")
+        scope_conditions = "".join(
+            " AND EXISTS (SELECT 1 FROM sessions AS scope_session "
+            "WHERE scope_session.user_id = audit_log.user_id "
+            "AND scope_session.session_id = ? AND scope_session.scope_version = ?)"
+            for _ in (scope_versions or {})
+        )
+        scope_params = [
+            value for pair in (scope_versions or {}).items() for value in pair
+        ]
+        approval_scope_versions: dict[str, int] | None = None
+        policy_state = ("", False)
+        policy_chain: list[dict[str, Any]] = []
+        chain_conditions = ""
+        chain_params: list[Any] = []
+        if user_decision == "approve":
+            if record.get("expired_at"):
+                raise ApprovalExpiredError(
+                    f"Call {call_id} expired; its invocation is no longer waiting"
+                )
+            with self._db.cursor() as cur:
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
+                policy_chain = load_session_policy_chain(
+                    cur, record["session_id"], user_id=user_id
+                )
+            session = policy_chain[0]
+            if session["status"] not in {"active", "idle"}:
+                raise ValueError(
+                    f"Session is {session['status']}; approval is not allowed"
+                )
+            if any(
+                ancestor["status"] in {"suspended", "terminated"}
+                for ancestor in policy_chain[1:]
+            ):
+                raise ValueError("Parent session is stopped; approval is not allowed")
+            policy_state = (session["_policy_raw"], bool(session["agent_restricted"]))
+            # Human overrides need fresh policy too; caller-supplied Judge
+            # revisions are an additional inference guard, never a substitute.
+            for item in policy_chain:
+                chain_conditions += (
+                    " AND EXISTS (SELECT 1 FROM sessions AS policy_session "
+                    "WHERE policy_session.user_id = audit_log.user_id "
+                    "AND policy_session.session_id = ? "
+                    "AND COALESCE(policy_session.policy, '') = ? "
+                    "AND policy_session.agent_restricted = ? "
+                    "AND COALESCE(policy_session.parent_session_id, '') = ? "
+                    "AND policy_session.scope_version = ? "
+                    "AND policy_session.status NOT IN ('suspended', 'terminated'))"
+                )
+                chain_params.extend(
+                    (
+                        item["session_id"],
+                        item["_policy_raw"],
+                        bool(item["agent_restricted"]),
+                        item.get("parent_session_id") or "",
+                        item["scope_version"],
+                    )
+                )
+
         # Atomic update: conditions in WHERE prevent TOCTOU races.
         # Matches unresolved escalations/denials OR records resolved by
         # the judge (allowing human override of judge decisions). Human
@@ -692,19 +1110,85 @@ class AuditStore:
         # COALESCE preserves existing judge_reasoning when the caller
         # does not provide it (i.e., human override passes None).
         with self._db.cursor() as cur:
+            if self._db.backend == "postgresql":
+                # Lock all observed scope rows in stable order before audit rows.
+                # Every source writer follows the same session-before-audit order.
+                ids = sorted(
+                    {
+                        record["session_id"],
+                        *(scope_versions or {}),
+                        *(item["session_id"] for item in policy_chain),
+                    }
+                )
+                placeholders = ", ".join("?" for _ in ids)
+                cur.execute(
+                    "SELECT session_id, policy, agent_restricted, parent_session_id, scope_version, status FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders}) "
+                    "ORDER BY session_id FOR UPDATE",
+                    [user_id, *ids],
+                )
+                locked_rows = {row["session_id"]: row for row in cur.fetchall()}
+                locked = locked_rows.get(record["session_id"])
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
+                if user_decision == "approve" and (
+                    locked is None
+                    or (locked["policy"] or "", bool(locked["agent_restricted"]))
+                    != policy_state
+                ):
+                    raise ValueError(
+                        "Session policy changed during approval; retry approval"
+                    )
+            elif scope_versions is not None:
+                _check_scope_versions(cur, user_id, scope_versions)
+            if user_decision == "approve":
+                validate_approval_policy(
+                    record,
+                    session,
+                    self._agent_policies.get(self._db),
+                    ancestors=policy_chain[1:],
+                    semantic_policy_clearance=semantic_policy_clearance,
+                )
+            review_context = None
+            if user_decision == "approve" and isinstance(
+                semantic_policy_clearance, SemanticPolicyClearance
+            ):
+                review_context = json.dumps(
+                    {
+                        **(record.get("evaluation_context") or {}),
+                        "__intaris_deny_policy_review": {
+                            "assessment": "clear",
+                            "fingerprint": semantic_policy_clearance.fingerprint,
+                            "reasoning": redact(semantic_policy_clearance.reasoning),
+                        },
+                    }
+                )
             cur.execute(
-                """
+                f"""
                 UPDATE audit_log
                 SET user_decision = ?, user_note = ?, resolved_at = ?,
                     resolved_by = ?, user_note_source = ?,
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
-                    effective_decision = ?, approval_source_call_id = ?
+                    effective_decision = ?, approval_source_call_id = ?,
+                    evaluation_context = COALESCE(?, evaluation_context)
                 WHERE call_id = ? AND user_id = ?
                   AND decision IN ('escalate', 'deny')
                   AND expired_at IS NULL
                   AND (user_decision IS NULL OR resolved_by = 'judge')
+                  AND (? != 'approve' OR (
+                      COALESCE(classification, '') != 'critical'
+                      AND evaluation_path != 'critical'
+                  ))
+                  AND (? != 'approve' OR EXISTS (
+                      SELECT 1 FROM sessions AS current_session
+                      WHERE current_session.user_id = audit_log.user_id
+                        AND current_session.session_id = audit_log.session_id
+                        AND COALESCE(current_session.policy, '') = ?
+                        AND current_session.agent_restricted = ?
+                        AND current_session.status IN ('active', 'idle')
+                  ))
                   AND (? = 0 OR (decision = 'escalate' AND user_decision IS NULL))
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                   AND (CAST(? AS TEXT) IS NULL OR EXISTS (
@@ -713,9 +1197,14 @@ class AuditStore:
                         AND source.session_id = audit_log.session_id
                         AND source.resolved_by = 'user'
                         AND source.user_decision = 'approve' AND source.expired_at IS NULL
-                         AND source.approval_scope = 'reusable'
+                        AND source.approval_scope = 'reusable'
+                        AND COALESCE(source.classification, '') != 'critical'
+                        AND source.evaluation_path != 'critical'
+                        AND {_not_revoked_sql("source")}
                   ))
-                """,
+                """
+                + scope_conditions
+                + chain_conditions,
                 (
                     user_decision,
                     user_note,
@@ -727,18 +1216,40 @@ class AuditStore:
                     judge_risk,
                     user_decision,
                     approval_source_call_id,
+                    review_context,
                     call_id,
                     user_id,
+                    user_decision,
+                    user_decision,
+                    *policy_state,
                     int(pending_only),
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
                     approval_source_call_id,
                     approval_source_call_id,
+                    *scope_params,
+                    *chain_params,
                 ),
             )
             if cur.rowcount == 0:
                 # Determine why the update failed for a clear error message
-                record = self.get_by_call_id(call_id, user_id=user_id)
+                cur.execute(
+                    "SELECT * FROM audit_log WHERE call_id = ? AND user_id = ?",
+                    (call_id, user_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"Call {call_id} not found")
+                record = _row_to_dict(row)
+                if scope_versions is not None:
+                    _check_scope_versions(cur, user_id, scope_versions)
+                if user_decision == "approve" and (
+                    record.get("classification") == "critical"
+                    or record.get("evaluation_path") == "critical"
+                ):
+                    raise ValueError(
+                        "Hard prohibition cannot be approved; change the rule and evaluate again"
+                    )
                 if record.get("expired_at"):
                     raise ApprovalExpiredError(
                         f"Call {call_id} expired; its invocation is no longer waiting"
@@ -767,10 +1278,52 @@ class AuditStore:
                         f"Call {call_id} already resolved "
                         f"(user_decision={record['user_decision']})"
                     )
+                if user_decision == "approve":
+                    cur.execute(
+                        "SELECT status FROM sessions WHERE user_id = ? AND session_id = ?",
+                        (user_id, record["session_id"]),
+                    )
+                    current = cur.fetchone()
+                    if current is None or current["status"] not in {"active", "idle"}:
+                        raise ValueError(
+                            "Session stopped during approval; evaluate again"
+                        )
+                    raise ValueError(
+                        "Session policy changed during approval; retry approval"
+                    )
                 # Shouldn't reach here, but raise generic error
                 raise ValueError(f"Failed to resolve call {call_id}")
+            if resolved_by == "user":
+                # The UPDATE below observes the current scope, including a
+                # concurrent native lease claiming this call before resolution.
+                cur.execute(
+                    "UPDATE sessions SET scope_version = scope_version + 1 "
+                    "WHERE user_id = ? AND session_id = ? AND EXISTS ("
+                    "SELECT 1 FROM audit_log WHERE call_id = ? AND user_id = ? "
+                    "AND (approval_scope = 'reusable' OR user_decision = 'deny'))",
+                    (user_id, record["session_id"], call_id, user_id),
+                )
 
-        return self.get_by_call_id(call_id, user_id=user_id)
+            if user_decision == "approve":
+                # Capture after the human resolution's own revision increment,
+                # while the same transaction still holds every scope row.
+                ids = [item["session_id"] for item in policy_chain]
+                placeholders = ", ".join("?" for _ in ids)
+                cur.execute(
+                    "SELECT session_id, scope_version FROM sessions "
+                    f"WHERE user_id = ? AND session_id IN ({placeholders})",
+                    [user_id, *ids],
+                )
+                approval_scope_versions = {
+                    item["session_id"]: item["scope_version"] for item in cur.fetchall()
+                }
+
+        resolved = self.get_by_call_id(call_id, user_id=user_id)
+        if approval_scope_versions is not None:
+            # Transient callback proof, never persisted or reconstructed from
+            # a later audit read. Delayed learning must retain this exact scope.
+            resolved["_approval_scope_versions"] = approval_scope_versions
+        return resolved
 
     def set_judge_reasoning(
         self,
@@ -872,7 +1425,8 @@ class AuditStore:
                   AND resolved_by = 'judge'
                   AND judge_decision IN ('approve', 'deny')
                   AND (expired_at IS NULL OR judge_decision = 'deny')
-                  AND (judge_decision = 'deny' OR {_USABLE_APPROVAL_SOURCE})
+                  AND (judge_decision = 'deny' OR (
+                      {_USABLE_APPROVAL_SOURCE} AND {_not_revoked_sql()}))
                   AND (
                     timestamp < ?
                     OR (timestamp = ? AND id < ?)
@@ -1017,6 +1571,12 @@ class AuditStore:
 def _row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, parsing JSON fields."""
     d = dict(row)
+    for field in ("intent_evidence", "evaluation_context"):
+        if d.get(field):
+            try:
+                d[field] = json.loads(d[field])
+            except (json.JSONDecodeError, TypeError):
+                d[field] = None
     if d.get("args_redacted"):
         try:
             d["args_redacted"] = json.loads(d["args_redacted"])

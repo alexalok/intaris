@@ -30,13 +30,23 @@ from datetime import datetime
 from datetime import timezone as tz
 from typing import Any
 
+from intaris.approval_policy import prepare_approval_policy
+from intaris.audit import ScopeChangedError
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.intent_evidence import (
+    SCOPE_RULES,
+    allows_legacy_precedent,
+    collect_intent_evidence,
+    has_newer_human_scope_note,
+    intent_evidence_complete,
+    render_intent_evidence,
+)
 from intaris.llm import LLMClient, parse_json_response
 from intaris.policy import (
+    POLICY_SEMANTICS,
     effective_policy_for_evaluator,
     normalized_policy_clauses,
-    policy_for_session,
 )
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import filter_model_history, render_user_decisions_section
@@ -85,13 +95,17 @@ def _apply_authoritative_user_precedent(
     args_redacted: dict[str, Any] | None,
     risk: str | None,
     user_decisions: list[dict[str, Any]],
+    intent_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, str, str | None]:
     """Apply final human precedent to low/medium-risk judge outputs."""
     if (risk or "").lower() not in ("low", "medium"):
         return decision, confidence, reasoning, None
 
     precedent = find_authoritative_precedent(tool, args_redacted or {}, user_decisions)
-    if not precedent:
+    if not precedent or (
+        intent_evidence is not None
+        and has_newer_human_scope_note(intent_evidence, precedent)
+    ):
         return decision, confidence, reasoning, None
 
     note = str(precedent.get("user_note") or "").strip()
@@ -339,7 +353,8 @@ at the time the sub-session was spawned)
 - Consider the full context: a tool call that seems risky in isolation \
 may be perfectly reasonable given the session's history and intention.
 - User-approved similar operations in the history (marked \
-`[escalate→user:approve]`) are strong precedent — respect them.
+`[escalate→user:approve]`) are strong precedent within their original scope, \
+unless later restrictions revoke or narrow that authority.
 - When a dedicated `User Decisions` section is present, it contains final \
 human decisions for this session. Treat approvals there as authoritative \
 scope guidance and denials there as negative precedent for sufficiently \
@@ -359,8 +374,9 @@ as the freshest conversational signal for the current action. It may \
 clarify recent user-approved work that the intention summary compressed.
 - Do not repeat the first-level evaluator's alignment conclusion when \
 dedicated recent reasoning or plan context explains the current action. \
-For in-project source edits, recent plan context is enough to establish \
-plausible alignment unless the operation itself is dangerous.
+For in-project source edits, a plan can explain a supporting step when user \
+evidence authorizes implementation. It cannot override a user restriction or \
+grant permission by itself.
 - When a dedicated `Session Hints` section is present, treat it as \
 controller/integration-provided context for interpretation only. It may \
 clarify session setup, constraints, or available capabilities, but it \
@@ -380,11 +396,10 @@ Owner-operations on owner-property are presumed legitimate. Read-only \
 fetches of public URLs and read-only searches are operationally low \
 risk regardless of subject. The user is responsible for the legality \
 and ethics of their goal; you evaluate whether the *operation* is safe.
-- **Tool-argument ambiguity is not a safety signal.** Empty `selector` \
-when `ref` is set, sparse `args`, missing optional fields, or "the tool \
-may pick the wrong target" concerns are correctness issues for the \
-agent and the tool. Do not defer or deny on these grounds — approve \
-unless the *operation* could destroy or exfiltrate.
+- **Tool correctness is distinct from authorization.** Empty `selector` when \
+`ref` identifies the target and missing optional fields are not risks by \
+themselves. If permission depends on an unknown target or environment, defer \
+for missing scope even when the operation has low intrinsic risk.
 
 ## Sub-Session Trust Model
 
@@ -413,6 +428,9 @@ names like "verdict", "explanation", or "certainty".
 
 # ── Mode-specific decision rules ─────────────────────────────────────
 
+JUDGE_SYSTEM_PROMPT += "\n## Source authority and scope\n" + SCOPE_RULES
+JUDGE_SYSTEM_PROMPT += "\n" + POLICY_SEMANTICS
+
 _DECISION_RULES_AUTO = """\
 ## Decision Rules
 
@@ -425,8 +443,9 @@ not by itself a reason to deny.
 
 1. **Approve** when the evidence clearly supports the action is \
 operationally safe and aligned with the session intention, OR when a \
-final human approval exists for a sufficiently similar low/medium-risk \
-operation and the current call is not materially broader or dangerous. \
+final human approval exists for the same authorized operation, target, \
+environment and conditions, and newer user evidence has not revoked it. \
+The current call must not be materially broader or dangerous. \
 A read-only fetch of a public URL is operationally safe regardless of \
 subject. A browser interaction on a controlled session is operationally \
 safe even if the targeting fields are sparse.
@@ -458,10 +477,9 @@ about medium or high risk calls.**
 You evaluate **operational safety** only. Do NOT moderate by topic. \
 Sensitive subject matter (security, locks, alarms, weapons, medical, \
 legal grey areas, finance, personal) is not by itself a reason to defer \
-or deny. Tool-argument ambiguity (empty selectors, sparse args, "may \
-target the wrong element") is a correctness concern handled by the \
-agent and the tool — not a safety concern. **Approve** these cases \
-unless the *operation itself* could destroy or exfiltrate.
+or deny. Missing optional fields and redundant selectors are tool-correctness \
+concerns, not reasons to block. An unknown authorization target or environment \
+is different: defer when the user's permission depends on that missing scope.
 
 Session `deny_policies` are hard operator-provided boundaries. If a deny \
 policy clearly applies, deny. Session `allow_policies` are \
@@ -475,16 +493,14 @@ deny policy wins.
 The risk level in the Original Evaluator Assessment was already \
 determined by the first-level evaluator. Use it as a key signal:
 
-- **Low risk**: Approve by default unless the call is clearly \
-malicious. A low-risk misaligned call (e.g., reading documentation, \
-fetching web content, exploring files outside the project) is not \
-worth deferring to a human — the worst-case outcome is harmless. \
-Do NOT defer low-risk calls just because alignment is uncertain.
+- **Low risk**: Approve routine bounded supporting work within the user's \
+scope, without requiring them to name every tool. Low risk does not itself \
+grant authority: defer if a restriction applies or scope remains unclear.
 - **Medium risk**: Apply normal judgment. Approve if plausibly \
 related to the session's broader purpose. Defer if genuinely uncertain.
-- **Medium-risk in-project source edits**: Approve when recent reasoning, \
-plan context, or adjacent approved edits plausibly connect the change to \
-the active task, even if the compressed intention is UI-heavy or omits \
+- **Medium-risk in-project source edits**: Approve when user evidence authorizes \
+implementation and recent reasoning explains the supporting change, even if \
+the compressed intention is UI-heavy or omits \
 the backend/tooling subtask. Do not defer solely because the first-level \
 evaluator labeled such an edit "not directly aligned".
 - **High risk**: Be cautious. Defer unless clearly safe and aligned.
@@ -494,15 +510,16 @@ evaluator labeled such an edit "not directly aligned".
 1. **Approve** when:
    - The evidence supports the action is safe and aligned with the \
 session intention.
-   - The call is **low risk**, even if alignment is uncertain or the \
-    first-level evaluator flagged it. Low risk calls are safe to approve.
+   - The call is routine low-risk supporting work within established scope, \
+     even if the first-level evaluator overlooked that relationship.
    - A final human approval exists for a sufficiently similar low/medium-risk \
      operation, including equivalent lookup/read tools, and the current call \
-     is not materially broader or dangerous.
+     is within the original targets and conditions, not revoked by newer \
+     evidence, and not materially broader or dangerous.
    - The call is medium risk but plausibly related to the session's \
 broader purpose or a reasonable development activity.
-   - The call is an in-project source edit and recent reasoning or plan \
-context explains why that backend/tooling change supports the active task.
+   - The call is an in-project source edit, user evidence authorizes \
+implementation, and plan context explains the supporting backend/tooling work.
 
 2. **Deny** ONLY when a session deny policy clearly blocks the call, or \
 when the tool call is **unambiguously operationally dangerous, destructive, \
@@ -519,17 +536,16 @@ under which the action could be legitimate and no deny policy clearly \
 applies, do NOT deny — defer instead. **Never** deny for sensitive subject \
 matter alone or for tool-argument ambiguity alone.
 
-3. **Defer** for medium/high risk calls that are not a clear approve \
+3. **Defer** for calls that are not a clear approve \
 or an obvious threat:
    - Evidence is ambiguous or insufficient to determine safety
-   - The tool call might contradict the session intention and the \
-risk is medium or higher
+   - The tool call might contradict the user's request or restrictions, \
+     even when intrinsic risk is low
    - Signs of possible scope creep that might have a legitimate reason
    - The decision requires human judgment or domain knowledge
 
-When in doubt about medium/high risk, **defer**. But when in doubt \
-about low risk, **approve**. A human reviewer's time should be \
-reserved for calls where the outcome actually matters.\
+When authority or operational safety is uncertain, **defer**. Approve \
+routine supporting work when its relationship to the user's scope is clear.\
 """
 
 JUDGE_EVALUATION_SCHEMA: dict[str, Any] = {
@@ -596,6 +612,8 @@ def _build_judge_prompt(
     review_packet: dict[str, Any] | None = None,
     resolution_policy: JudgeResolutionPolicy | None = None,
     prior_judge_reviews: list[dict[str, Any]] | None = None,
+    intent_evidence: dict[str, Any] | None = None,
+    original_intent_evidence: dict[str, Any] | None = None,
 ) -> str:
     """Build the user prompt for judge evaluation.
 
@@ -632,6 +650,13 @@ def _build_judge_prompt(
         Formatted user prompt string.
     """
     sections = []
+    if intent_evidence:
+        sections.append(render_intent_evidence(intent_evidence))
+    if original_intent_evidence:
+        sections.append(
+            "Original L1 evidence fingerprint (historical, current sources above govern): "
+            + str(original_intent_evidence.get("fingerprint", "unknown"))
+        )
 
     # Parent session intention
     if parent_intention:
@@ -986,8 +1011,8 @@ def _build_review_packet(
             packet["session_details"] = compact_details
 
     args = record.get("args_redacted")
-    context = None
-    if isinstance(args, dict):
+    context = record.get("evaluation_context")
+    if context is None and isinstance(args, dict):
         context = args.get("__intaris_context")
         if context is None:
             context = args.get("context")
@@ -1026,9 +1051,11 @@ def _extract_skill_metadata_from_records(
         args = record.get("args_redacted")
         if not isinstance(args, dict):
             continue
-        context = args.get("__intaris_context")
+        context = record.get("evaluation_context")
         if context is None:
-            context = args.get("context")
+            context = args.get("__intaris_context")
+            if context is None:
+                context = args.get("context")
         if not isinstance(context, dict):
             continue
         skill = context.get("skill")
@@ -1111,6 +1138,7 @@ async def resolve_with_side_effects(
     notification_dispatcher: Any | None = None,
     metrics: Any | None = None,
     pending_only: bool = False,
+    scope_versions: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Resolve an escalation or denial with all side effects.
 
@@ -1146,6 +1174,8 @@ async def resolve_with_side_effects(
         event_bus: EventBus instance.
         notification_dispatcher: NotificationDispatcher instance.
         metrics: Metrics instance for observability counters.
+        scope_versions: Observed session and ancestor revisions for atomic
+            Judge approval freshness checks.
         pending_only: Refuse resolved calls even when the prior resolver was
             the judge. Used by invocation-bounded native callbacks.
 
@@ -1174,8 +1204,16 @@ async def resolve_with_side_effects(
         except ValueError:
             pass
 
+    # Policy applicability is independent of the human or Judge's approval.
+    # Inference stays outside the transaction; the store rechecks its binding.
+    clearance = None
+    if user_decision == "approve":
+        clearance = await prepare_approval_policy(
+            evaluator=evaluator, call_id=call_id, user_id=user_id
+        )
+
     # Step 1: Resolve the escalation (atomic DB update)
-    audit_store.resolve_escalation(
+    resolved = audit_store.resolve_escalation(
         call_id=call_id,
         user_decision=user_decision,
         user_note=user_note,
@@ -1187,6 +1225,8 @@ async def resolve_with_side_effects(
         approval_source_call_id=approval_source_call_id,
         **({"user_note_source": user_note_source} if user_note_source else {}),
         **({"pending_only": True} if pending_only else {}),
+        **({"scope_versions": scope_versions} if scope_versions is not None else {}),
+        **({"semantic_policy_clearance": clearance} if clearance is not None else {}),
     )
 
     # Look up the full record for downstream processing
@@ -1238,7 +1278,14 @@ async def resolve_with_side_effects(
     # Step 3: Path prefix learning
     if record is not None and user_decision == "approve" and evaluator is not None:
         try:
-            evaluator.learn_from_approved_escalation(record)
+            evaluator.learn_from_approved_escalation(
+                {
+                    **record,
+                    "_approval_scope_versions": resolved.get(
+                        "_approval_scope_versions"
+                    ),
+                }
+            )
         except Exception:
             logger.debug("Could not learn path prefix from approval", exc_info=True)
 
@@ -1377,6 +1424,8 @@ class JudgeReviewer:
         self._config = config
         self._agent_policy = agent_policy
         self._audit = audit_store
+        if agent_policy is not None:
+            audit_store.set_agent_policy(audit_store._db, agent_policy)
         self._sessions = session_store
         self._evaluator = evaluator
         self._intention_barrier = intention_barrier
@@ -1581,6 +1630,25 @@ class JudgeReviewer:
         if record.get("minimum_outcome") in {"deny", "escalate"}:
             return
 
+        # Includes legacy records routed to Judge before hard floors existed.
+        if (
+            record.get("classification") == "critical"
+            or record.get("evaluation_path") == "critical"
+        ):
+            if record.get("user_decision") is None and not record.get("expired_at"):
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision="deny",
+                    resolved_by="judge",
+                    judge_reasoning="Hard prohibition cannot be approved",
+                    judge_decision="deny",
+                    judge_risk="critical",
+                    audit_store=self._audit,
+                    event_bus=self._event_bus,
+                )
+            return
+
         # Guard: only review tool_call escalations
         if record.get("record_type", "tool_call") != "tool_call":
             logger.debug("Judge skipping non-tool_call record: %s", call_id)
@@ -1597,9 +1665,14 @@ class JudgeReviewer:
 
         # Load session
         session = await asyncio.to_thread(
-            self._sessions.get, session_id, user_id=user_id
+            self._sessions.get_with_parent_policy,
+            session_id,
+            user_id=user_id,
+            agent_policy=self._agent_policy,
         )
-        session["policy"] = policy_for_session(session, self._agent_policy)
+        intent_evidence = await asyncio.to_thread(
+            collect_intent_evidence, session, self._audit
+        )
 
         # Load rich context (30 recent records including reasoning)
         recent_history = await asyncio.to_thread(
@@ -1744,6 +1817,8 @@ class JudgeReviewer:
             review_packet=review_packet,
             resolution_policy=resolution_policy,
             prior_judge_reviews=prior_judge_reviews,
+            intent_evidence=intent_evidence,
+            original_intent_evidence=record.get("intent_evidence"),
         )
 
         # Select mode-specific decision rules for the system prompt
@@ -1781,7 +1856,129 @@ class JudgeReviewer:
         judge_risk = _normalize_judge_risk(result.get("risk"), record.get("risk"))
         confidence = str(result.get("confidence", "low"))
         approval_source_call_id = None
-        if record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW:
+        current_session = await asyncio.to_thread(
+            self._sessions.get_with_parent_policy,
+            session_id,
+            user_id=user_id,
+            agent_policy=self._agent_policy,
+        )
+        current_evidence = await asyncio.to_thread(
+            collect_intent_evidence, current_session, self._audit
+        )
+        evidence_changed = (
+            current_evidence["fingerprint"] != intent_evidence["fingerprint"]
+        )
+
+        async def guard_current_approval(
+            final_decision: str, *, scope_changed: bool = False
+        ) -> bool:
+            # Check the final outcome: policy and precedent can turn a model
+            # denial into approval. Neither can supply omitted current sources.
+            incomplete = not (
+                intent_evidence_complete(intent_evidence)
+                and intent_evidence_complete(current_evidence)
+            )
+            if (
+                not (evidence_changed or scope_changed or incomplete)
+                or final_decision != "approve"
+            ):
+                return False
+            guard_reasoning = (
+                "Current user intent evidence is incomplete; review full sources."
+                if incomplete
+                else "User scope or policy changed during review; reassess current evidence."
+            )
+            current_policy = current_session.get("policy") or {}
+            if (
+                record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
+                or current_policy.get("interaction_mode") == "none"
+            ):
+                # Background and inline entry points both have no human channel.
+                # A permissive maximum or resolution policy cannot undo this.
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision="deny",
+                    resolved_by="judge",
+                    judge_reasoning=guard_reasoning,
+                    judge_decision="deny",
+                    judge_risk=judge_risk,
+                    audit_store=self._audit,
+                    evaluator=self._evaluator,
+                    event_bus=self._event_bus,
+                    notification_dispatcher=(
+                        self._notification_dispatcher
+                        if self._should_notify_resolution("deny")
+                        else None
+                    ),
+                )
+                if self._metrics:
+                    self._metrics.judge_denials_total += 1
+                return True
+            await asyncio.to_thread(
+                self._audit.set_judge_reasoning,
+                call_id,
+                guard_reasoning,
+                user_id=user_id,
+                judge_decision="defer",
+                judge_risk=judge_risk,
+            )
+            if self._metrics:
+                self._metrics.judge_deferrals_total += 1
+            if notify_unresolved and self._config.notify_mode != "never":
+                await self._send_escalation_notification(
+                    call_id=call_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    tool=record.get("tool"),
+                    risk=judge_risk,
+                    reasoning=guard_reasoning,
+                    event_type="judge_deferral",
+                )
+            return True
+
+        async def resolve_current_scope() -> bool:
+            try:
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision=decision,
+                    user_note=f"Judge ({confidence} confidence)",
+                    resolved_by="judge",
+                    judge_reasoning=reasoning,
+                    judge_decision=decision,
+                    judge_risk=judge_risk,
+                    approval_source_call_id=approval_source_call_id,
+                    scope_versions=(
+                        current_evidence["scope_versions"]
+                        if decision == "approve"
+                        else None
+                    ),
+                    audit_store=self._audit,
+                    evaluator=self._evaluator,
+                    intention_barrier=self._intention_barrier,
+                    alignment_barrier=self._alignment_barrier,
+                    event_bus=self._event_bus,
+                    notification_dispatcher=(
+                        self._notification_dispatcher
+                        if self._should_notify_resolution(decision)
+                        else None
+                    ),
+                )
+            except ScopeChangedError:
+                await guard_current_approval(decision, scope_changed=True)
+                return False
+            return True
+
+        if (
+            not evidence_changed
+            and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
+            and record.get("tool") != "skill_view_raw"
+            and allows_legacy_precedent(
+                current_evidence, policy=current_session.get("policy")
+            )
+        ):
             # Do not apply a grant that expired while inference was running.
             if user_decisions:
                 user_decisions = await asyncio.to_thread(
@@ -1799,6 +1996,7 @@ class JudgeReviewer:
                     args_redacted=record.get("args_redacted") or {},
                     risk=judge_risk,
                     user_decisions=user_decisions,
+                    intent_evidence=current_evidence,
                 )
             )
 
@@ -1845,27 +2043,10 @@ class JudgeReviewer:
                 record, decision, reasoning, judge_risk, notify_unresolved
             ):
                 return
-            await resolve_with_side_effects(
-                call_id=call_id,
-                user_id=user_id,
-                user_decision=decision,
-                user_note=f"Judge ({confidence} confidence)",
-                resolved_by="judge",
-                judge_reasoning=reasoning,
-                judge_decision=decision,
-                judge_risk=judge_risk,
-                approval_source_call_id=approval_source_call_id,
-                audit_store=self._audit,
-                evaluator=self._evaluator,
-                intention_barrier=self._intention_barrier,
-                alignment_barrier=self._alignment_barrier,
-                event_bus=self._event_bus,
-                notification_dispatcher=(
-                    self._notification_dispatcher
-                    if self._should_notify_resolution(decision)
-                    else None
-                ),
-            )
+            if await guard_current_approval(decision):
+                return
+            if not await resolve_current_scope():
+                return
 
             if self._metrics:
                 if decision == "approve":
@@ -1887,10 +2068,10 @@ class JudgeReviewer:
                 judge_risk == "low"
                 and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
             ):
-                decision = "approve"
-                if original_decision != "approve":
+                if decision != "approve" or confidence == "low":
+                    decision = "defer"
                     reasoning = (
-                        f"Judge auto-approved low-risk call in advisory mode "
+                        f"Judge deferred low-risk call without confident authorization "
                         f"(original_decision={original_decision}): {reasoning}"
                     )
             elif judge_risk == "critical":
@@ -1925,6 +2106,8 @@ class JudgeReviewer:
             if await self._defer_capped_denial(
                 record, decision, reasoning, judge_risk, notify_unresolved
             ):
+                return
+            if await guard_current_approval(decision):
                 return
 
             if decision == "defer":
@@ -1965,27 +2148,8 @@ class JudgeReviewer:
                 )
             else:
                 # Judge made a decision (approve or high-confidence deny)
-                await resolve_with_side_effects(
-                    call_id=call_id,
-                    user_id=user_id,
-                    user_decision=decision,
-                    user_note=f"Judge ({confidence} confidence)",
-                    resolved_by="judge",
-                    judge_reasoning=reasoning,
-                    judge_decision=decision,
-                    judge_risk=judge_risk,
-                    approval_source_call_id=approval_source_call_id,
-                    audit_store=self._audit,
-                    evaluator=self._evaluator,
-                    intention_barrier=self._intention_barrier,
-                    alignment_barrier=self._alignment_barrier,
-                    event_bus=self._event_bus,
-                    notification_dispatcher=(
-                        self._notification_dispatcher
-                        if self._should_notify_resolution(decision)
-                        else None
-                    ),
-                )
+                if not await resolve_current_scope():
+                    return
 
                 if self._metrics:
                     if decision == "approve":

@@ -986,16 +986,15 @@ class TestPathPolicy:
         )
 
     def test_deny_paths_without_working_directory(self):
-        """deny_paths requires working_directory to resolve paths."""
+        """Absolute denied targets remain enforceable without cwd metadata."""
         policy = {"deny_paths": ["/etc/*"]}
-        # Without working_directory, deny_paths is not checked
         assert (
             classify(
                 "read",
                 {"filePath": "/etc/shadow"},
                 session_policy=policy,
             )
-            == Classification.READ
+            == Classification.CRITICAL
         )
 
     def test_no_path_policy_no_override(self):

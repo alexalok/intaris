@@ -63,6 +63,7 @@ from typing import Any, Callable
 
 from .client import ApiResult, IntarisClient
 from .dispatch import install_dispatch_guard
+from .skills import RAW_SKILL_TOOL, prepare_skill_read
 from .waits import Invocation, WaitStopped
 
 logger = logging.getLogger(__name__)
@@ -1645,7 +1646,11 @@ def _make_guarded_handler(
                 # Capture only after final admission. The native dispatcher
                 # owns exception sanitization and invalid-result conversion.
                 _note_sink(resolution, call_id)
-            result = invoke_original(args, **kwargs)
+            result = (
+                raw_read.read()
+                if raw_read is not None
+                else invoke_original(args, **kwargs)
+            )
             if resolution is not None and _note_sink is None:
                 return _with_approval_note(result, resolution, call_id)
             return result
@@ -1665,10 +1670,27 @@ def _make_guarded_handler(
                 return dispatch_async()
             return dispatch_now(call_id, resolution)
 
+        # The native loader combines reading with activation. Substitute only
+        # a verified native handler, and evaluate the raw reader's real target.
+        if tool_name == RAW_SKILL_TOOL:
+            return json.dumps(
+                {"error": "Internal raw skill reader is not a dispatchable tool"}
+            )
+        try:
+            raw_read = prepare_skill_read(original_handler, tool_name, toolset, args)
+        except (OSError, ValueError) as exc:
+            return json.dumps(
+                {"success": False, "error": f"Raw skill lookup failed: {exc}"}
+            )
+        evaluation_tool = RAW_SKILL_TOOL if raw_read is not None else tool_name
+        evaluation_args = raw_read.evaluation_args if raw_read is not None else args
+
         # Evaluate the tool call
         intention_pending = state.intention_pending
         client = approval.client
-        result = approval.evaluate(tool_name, args, intention_pending=intention_pending)
+        result = approval.evaluate(
+            evaluation_tool, evaluation_args, intention_pending=intention_pending
+        )
 
         # Clear intention_pending after first evaluate
         if intention_pending:
@@ -1768,7 +1790,7 @@ def _make_guarded_handler(
                         "[intaris] Session reactivated — re-evaluating %s",
                         tool_name,
                     )
-                    re_result = approval.evaluate(tool_name, args)
+                    re_result = approval.evaluate(evaluation_tool, evaluation_args)
                     response_error = _decision_response_error(re_result)
                     if response_error:
                         return json.dumps(

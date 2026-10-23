@@ -264,6 +264,16 @@ For escalated records that have been resolved, `user_decision` is `"approve"` or
 
 Important: `audit_log.decision` is the raw evaluator output, not necessarily the public final outcome. For judge-reviewed calls it may remain `"escalate"` even when `POST /evaluate` returned an effective `approve` or `deny`.
 
+### Audit evaluation context
+
+Tool-call audit records expose optional `evaluation_context` metadata separately
+from `args_redacted`. It includes redacted evaluation context, the invocation
+working directory, and hashes of effective free-text deny clauses. Argument
+names such as `context` and `__intaris_context` remain actual tool arguments.
+Older records may have no separate context. A new or changed deny clause requires
+a fresh evaluation before approving a pending record; removing or reordering
+clauses does not. This does not expire the record or prevent denying it.
+
 ### GET /audit/{call_id}
 
 Get a single audit record by call ID.
@@ -322,6 +332,13 @@ pending records requiring evidence-based reconciliation.
 ### POST /decision
 
 Resolve an escalated tool call (approve or deny). When the judge is enabled (`JUDGE_MODE`), escalations may also be auto-resolved by the judge before `POST /evaluate` returns. This endpoint is only for unresolved human-review escalations.
+
+Approval rechecks deterministic prohibitions against the current effective
+session policy, including rules added after escalation and restricted-session
+adoption. A matching hard rule, incomplete arguments needed to check a current
+rule, or a concurrent policy change returns HTTP 400 and leaves the record
+unresolved. Unrelated rules do not block approval. Denial and explicit client
+expiration remain separate actions; an expired invocation returns HTTP 409.
 
 **Request:**
 

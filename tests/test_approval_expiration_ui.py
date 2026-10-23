@@ -189,6 +189,26 @@ def _run_js(body: str, data: dict | None = None) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("field", ["classification", "evaluation_path"])
+def test_hard_prohibitions_have_no_approval_actions(field: str) -> None:
+    _run_js(
+        r"""
+const {field} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const hard = {...record, expired_at: null, decision: 'deny', user_decision: null,
+  resolved_by: null, [field]: 'critical'};
+const ordinary = {...hard, classification: 'write', evaluation_path: 'llm', call_id: 'ordinary'};
+assert.equal(audit.canOverrideDenial(hard), false);
+assert.equal(audit.canOverrideJudge({...hard, resolved_by: 'judge'}), false);
+assert.equal(sandbox.canResolveApproval({...hard, decision: 'escalate'}), false);
+assert.equal(audit.canOverrideDenial(ordinary), true);
+api.listAudit = async () => ({items: [hard, ordinary], total: 2, pages: 1});
+await approvals.loadDenials();
+assert.deepEqual(approvals.denials.map(r => r.call_id).join(','), 'ordinary');
+""",
+        {"field": field},
+    )
+
+
 @pytest.mark.parametrize("view", ["approvals", "audit", "sessions", "modal"])
 @pytest.mark.parametrize(
     "reason,label",
@@ -520,4 +540,18 @@ stores.auth.logout();
 assert.equal(stores.ws.ws, null);
 await stores.auth.login('test-key', 'user-1');
 assert(stores.ws.ws, 'Login after logout must reconnect too');
+""")
+
+
+def test_denial_panel_requests_filter_before_result_limit():
+    _run_js(r"""
+api.listAudit = async params => {
+  requests.push(clone(params));
+  assert.equal(params.overridable_denials, true);
+  assert.equal(params.limit, 20);
+  return {items: [{...record, call_id: 'eligible', expired_at: null, user_decision: null, decision: 'deny'}], total: 25, pages: 2};
+};
+await approvals.loadDenials();
+assert.equal(approvals.denials.length, 1);
+assert.equal(approvals.denials[0].call_id, 'eligible');
 """)

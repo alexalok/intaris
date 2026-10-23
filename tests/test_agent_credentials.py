@@ -256,13 +256,13 @@ def test_agent_lifecycle_and_admin_approval(client):
         client.post("/api/v1/decision", headers=AGENT, json=decision).status_code == 403
     )
     assert (
-        client.post("/api/v1/decision", headers=ADMIN, json=decision).status_code == 200
+        client.post("/api/v1/decision", headers=ADMIN, json=decision).status_code == 400
     )
     assert (
         client.get(f"/api/v1/audit/{denied['call_id']}", headers=AGENT).json()[
             "resolved_by"
         ]
-        == "user"
+        is None
     )
     for path, body in [
         ("/reasoning", {"session_id": "s", "content": "Inspecting code"}),
@@ -476,15 +476,16 @@ def test_agent_policy_survives_missing_config_fail_closed(client):
     assert result.status_code >= 400
 
 
-def test_human_approval_retry_still_works(client):
+def test_human_approval_cannot_override_mandatory_prohibition(client):
     create(client)
     denied = evaluate(client, command="sudo id")
-    client.post(
+    response = client.post(
         "/api/v1/decision",
         headers=ADMIN,
         json={"call_id": denied["call_id"], "decision": "approve"},
-    ).raise_for_status()
-    assert evaluate(client, command="sudo id")["decision"] == "approve"
+    )
+    assert response.status_code == 400
+    assert evaluate(client, command="sudo id")["decision"] == "deny"
 
 
 def test_prior_judge_approval_cannot_bypass_mandatory_critical(client):
@@ -495,9 +496,10 @@ def test_prior_judge_approval_cannot_bypass_mandatory_critical(client):
     denied = evaluate(client, command="sudo id")
     # Prior judge resolution (e.g. from a less restrictive deployment) is not
     # human approval of the current mandatory deny rule.
-    AuditStore(_get_db()).resolve_escalation(
-        denied["call_id"], "approve", user_id="owner", resolved_by="judge"
-    )
+    with pytest.raises(ValueError, match="Hard prohibition"):
+        AuditStore(_get_db()).resolve_escalation(
+            denied["call_id"], "approve", user_id="owner", resolved_by="judge"
+        )
     assert evaluate(client, command="sudo id")["decision"] == "deny"
 
 
@@ -850,19 +852,20 @@ def test_conflicting_agent_credentials_rejected(client):
 @pytest.mark.parametrize("classification", ["write", "escalate"])
 @pytest.mark.parametrize("resolved_by", ["judge", "user"])
 @pytest.mark.parametrize("restricted", [True, False], ids=["restricted", "legacy"])
+@pytest.mark.parametrize("history_session", ["s", "history"])
 def test_retry_approval_identity_for_every_classification(
-    client, classification, resolved_by, restricted
+    client, classification, resolved_by, restricted, history_session
 ):
     import intaris.server as srv
     from intaris.audit import AuditStore
     from intaris.decision import Decision
 
-    create(client, "history", headers=ADMIN)
+    create(client, history_session, headers=ADMIN)
     evaluator = srv._get_evaluator()
     args = {"command": "touch /tmp/output"}
     prior = evaluator.evaluate(
         user_id="owner",
-        session_id="history",
+        session_id=history_session,
         agent_id="operator",
         tool="terminal",
         args=args,
@@ -871,7 +874,8 @@ def test_retry_approval_identity_for_every_classification(
     AuditStore(srv._get_db()).resolve_escalation(
         prior["call_id"], "approve", user_id="owner", resolved_by=resolved_by
     )
-    create(client, headers=AGENT if restricted else ADMIN)
+    if history_session != "s":
+        create(client, headers=AGENT if restricted else ADMIN)
     with patch.object(
         evaluator,
         "_llm_evaluate",
@@ -889,13 +893,14 @@ def test_retry_approval_identity_for_every_classification(
             restricted_agent=restricted,
         )
 
-    if restricted and resolved_by == "judge":
+    if history_session != "s" or (restricted and resolved_by == "judge"):
         assert result["decision"] == (
             "deny" if classification == "write" else "escalate"
         ), result
         if classification == "write":
             inference.assert_called_once()
-            assert inference.call_args.kwargs["session"]["policy"] == POLICY
+            if restricted:
+                assert inference.call_args.kwargs["session"]["policy"] == POLICY
         else:
             inference.assert_not_called()
     else:
@@ -1115,10 +1120,19 @@ def test_admin_inference_finishing_after_adoption_cannot_train_path_cache(client
         return Decision("approve", "low", "Old admin inference completed", "llm")
 
     with patch.object(evaluator, "_llm_evaluate", side_effect=adopt_during_inference):
-        assert (
-            _evaluate_path_read(client, "/outside/first.txt", ADMIN)["decision"]
-            == "approve"
+        # The final L1 transaction now rejects the stale admin approval itself,
+        # before a fresh Judge review can evaluate the newly restricted scope.
+        first = evaluator.evaluate(
+            user_id="owner",
+            session_id="s",
+            agent_id="operator",
+            tool="read",
+            args={"filePath": "/outside/first.txt"},
         )
+        assert first["decision"] == "escalate"
+    stored = client.get(f"/api/v1/audit/{first['call_id']}", headers=ADMIN).json()
+    assert stored["effective_decision"] == "escalate"
+    assert stored["outcome_override"] == "intent_evidence_changed"
     assert not evaluator._approved_paths.get(("owner", "s"))
     with patch.object(
         evaluator,
@@ -1206,7 +1220,7 @@ def test_agent_quoted_shell_paths_obey_mandatory_policy(client, tool, deny_paths
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert context["target_paths"] == ["/etc/passwd"]
 
 
@@ -1400,7 +1414,7 @@ def test_agent_unknown_grep_long_options_obey_policy(client, tool, command, deny
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert "/etc/passwd" in context["target_paths"]
 
 
@@ -1458,7 +1472,7 @@ def test_agent_hyphen_pattern_obeys_path_policy(
     assert audit["classification"] == ("critical" if deny_paths else "write")
     assert audit["tool"] == tool
     if not deny_paths:
-        context = audit["args_redacted"]["__intaris_context"]["path_policy"]
+        context = audit["evaluation_context"]["path_policy"]
         assert context["target_paths"] == ["/etc/passwd"]
 
 

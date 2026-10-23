@@ -910,9 +910,9 @@ class TestEvaluatorDecisionContext:
         assert prompt_context["tool"]["read_only"] is True
 
         record = audit.get_by_call_id(result["call_id"], user_id="user-1")
-        stored_context = record["args_redacted"]["__intaris_context"]
+        stored_context = record["evaluation_context"]
         assert stored_context["tool"]["description"] == "List Alertmanager silences"
-        assert record["args_redacted"]["context"] == stored_context
+        assert "__intaris_context" not in record["args_redacted"]
 
     def test_llm_evaluate_honors_final_human_same_tool_approval(
         self, db, session_store
@@ -2212,9 +2212,7 @@ class TestIntentionSourceColumn:
         assert '"any_target_denied_by_policy": false' in user_prompt
         assert '"project_path"' not in user_prompt
 
-    def test_write_evaluation_includes_denied_absolute_target_without_cwd(
-        self, db, session_store
-    ):
+    def test_absolute_denied_target_is_stopped_without_cwd(self, db, session_store):
         from intaris.audit import AuditStore
 
         llm = MagicMock()
@@ -2239,7 +2237,7 @@ class TestIntentionSourceColumn:
             db=db,
         )
 
-        evaluator.evaluate(
+        result = evaluator.evaluate(
             user_id="user-1",
             session_id="sess-policy-denied-target",
             agent_id=None,
@@ -2252,10 +2250,9 @@ class TestIntentionSourceColumn:
             },
         )
 
-        messages = llm.generate.call_args[0][0]
-        user_prompt = messages[1]["content"]
-        assert '"all_targets_allowed_by_policy": true' in user_prompt
-        assert '"any_target_denied_by_policy": true' in user_prompt
+        assert result["decision"] == "deny"
+        assert result["classification"] == "critical"
+        llm.generate.assert_not_called()
 
     def test_write_evaluation_omits_relative_target_policy_without_cwd(
         self, db, session_store

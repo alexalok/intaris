@@ -430,20 +430,25 @@ def test_evaluator_routes_write_classification_to_jev() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-routing",
+        "user_id": "user-jev-routing",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-routing",
-            "user_id": "user-jev-routing",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-routing",
@@ -467,20 +472,25 @@ def test_evaluator_preserves_explicit_jev_escalation() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-escalation",
+        "user_id": "user-jev-escalation",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-escalation",
-            "user_id": "user-jev-escalation",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-escalation",
@@ -503,20 +513,25 @@ def test_evaluator_preserves_jev_diagnostics_after_decision_matrix() -> None:
     audit = MagicMock()
     audit.get_recent.return_value = []
     audit.get_user_decisions.return_value = []
+    audit.get_intent_sources.return_value = []
+    sessions = MagicMock()
+    session = {
+        "session_id": "session-jev-diagnostics",
+        "user_id": "user-jev-diagnostics",
+        "intention": "Update project documentation",
+        "policy": None,
+    }
+    sessions.get.return_value = session
+    sessions.get_with_parent_policy.return_value = session
     evaluator = Evaluator(
         llm=llm,
         jev=jev,
-        session_store=MagicMock(),
+        session_store=sessions,
         audit_store=audit,
     )
 
     decision = evaluator._llm_evaluate(
-        session={
-            "session_id": "session-jev-diagnostics",
-            "user_id": "user-jev-diagnostics",
-            "intention": "Update project documentation",
-            "policy": None,
-        },
+        session=session,
         tool="write",
         args_redacted={"file_path": "docs/usage.md"},
         agent_id="agent-jev-diagnostics",
@@ -581,3 +596,43 @@ def test_live_jev_inference_contract() -> None:
     assert result.reasoning
     assert isinstance(aligned, bool)
     assert reasoning
+
+
+@pytest.mark.parametrize("include_rubric", [False, True])
+def test_intent_rules_present_once_without_budget_only_escalation(include_rubric):
+    from intaris.intent_evidence import SCOPE_RULES
+    from intaris.prompts import SAFETY_EVALUATION_SYSTEM_PROMPT
+    from intaris.sanitize import ANTI_INJECTION_PREAMBLE
+
+    client, requests = _client(_response())
+    rules = (
+        SAFETY_EVALUATION_SYSTEM_PROMPT.format(anti_injection=ANTI_INJECTION_PREAMBLE)
+        if include_rubric
+        else "Evaluate scope."
+    )
+    state = {
+        "intent_evidence": {"sources": [{"text": "Inspect project only"}]},
+        "tool": "edit",
+    }
+    client.evaluate_tool_call(state=state, evaluation_rules=rules)
+    body = json.loads(requests[-1].content)
+    expected_rules = rules if include_rubric else rules + "\n" + SCOPE_RULES
+    assert body["state"]["evaluation_rules"] == expected_rules
+    assert body["state"]["evaluation_rules"].count(SCOPE_RULES) == 1
+    payload = {key: body[key] for key in ("state", "questions")}
+    client._max_input_bytes = len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    requests.clear()
+    assert (
+        client.evaluate_tool_call(state=state, evaluation_rules=rules).decision
+        == "approve"
+    )
+    assert len(requests) == 1
+    client._max_input_bytes -= 1
+    requests.clear()
+    assert (
+        client.evaluate_tool_call(state=state, evaluation_rules=rules).decision
+        == "escalate"
+    )
+    assert requests == []

@@ -184,6 +184,7 @@ class EventAuditStore:
         from_ts: str | None = None,
         to_ts: str | None = None,
         resolved: bool | None = None,
+        overridable_denials: bool = False,
         event_type: str | None = None,
         event_source: str | None = None,
         page: int = 1,
@@ -207,7 +208,7 @@ class EventAuditStore:
         items: list[dict[str, Any]] = []
         total = 0
 
-        decision_only_filters = any(
+        decision_only_filters = overridable_denials or any(
             value is not None
             for value in (
                 record_type,
@@ -232,6 +233,7 @@ class EventAuditStore:
                 from_ts=from_ts,
                 to_ts=to_ts,
                 resolved=resolved,
+                overridable_denials=overridable_denials,
                 page=1,
                 limit=branch_limit,
             )

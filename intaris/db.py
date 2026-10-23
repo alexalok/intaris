@@ -382,6 +382,12 @@ class Database:
 
     def _migrate_sqlite(self, conn: sqlite3.Connection) -> None:
         """Run schema migrations for SQLite backend."""
+        if not self._sqlite_column_exists(conn, "sessions", "intent_profile"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN intent_profile TEXT")
+        if not self._sqlite_column_exists(conn, "audit_log", "intent_evidence"):
+            conn.execute("ALTER TABLE audit_log ADD COLUMN intent_evidence TEXT")
+        if not self._sqlite_column_exists(conn, "audit_log", "evaluation_context"):
+            conn.execute("ALTER TABLE audit_log ADD COLUMN evaluation_context TEXT")
         if not self._sqlite_column_exists(
             conn, "mcp_servers", "trust_readonly_annotations"
         ):
@@ -504,6 +510,11 @@ class Database:
         if not self._sqlite_column_exists(conn, "notification_channels", "events"):
             conn.execute("ALTER TABLE notification_channels ADD COLUMN events TEXT")
             logger.info("Migration: added events column to notification_channels")
+
+        if not self._sqlite_column_exists(conn, "sessions", "scope_version"):
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN scope_version INTEGER NOT NULL DEFAULT 0"
+            )
 
         if not self._sqlite_column_exists(conn, "sessions", "agent_restricted"):
             conn.execute(
@@ -979,6 +990,9 @@ class Database:
         try:
             # All columns that may need adding (idempotent with IF NOT EXISTS)
             migrations = [
+                ("sessions", "intent_profile", "TEXT"),
+                ("audit_log", "intent_evidence", "TEXT"),
+                ("audit_log", "evaluation_context", "TEXT"),
                 (
                     "mcp_servers",
                     "trust_readonly_annotations",
@@ -1000,6 +1014,7 @@ class Database:
                 ("notification_channels", "events", "TEXT"),
                 ("sessions", "alignment_overridden", "BOOLEAN DEFAULT FALSE"),
                 ("sessions", "agent_restricted", "BOOLEAN NOT NULL DEFAULT FALSE"),
+                ("sessions", "scope_version", "BIGINT NOT NULL DEFAULT 0"),
                 ("sessions", "last_alignment", "TEXT"),
                 ("audit_log", "injection_detected", "BOOLEAN DEFAULT FALSE"),
                 ("behavioral_analyses", "agent_id", "TEXT"),
@@ -1268,6 +1283,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     latest_user_message_seq INTEGER,
     user_message_observed INTEGER DEFAULT 0,
     agent_restricted INTEGER NOT NULL DEFAULT 0,
+    scope_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, session_id)
@@ -1581,6 +1597,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     latest_user_message_seq BIGINT,
     user_message_observed BOOLEAN DEFAULT FALSE,
     agent_restricted BOOLEAN NOT NULL DEFAULT FALSE,
+    scope_version BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, session_id)
 );
 

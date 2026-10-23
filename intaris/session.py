@@ -13,8 +13,40 @@ from datetime import datetime, timezone
 from typing import Any
 
 from intaris.db import Database
+from intaris.policy import policy_for_chain
 
 logger = logging.getLogger(__name__)
+
+
+def load_session_policy_chain(
+    cur: Any, session_id: str, *, user_id: str
+) -> list[dict[str, Any]]:
+    """Read tenant-scoped child plus at most four ancestors on one cursor.
+
+    Retain raw policy text for atomic approval comparison. A broken chain is
+    never evidence that an ancestor has no restrictions.
+    """
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current = session_id
+    while current:
+        if current in seen or len(chain) >= 5:
+            raise ValueError(
+                "Session policy ancestry is cyclic or exceeds the supported depth"
+            )
+        seen.add(current)
+        cur.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+            (current, user_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("Session policy ancestry is unavailable")
+        session = _row_to_dict(row)
+        session["_policy_raw"] = row["policy"] or ""
+        chain.append(session)
+        current = session.get("parent_session_id")
+    return chain
 
 
 class SessionStore:
@@ -123,11 +155,27 @@ class SessionStore:
 
         return _row_to_dict(row)
 
+    def get_with_parent_policy(
+        self, session_id: str, *, user_id: str, agent_policy: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Return an ephemeral effective policy and its earliest scope revisions."""
+        with self._db.cursor() as cur:
+            chain = load_session_policy_chain(cur, session_id, user_id=user_id)
+        session = dict(chain[0])
+        session["policy"] = policy_for_chain(chain, agent_policy)
+        session["_parent_chain"] = chain[1:]
+        session["_scope_versions"] = {
+            item["session_id"]: item["scope_version"] for item in chain
+        }
+        return session
+
     def restrict_agent_session(self, session_id: str, *, user_id: str) -> None:
         """Permanently require server policy once an agent evaluates this session."""
         with self._db.cursor() as cur:
             cur.execute(
-                "UPDATE sessions SET agent_restricted = TRUE WHERE session_id = ? AND user_id = ?",
+                "UPDATE sessions SET scope_version = scope_version + "
+                "CASE WHEN agent_restricted THEN 0 ELSE 1 END, "
+                "agent_restricted = TRUE WHERE session_id = ? AND user_id = ?",
                 (session_id, user_id),
             )
             if cur.rowcount == 0:
@@ -175,7 +223,10 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = ?, status_reason = ?, updated_at = ?
+                SET status = ?, status_reason = ?, updated_at = ?,
+                    scope_version = scope_version + CASE
+                        WHEN status = ? OR (status IN ('active', 'idle')
+                            AND ? IN ('active', 'idle')) THEN 0 ELSE 1 END
                 WHERE session_id = ? AND user_id = ?
                 """
                 + (
@@ -183,7 +234,7 @@ class SessionStore:
                     if agent_request
                     else ""
                 ),
-                (status, status_reason, now, session_id, user_id),
+                (status, status_reason, now, status, status, session_id, user_id),
             )
             if cur.rowcount == 0:
                 if agent_request:
@@ -239,6 +290,7 @@ class SessionStore:
         if intention is not None:
             sets.append("intention = ?")
             params.append(intention)
+            sets.append("intent_profile = NULL")
         if details is not None:
             sets.append("details = ?")
             params.append(json.dumps(details))
@@ -252,6 +304,11 @@ class SessionStore:
             sets.append("title = ?")
             params.append(title)
 
+        if any(
+            value is not None
+            for value in (intention, details, policy, intention_source)
+        ):
+            sets.append("scope_version = scope_version + 1")
         params.extend([session_id, user_id])
 
         with self._db.cursor() as cur:
@@ -304,7 +361,8 @@ class SessionStore:
                         WHEN ? > 0 THEN TRUE
                         ELSE user_message_observed
                     END,
-                    last_event_seq = {base_sql} + ?
+                    last_event_seq = {base_sql} + ?,
+                    scope_version = scope_version + {int(last_user_offset > 0)}
                 WHERE session_id = ? AND user_id = ?{returning}
                 """,
                 (
@@ -338,30 +396,53 @@ class SessionStore:
         *,
         user_id: str,
         event_seq: int,
+        cursor: Any | None = None,
     ) -> None:
-        """Advance durable user-message state for a pre-migration event."""
-        with self._db.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE sessions
-                SET latest_user_message_seq = CASE
-                        WHEN latest_user_message_seq IS NULL
-                          OR latest_user_message_seq < ?
-                        THEN ?
-                        ELSE latest_user_message_seq
-                    END,
-                    last_event_seq = CASE
-                        WHEN COALESCE(last_event_seq, 0) < ?
-                        THEN ?
-                        ELSE last_event_seq
-                    END,
-                    user_message_observed = TRUE
-                WHERE session_id = ? AND user_id = ?
-                """,
-                (event_seq, event_seq, event_seq, event_seq, session_id, user_id),
-            )
-            if cur.rowcount == 0:
-                raise ValueError(f"Session {session_id} not found")
+        """Advance event state using the source insert transaction when supplied.
+
+        Event-backed audit sources must pass their transaction cursor so the
+        pointer and source become visible together, including on PostgreSQL.
+        """
+        if type(event_seq) is not int or event_seq <= 0:
+            raise ValueError("source_event_seq must be a positive integer")
+        if cursor is None:
+            with self._db.cursor() as cur:
+                self.observe_user_message(
+                    session_id, user_id=user_id, event_seq=event_seq, cursor=cur
+                )
+            return
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET latest_user_message_seq = CASE
+                    WHEN latest_user_message_seq IS NULL
+                      OR latest_user_message_seq < ?
+                    THEN ?
+                    ELSE latest_user_message_seq
+                END,
+                last_event_seq = CASE
+                    WHEN COALESCE(last_event_seq, 0) < ?
+                    THEN ?
+                    ELSE last_event_seq
+                END,
+                user_message_observed = TRUE,
+                scope_version = scope_version + CASE
+                    WHEN latest_user_message_seq IS NULL OR latest_user_message_seq < ?
+                    THEN 1 ELSE 0 END
+            WHERE session_id = ? AND user_id = ?
+            """,
+            (
+                event_seq,
+                event_seq,
+                event_seq,
+                event_seq,
+                event_seq,
+                session_id,
+                user_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(f"Session {session_id} not found")
 
     def mark_user_message_observed(
         self,
@@ -417,12 +498,17 @@ class SessionStore:
                     user_message_observed = CASE
                         WHEN ? IS NOT NULL THEN TRUE
                         ELSE user_message_observed
-                    END
+                    END,
+                    scope_version = scope_version + CASE
+                        WHEN ? IS NOT NULL AND (latest_user_message_seq IS NULL
+                            OR latest_user_message_seq < ?) THEN 1 ELSE 0 END
                 WHERE session_id = ? AND user_id = ?
                 """,
                 (
                     last_event_seq,
                     last_event_seq,
+                    latest_user_message_seq,
+                    latest_user_message_seq,
                     latest_user_message_seq,
                     latest_user_message_seq,
                     latest_user_message_seq,
@@ -445,11 +531,18 @@ class SessionStore:
         expected_user_message_seq: int | None = None,
         guard_user_message_seq: bool = False,
         require_no_user_message: bool = False,
+        intent_profile: dict[str, Any] | None = None,
     ) -> bool:
         """Persist a generated intention only while its durable guard holds."""
         now = datetime.now(timezone.utc).isoformat()
         conditions = ["session_id = ?", "user_id = ?"]
-        params: list[Any] = [intention, intention_source, title, now]
+        params: list[Any] = [
+            intention,
+            intention_source,
+            title,
+            now,
+            json.dumps(intent_profile) if intent_profile is not None else None,
+        ]
         condition_params: list[Any] = [session_id, user_id]
         if guard_user_message_seq:
             if expected_user_message_seq is None:
@@ -466,7 +559,8 @@ class SessionStore:
                 """
                 UPDATE sessions
                 SET intention = ?, intention_source = ?,
-                    title = COALESCE(?, title), updated_at = ?
+                    title = COALESCE(?, title), updated_at = ?, intent_profile = ?,
+                    scope_version = scope_version + 1
                 WHERE """
                 + " AND ".join(conditions),
                 params,
@@ -595,7 +689,7 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = 'completed', updated_at = ?
+                SET status = 'completed', updated_at = ?, scope_version = scope_version + 1
                 WHERE status = 'idle'
                   AND parent_session_id IS NOT NULL
                   AND last_activity_at IS NOT NULL
@@ -672,10 +766,12 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET alignment_overridden = ?, updated_at = ?
+                SET alignment_overridden = ?, updated_at = ?,
+                    scope_version = scope_version + CASE
+                        WHEN COALESCE(alignment_overridden, FALSE) = ? THEN 0 ELSE 1 END
                 WHERE session_id = ? AND user_id = ?
                 """,
-                (overridden, now, session_id, user_id),
+                (overridden, now, overridden, session_id, user_id),
             )
 
     def get_active_child_sessions(
@@ -1061,7 +1157,7 @@ class SessionStore:
 def _row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, parsing JSON fields."""
     d = dict(row)
-    for json_field in ("details", "policy"):
+    for json_field in ("details", "policy", "intent_profile"):
         if d.get(json_field):
             try:
                 d[json_field] = json.loads(d[json_field])

@@ -350,16 +350,29 @@ async def action_post(request: Request) -> HTMLResponse:
     # This calls resolve_escalation() directly rather than
     # resolve_with_side_effects() — EventBus publish, path learning,
     # and notification dispatch are intentionally skipped for action links.
+    from intaris.approval_policy import prepare_approval_policy
     from intaris.audit import AuditStore
-    from intaris.server import _get_db
+    from intaris.server import _get_db, _get_evaluator
 
     try:
         store = AuditStore(_get_db())
+        clearance = None
+        if payload.action == "approve":
+            clearance = await prepare_approval_policy(
+                evaluator=_get_evaluator(),
+                call_id=payload.call_id,
+                user_id=payload.user_id,
+            )
         store.resolve_escalation(
             call_id=payload.call_id,
             user_decision=payload.action,
             user_note="Resolved via notification action link",
             user_id=payload.user_id,
+            **(
+                {"semantic_policy_clearance": clearance}
+                if clearance is not None
+                else {}
+            ),
         )
     except ValueError as e:
         return HTMLResponse(

@@ -29,7 +29,14 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from intaris.audit import AuditStore
+from intaris.approval_policy import (
+    deny_policy_fingerprints,
+    make_evaluation_context,
+)
+from intaris.approval_policy import (
+    effective_working_directory as _effective_working_directory,
+)
+from intaris.audit import AuditStore, ScopeChangedError
 from intaris.classifier import (
     Classification,
     classify,
@@ -48,8 +55,15 @@ from intaris.decision import (
     clamp_outcome,
     make_fast_decision,
 )
+from intaris.intent_evidence import (
+    allows_legacy_precedent,
+    collect_intent_evidence,
+    has_newer_human_scope_note,
+    intent_evidence_complete,
+    requires_read_scope_review,
+)
 from intaris.llm import LLMClient, parse_json_response
-from intaris.policy import effective_policy_for_evaluator, policy_for_session
+from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import (
     SAFETY_EVALUATION_SCHEMA,
@@ -64,6 +78,7 @@ from intaris.session import SessionStore
 
 if TYPE_CHECKING:
     from intaris.jev import JevClient
+    from intaris.semantic_policy import SemanticPolicyClearance
 
 # Escalation retry: reuse approval if same tool+args approved within this window.
 _ESCALATION_RETRY_TTL_MINUTES = 10
@@ -75,24 +90,8 @@ _MAX_APPROVED_PATHS_PER_SESSION = 50
 # Prevents merging to overly broad prefixes like /Users or /home.
 # Example: /Users/foo/.cache/opencode = 4 components (excluding root).
 _MIN_MERGE_DEPTH = 4
-_CONTEXT_ARG_KEY = "__intaris_context"
 
 logger = logging.getLogger(__name__)
-
-
-def _args_redacted_with_context(
-    args_redacted: dict[str, Any],
-    context: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Attach redacted evaluate context to audit args without clobbering tool args."""
-
-    if not context:
-        return args_redacted
-    result = dict(args_redacted)
-    result[_CONTEXT_ARG_KEY] = context
-    if "context" not in result:
-        result["context"] = context
-    return result
 
 
 def _apply_authoritative_user_precedent(
@@ -101,6 +100,7 @@ def _apply_authoritative_user_precedent(
     tool: str,
     args_redacted: dict[str, Any],
     user_decisions: list[dict[str, Any]],
+    intent_evidence: dict[str, Any],
 ) -> EvaluationResult:
     """Apply final human same-tool precedent to low/medium-risk evaluations.
 
@@ -114,7 +114,7 @@ def _apply_authoritative_user_precedent(
         return evaluation
 
     precedent = find_authoritative_precedent(tool, args_redacted, user_decisions)
-    if not precedent:
+    if not precedent or has_newer_human_scope_note(intent_evidence, precedent):
         return evaluation
 
     note = str(precedent.get("user_note") or "").strip()
@@ -138,6 +138,46 @@ def _apply_authoritative_user_precedent(
     )
 
 
+def _unchanged_human_read_scope(
+    record: dict[str, Any],
+    scope_versions: dict[str, int],
+    working_directory: str | None,
+) -> bool:
+    """Accept an explicit bare human grant only for its unchanged reviewed scope.
+
+    Resolving the grant advances its own session revision once. Any additional
+    user, policy, lifecycle, or ancestor change invalidates this proof. Missing
+    or incomplete historical evidence and conditional notes need current L1
+    approval instead. This preserves the explicit approval-ID retry protocol.
+    """
+    if (
+        record.get("user_note_source") in {None, "user"}
+        and str(record.get("user_note") or "").strip()
+    ):
+        return False
+    context = record.get("evaluation_context")
+    if (
+        not isinstance(context, dict)
+        or "__intaris_evaluation_directory" not in context
+        or context["__intaris_evaluation_directory"] != working_directory
+    ):
+        return False
+    evidence = record.get("intent_evidence")
+    if not intent_evidence_complete(evidence):
+        return False
+    expected = evidence.get("scope_versions")
+    session_id = record.get("session_id")
+    if (
+        not isinstance(expected, dict)
+        or session_id not in expected
+        or any(type(value) is not int or value < 0 for value in expected.values())
+    ):
+        return False
+    expected = dict(expected)
+    expected[session_id] += 1
+    return expected == scope_versions
+
+
 def _resolve_tool_paths_for_context(
     tool: str,
     args: dict[str, Any],
@@ -145,41 +185,6 @@ def _resolve_tool_paths_for_context(
 ) -> list[str]:
     """Resolve tool target paths for evaluator policy context."""
     return resolve_tool_paths(tool, args, working_directory)
-
-
-def _effective_working_directory(
-    tool: str,
-    args: dict[str, Any],
-    context: dict[str, Any] | None,
-    session_details: dict[str, Any],
-) -> str | None:
-    """Resolve the directory that applies to this specific tool call."""
-
-    context = context or {}
-    executor_environment = context.get("executor_environment")
-    executor_metadata_present = isinstance(executor_environment, dict)
-    candidates = [
-        context.get("working_directory"),
-        (executor_environment.get("cwd") if executor_metadata_present else None),
-    ]
-    if not executor_metadata_present:
-        candidates.append(session_details.get("working_directory"))
-    base_directory = next(
-        (
-            os.path.normpath(value)
-            for value in candidates
-            if isinstance(value, str) and os.path.isabs(value)
-        ),
-        None,
-    )
-    if tool in {"bash", "terminal"}:
-        tool_workdir = args.get("workdir")
-        if isinstance(tool_workdir, str) and tool_workdir:
-            if os.path.isabs(tool_workdir):
-                return os.path.normpath(tool_workdir)
-            if base_directory:
-                return os.path.normpath(os.path.join(base_directory, tool_workdir))
-    return base_directory
 
 
 def _build_path_policy_context(
@@ -270,6 +275,8 @@ class Evaluator:
         self._jev = jev
         self._sessions = session_store
         self._audit = audit_store
+        if agent_policy is not None:
+            audit_store.set_agent_policy(audit_store._db, agent_policy)
         self._db = db
         self._analysis_config = analysis_config
         self._analysis_enabled = analysis_config is not None and analysis_config.enabled
@@ -288,6 +295,28 @@ class Evaluator:
         # Validate sources in the DB so another worker can expire a grant.
         self._approved_path_sources: dict[tuple[str, str], set[str]] = {}
         self._approved_path_versions: dict[tuple[str, str], object] = {}
+        # Model-learned prefixes lack a human approval ID. Bind them to the
+        # original scope snapshot so later user decisions invalidate them too.
+        self._approved_path_scopes: dict[tuple[str, str], dict[str, int]] = {}
+
+    def prepare_approval_policy(
+        self, call_id: str, *, user_id: str
+    ) -> SemanticPolicyClearance | None:
+        """Assess pending-call prohibitions without reevaluating or auditing a call.
+
+        Approval authority is separate from policy applicability. The atomic
+        store binds this assessment to the exact record and current rules.
+        """
+        from intaris.semantic_policy import assess_semantic_policy
+
+        record = self._audit.get_by_call_id(call_id, user_id=user_id)
+        session = self._sessions.get_with_parent_policy(
+            record["session_id"], user_id=user_id, agent_policy=self._agent_policy
+        )
+        policy = session.get("policy") or {}
+        if not deny_policy_fingerprints(policy):
+            return None
+        return assess_semantic_policy(record, policy, llm=self._llm, jev=self._jev)
 
     async def wait_for_alignment(self, user_id: str, session_id: str) -> None:
         """Let MCP metadata calls observe pending alignment checks before evaluation."""
@@ -359,9 +388,10 @@ class Evaluator:
         # Get session for intention and policy (verifies ownership)
         if restricted_agent:
             self._sessions.restrict_agent_session(session_id, user_id=user_id)
-        session = self._sessions.get(session_id, user_id=user_id)
+        session = self._sessions.get_with_parent_policy(
+            session_id, user_id=user_id, agent_policy=self._agent_policy
+        )
         restricted = bool(session.get("agent_restricted"))
-        session["policy"] = policy_for_session(session, self._agent_policy)
         if restricted:
             # Prefixes have no approval provenance and can outlive agent adoption.
             # Restricted reads must use current policy or an exact human retry.
@@ -371,6 +401,10 @@ class Evaluator:
             context = dict(context or {})
             for field in ("interaction_mode", "judge", "maximum_outcome", "policy"):
                 context.pop(field, None)
+        # This metadata is evaluator-owned, never a client-supplied claim.
+        if context and "__intaris_evaluation_directory" in context:
+            context = dict(context)
+            context.pop("__intaris_evaluation_directory")
         maximum_outcome = (session.get("policy") or {}).get("maximum_outcome")
         unattended = (session.get("policy") or {}).get(
             "interaction_mode"
@@ -390,6 +424,7 @@ class Evaluator:
                     session_id, "active", user_id=user_id, agent_request=restricted
                 )
                 session_status = "active"
+                session["status"] = session_status
                 logger.debug("Auto-resumed idle session %s", session_id)
             except PermissionError:
                 # A concurrent operator stop won the conditional update.
@@ -413,9 +448,7 @@ class Evaluator:
                 reasoning = f"{reasoning}. Reason: {status_reason}"
 
             latency_ms = int((time.monotonic() - start_time) * 1000)
-            inactive_args_redacted = _args_redacted_with_context(
-                redact(args), redact(context) if context else None
-            )
+            inactive_args_redacted = redact(args)
             self._audit.insert(
                 call_id=call_id,
                 user_id=user_id,
@@ -423,6 +456,12 @@ class Evaluator:
                 agent_id=agent_id,
                 tool=tool,
                 args_redacted=inactive_args_redacted,
+                evaluation_context=make_evaluation_context(
+                    tool=tool,
+                    args=classification_args,
+                    context=context,
+                    session=session,
+                ),
                 classification="write",
                 evaluation_path="fast",
                 decision="deny",
@@ -479,9 +518,7 @@ class Evaluator:
                     "deny" if unattended else clamp_outcome("escalate", minimum_outcome)
                 )
                 latency_ms = int((time.monotonic() - start_time) * 1000)
-                args_redacted = _args_redacted_with_context(
-                    redact(args), redact(context) if context else None
-                )
+                args_redacted = redact(args)
                 args_hash = _compute_args_hash(args)
                 self._audit.insert(
                     call_id=call_id,
@@ -490,6 +527,12 @@ class Evaluator:
                     agent_id=agent_id,
                     tool=tool,
                     args_redacted=args_redacted,
+                    evaluation_context=make_evaluation_context(
+                        tool=tool,
+                        args=classification_args,
+                        context=context,
+                        session=session,
+                    ),
                     classification="write",
                     evaluation_path="alignment",
                     decision=alignment_decision,
@@ -560,9 +603,9 @@ class Evaluator:
         )
 
         _injection_detected = False
-        injection_scan_payload: dict[str, Any] = dict(args_redacted)
+        injection_scan_payload: dict[str, Any] = {"args": args_redacted}
         if context:
-            injection_scan_payload[_CONTEXT_ARG_KEY] = redact(context)
+            injection_scan_payload["context"] = redact(context)
         args_text = json.dumps(injection_scan_payload, default=str)
         findings = detect_injection_patterns(args_text)
         if findings:
@@ -593,21 +636,32 @@ class Evaluator:
         # session's intention and their own. This prevents sub-agents
         # from escaping the parent's guardrails by declaring a narrow
         # intention that doesn't cover what they're actually doing.
+        scope_versions = dict(session["_scope_versions"])
         parent_intention: str | None = None
         parent_session_id = session.get("parent_session_id")
+        # Keep trusted operation identity when parent handling disables its
+        # classifier shortcut. Read scope must still constrain metadata reads.
+        metadata_readonly = trusted_readonly is True and ":" in tool
         if parent_session_id:
             # Child calls retain per-call review against the parent's latest
             # intention. The alignment barrier is fail-open on timeout/error
             # and does not provide durable proof of successful alignment.
             trusted_readonly = False
             try:
-                parent_session = self._sessions.get(parent_session_id, user_id=user_id)
+                parent_session = session["_parent_chain"][0]
                 parent_intention = parent_session.get("intention")
 
                 # Parent lifecycle cascade: if parent is terminated or
                 # suspended, auto-suspend the child session. This prevents
                 # orphaned children from operating under a dead parent.
-                parent_status = parent_session.get("status", "active")
+                parent_status = next(
+                    (
+                        ancestor["status"]
+                        for ancestor in session["_parent_chain"]
+                        if ancestor["status"] in {"terminated", "suspended"}
+                    ),
+                    parent_session.get("status", "active"),
+                )
                 if parent_status in ("terminated", "suspended"):
                     status_reason = f"Parent session is {parent_status}"
                     try:
@@ -620,9 +674,7 @@ class Evaluator:
                     except ValueError:
                         pass
                     latency_ms = int((time.monotonic() - start_time) * 1000)
-                    cascade_args_redacted = _args_redacted_with_context(
-                        redact(args), redact(context) if context else None
-                    )
+                    cascade_args_redacted = redact(args)
                     cascade_reasoning = (
                         f"Session suspended — parent session is {parent_status}"
                     )
@@ -633,6 +685,12 @@ class Evaluator:
                         agent_id=agent_id,
                         tool=tool,
                         args_redacted=cascade_args_redacted,
+                        evaluation_context=make_evaluation_context(
+                            tool=tool,
+                            args=classification_args,
+                            context=context,
+                            session=session,
+                        ),
                         classification="write",
                         evaluation_path="fast",
                         decision="deny",
@@ -678,6 +736,13 @@ class Evaluator:
                     session_id,
                 )
 
+        unresolved_path_policy = bool((session_policy or {}).get("deny_paths")) and any(
+            not os.path.isabs(path)
+            for path in resolve_tool_paths(
+                tool, classification_args, working_directory or ""
+            )
+        )
+
         # Step 1-2: Classify (with path awareness via working_directory)
         classification = classify(
             tool,
@@ -713,7 +778,11 @@ class Evaluator:
                     path_reclassified = True
                     # Check approved paths cache
                     if self._check_approved_paths(
-                        user_id, session_id, outside_paths, working_directory
+                        user_id,
+                        session_id,
+                        outside_paths,
+                        working_directory,
+                        scope_versions=scope_versions,
                     ):
                         classification = Classification.READ
                         path_reclassified = False
@@ -721,6 +790,27 @@ class Evaluator:
                             "Path approved via prior evaluation: %s",
                             outside_paths,
                         )
+
+        # Read-only effects are not proof of current authorization. User and
+        # parent sources may constrain builtin reads, allowlisted commands, or
+        # siblings of cached paths. Route these through normal scope assessment;
+        # evidence presence itself neither denies nor escalates benign reads.
+        # Structured hard prohibitions have already run and cannot be weakened.
+        read_scope_review = (
+            classification != Classification.CRITICAL
+            and (
+                classification == Classification.READ
+                or is_read_only(tool, classification_args)
+                or metadata_readonly
+                or tool == "skill_view_raw"
+            )
+            and bool(
+                normalized_policy_clauses(session_policy).get("deny_policies")
+                or requires_read_scope_review(session, self._audit)
+            )
+        )
+        if read_scope_review and classification == Classification.READ:
+            classification = Classification.WRITE
 
         # Inject deterministic path-policy facts into WRITE evaluations when
         # either the project directory or explicit target paths are known.
@@ -745,7 +835,14 @@ class Evaluator:
                 )
 
         # Step 3-5: Fast paths for read-only, critical, and escalate
-        if classification == Classification.READ:
+        if unresolved_path_policy and classification != Classification.CRITICAL:
+            decision = Decision(
+                decision="deny",
+                risk="medium",
+                path="fast",
+                reasoning="Current path policy requires an executor working directory; evaluate again.",
+            )
+        elif classification == Classification.READ:
             reasoning = f"Read-only tool call: {tool}"
             allowed_script = match_allowed_script(
                 tool, classification_args, session_policy
@@ -764,26 +861,10 @@ class Evaluator:
                     )
             decision = make_fast_decision("read", reasoning)
         elif classification == Classification.CRITICAL:
-            # Check for prior approved override before auto-deny.
-            # If the user explicitly approved the exact same command
-            # (via denial override), bypass the critical auto-deny.
-            retry_decision = (
-                self._check_escalation_retry(
-                    user_id=user_id,
-                    tool=tool,
-                    args_hash=args_hash,
-                    human_only=restricted,
-                )
-                if minimum_outcome is None and not unattended
-                else None
+            decision = make_fast_decision(
+                "critical",
+                f"Hard prohibition: critical pattern or explicit deny rule for {tool}",
             )
-            if retry_decision is not None:
-                decision = retry_decision
-            else:
-                decision = make_fast_decision(
-                    "critical",
-                    f"Critical pattern detected in {tool} call",
-                )
         elif classification == Classification.ESCALATE:
             # Check escalation retry: reuse prior approval if same
             # tool+args was approved within the TTL window.
@@ -793,8 +874,9 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                     human_only=restricted,
+                    session_id=session_id,
                 )
-                if minimum_outcome is None and not unattended
+                if minimum_outcome is None and not unattended and not read_scope_review
                 else None
             )
             if retry_decision is not None:
@@ -814,8 +896,9 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                     human_only=restricted,
+                    session_id=session_id,
                 )
-                if minimum_outcome is None and not unattended
+                if minimum_outcome is None and not unattended and not read_scope_review
                 else None
             )
             if retry_decision is not None:
@@ -829,10 +912,21 @@ class Evaluator:
                     agent_id=agent_id,
                     context=redact(context) if context else None,
                     parent_intention=parent_intention,
+                    allow_legacy_precedent=not read_scope_review,
                 )
 
+        if (
+            read_scope_review or classification == Classification.ESCALATE
+        ) and decision.intent_evidence is None:
+            # Preferences retain escalation until caps or an explicit human
+            # retry apply. Those approvals still require complete current scope.
+            decision.intent_evidence = collect_intent_evidence(session, self._audit)
+
         raw_decision = decision.decision
-        decision.decision = cap_outcome(raw_decision, maximum_outcome)
+        hard_prohibition = classification == Classification.CRITICAL
+        decision.decision = (
+            "deny" if hard_prohibition else cap_outcome(raw_decision, maximum_outcome)
+        )
         policy_overrode = decision.decision != raw_decision
         outcome_override = "session_policy.maximum_outcome" if policy_overrode else None
 
@@ -855,12 +949,32 @@ class Evaluator:
                     and not record.get("expired_at")
                     and record.get("resolved_by") == "user"
                     and record.get("approval_scope", "reusable") == "reusable"
+                    and self._audit.approvals_are_usable(
+                        {approval_call_id}, user_id=user_id
+                    )
                 )
                 if not approved:
                     decision.decision = "deny"
                     decision.reasoning = "Approval does not match this evaluation."
                     outcome_override = "invalid_approval"
-            if approved and minimum_outcome == "escalate" and raw_decision != "deny":
+            if approved and decision.intent_evidence is None:
+                decision.intent_evidence = collect_intent_evidence(session, self._audit)
+            if (
+                approved
+                and minimum_outcome == "escalate"
+                and (
+                    raw_decision == "approve"
+                    or not has_newer_human_scope_note(decision.intent_evidence, record)
+                )
+                and raw_decision != "deny"
+                and (
+                    not read_scope_review
+                    or raw_decision == "approve"
+                    or _unchanged_human_read_scope(
+                        record, scope_versions, working_directory
+                    )
+                )
+            ):
                 decision.decision = "approve"
                 decision.reasoning = f"User approved call {approval_call_id}."
                 outcome_override = "human_approval"
@@ -876,6 +990,7 @@ class Evaluator:
 
         if (
             unattended
+            and not hard_prohibition
             and judge_unattended
             and minimum_outcome is None
             and raw_decision in {"deny", "escalate"}
@@ -895,6 +1010,107 @@ class Evaluator:
                 outcome_override = "task.interaction_mode"
             decision.reasoning = (
                 f"{decision.reasoning} Escalation is disabled for this unattended task."
+            )
+
+        if hard_prohibition:
+            decision.decision = "deny"
+            decision.approval_call_id = None
+            outcome_override = "hard_stop.classifier_critical"
+
+        if unresolved_path_policy and not hard_prohibition:
+            # Neither a permissive cap nor a previous grant supplies missing
+            # executor metadata. Keep the normal non-executable API response.
+            decision.decision = "deny"
+            decision.approval_call_id = None
+            outcome_override = "hard_stop.path_context"
+
+        if decision.evidence_changed and not hard_prohibition:
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.approval_call_id = None
+            outcome_override = "intent_evidence_changed"
+
+        if (
+            decision.decision == "approve"
+            and decision.intent_evidence is not None
+            and not intent_evidence_complete(decision.intent_evidence)
+        ):
+            # Apply after caps and explicit approval IDs: neither supplies text
+            # omitted from the current packet, including ancestor restrictions.
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.reasoning = (
+                "Current user intent evidence is incomplete; review full sources."
+            )
+            decision.approval_call_id = None
+            outcome_override = "intent_evidence_incomplete"
+
+        # Calculate latency
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+
+        # Step 7: Audit (with args_hash for escalation retry, profile_version)
+        audit_context = make_evaluation_context(
+            tool=tool, args=classification_args, context=context, session=session
+        )
+        audit_args = dict(
+            call_id=call_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            tool=tool,
+            args_redacted=args_redacted,
+            evaluation_context=audit_context,
+            classification=classification.value,
+            evaluation_path=decision.path,
+            decision=decision.decision,
+            risk=decision.risk,
+            reasoning=decision.reasoning,
+            latency_ms=latency_ms,
+            args_hash=args_hash,
+            profile_version=profile_version,
+            intention=session.get("intention"),
+            injection_detected=_injection_detected,
+            raw_decision=raw_decision,
+            maximum_outcome=maximum_outcome,
+            minimum_outcome=minimum_outcome,
+            outcome_override=outcome_override,
+            intent_evidence=decision.intent_evidence,
+        )
+        if decision.intent_evidence is not None:
+            # Earlier classifier/parent checks must not inherit a newer scope
+            # merely because exact-retry evidence was collected later.
+            scope_versions = {
+                **decision.intent_evidence["scope_versions"],
+                **scope_versions,
+            }
+        try:
+            self._audit.insert(
+                **audit_args,
+                **(
+                    {"scope_versions": scope_versions}
+                    if decision.decision == "approve"
+                    else {}
+                ),
+            )
+        except ScopeChangedError:
+            # No approving row was inserted. Persist the existing scope-change
+            # fallback without applying permissive caps or unattended Judge reuse.
+            decision.decision = (
+                "deny" if unattended or minimum_outcome == "deny" else "escalate"
+            )
+            decision.reasoning = "User scope or policy changed during evaluation; review current evidence."
+            decision.approval_call_id = None
+            decision.evidence_changed = True
+            outcome_override = "intent_evidence_changed"
+            self._audit.insert(
+                **{
+                    **audit_args,
+                    "decision": decision.decision,
+                    "reasoning": decision.reasoning,
+                    "outcome_override": outcome_override,
+                }
             )
 
         # Learn from LLM approvals: cache path prefixes for path-reclassified
@@ -919,40 +1135,13 @@ class Evaluator:
                         session_id,
                         prefix,
                         approval_call_id=decision.approval_call_id,
+                        scope_versions=scope_versions,
                     )
                     logger.info(
                         "Learned approved path prefix: %s (session %s)",
                         prefix,
                         session_id,
                     )
-
-        # Calculate latency
-        latency_ms = int((time.monotonic() - start_time) * 1000)
-
-        # Step 7: Audit (with args_hash for escalation retry, profile_version)
-        audit_context = redact(context) if context else None
-        self._audit.insert(
-            call_id=call_id,
-            user_id=user_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            tool=tool,
-            args_redacted=_args_redacted_with_context(args_redacted, audit_context),
-            classification=classification.value,
-            evaluation_path=decision.path,
-            decision=decision.decision,
-            risk=decision.risk,
-            reasoning=decision.reasoning,
-            latency_ms=latency_ms,
-            args_hash=args_hash,
-            profile_version=profile_version,
-            intention=session.get("intention"),
-            injection_detected=_injection_detected,
-            raw_decision=raw_decision,
-            maximum_outcome=maximum_outcome,
-            minimum_outcome=minimum_outcome,
-            outcome_override=outcome_override,
-        )
 
         # Step 8: Update session counters
         try:
@@ -1070,12 +1259,13 @@ class Evaluator:
         tool: str,
         args_hash: str,
         human_only: bool = False,
+        session_id: str | None = None,
     ) -> Decision | None:
         """Check if a prior escalation or denial for the same tool+args was approved.
 
         Looks for an audit record within the retry TTL window where:
-        - Same user, tool, and args_hash (session-independent so approvals
-          survive MCP proxy reconnects)
+        - Same user, session, tool, and args_hash. Reconnects retaining their
+          session can retry; a new session requires its own scope evaluation.
         - The record was resolved with user_decision='approve'
 
         This covers both escalation retry (existing) and denial override
@@ -1086,6 +1276,11 @@ class Evaluator:
             Decision to approve (reusing prior approval), or None if no
             valid prior approval found.
         """
+        if session_id is None or tool == "skill_view_raw":
+            # Each inspection must consider current restrictions; old reads
+            # and approvals do not establish an unrestricted inspection scope.
+            return None
+
         from datetime import datetime, timedelta, timezone
 
         cutoff = (
@@ -1099,10 +1294,49 @@ class Evaluator:
             args_hash=args_hash,
             cutoff=cutoff,
             human_only=human_only,
+            session_id=session_id,
         )
 
         if row is not None:
             prior_call_id = row["call_id"]
+            if session_id is not None:
+                prior = self._audit.get_by_call_id(prior_call_id, user_id=user_id)
+                current_session = self._sessions.get_with_parent_policy(
+                    session_id, user_id=user_id, agent_policy=self._agent_policy
+                )
+                if normalized_policy_clauses(current_session.get("policy")).get(
+                    "deny_policies"
+                ):
+                    # Free-text restrictions require current interpretation;
+                    # an old exact grant contains no policy snapshot proof.
+                    return None
+                current = collect_intent_evidence(current_session, self._audit)
+                authority = prior
+                if prior.get("approval_source_call_id"):
+                    # A derived Judge row cannot make an older human grant
+                    # newer than a restriction written between the two rows.
+                    try:
+                        authority = self._audit.get_by_call_id(
+                            prior["approval_source_call_id"], user_id=user_id
+                        )
+                    except ValueError:
+                        return None
+                if (
+                    has_newer_human_scope_note(current, authority)
+                    or any(
+                        source["kind"] == "user_message"
+                        and (
+                            prior["session_id"] != session_id
+                            or source["timestamp"]
+                            > (prior.get("resolved_at") or prior["timestamp"])
+                        )
+                        for source in current["sources"]
+                    )
+                    or not current["complete"]
+                    or current.get("parent")
+                    or current.get("parent_unavailable")
+                ):
+                    return None
             logger.info(
                 "Escalation retry: reusing approval from %s for %s",
                 prior_call_id,
@@ -1118,6 +1352,7 @@ class Evaluator:
                 ),
                 path="fast",
                 approval_call_id=prior_call_id,
+                intent_evidence=current,
             )
 
         return None
@@ -1130,6 +1365,8 @@ class Evaluator:
         session_id: str,
         resolved_paths: list[str],
         working_directory: str,
+        *,
+        scope_versions: dict[str, int] | None = None,
     ) -> bool:
         """Check if all resolved paths are under an approved prefix.
 
@@ -1145,6 +1382,13 @@ class Evaluator:
         """
         key = (user_id, session_id)
         with self._approved_paths_lock:
+            bound_scope = self._approved_path_scopes.get(key)
+            if bound_scope is not None and bound_scope != scope_versions:
+                self._approved_paths.pop(key, None)
+                self._approved_path_sources.pop(key, None)
+                self._approved_path_versions.pop(key, None)
+                self._approved_path_scopes.pop(key, None)
+                return False
             prefixes = list(self._approved_paths.get(key, []))
             sources = set(self._approved_path_sources.get(key, set()))
             version = self._approved_path_versions.get(key)
@@ -1159,6 +1403,7 @@ class Evaluator:
                     self._approved_paths.pop(key, None)
                     self._approved_path_sources.pop(key, None)
                     self._approved_path_versions.pop(key, None)
+                    self._approved_path_scopes.pop(key, None)
                     return False
 
         for rp in resolved_paths:
@@ -1176,6 +1421,7 @@ class Evaluator:
         prefix: str,
         *,
         approval_call_id: str | None = None,
+        scope_versions: dict[str, int] | None = None,
     ) -> None:
         """Add an approved path prefix for a session.
 
@@ -1197,6 +1443,14 @@ class Evaluator:
         key = (user_id, session_id)
         norm_prefix = os.path.normpath(prefix)
         with self._approved_paths_lock:
+            if self._approved_path_scopes.get(key) != scope_versions:
+                # Do not merge a fresh grant with prefixes learned under old scope.
+                self._approved_paths.pop(key, None)
+                self._approved_path_sources.pop(key, None)
+            if scope_versions is None:
+                self._approved_path_scopes.pop(key, None)
+            else:
+                self._approved_path_scopes[key] = dict(scope_versions)
             sources = self._approved_path_sources.setdefault(key, set())
             if approval_call_id:
                 if (
@@ -1263,13 +1517,32 @@ class Evaluator:
         if not is_read_only(tool, args_redacted):
             return
 
-        # Get session's working_directory
-        session = self._sessions.get(session_id, user_id=user_id)
-        if not session or session.get("agent_restricted"):
+        # A delayed callback must not stamp an old grant with newer authority.
+        # Reloaded legacy records lack this transient transaction snapshot and
+        # can still use normal evaluation/exact retry, but cannot seed a cache.
+        granted_scope = record.get("_approval_scope_versions")
+        if not isinstance(granted_scope, dict) or session_id not in granted_scope:
             return
-        details = session.get("details") or {}
-        working_directory = details.get("working_directory")
-        if not working_directory:
+        session = self._sessions.get_with_parent_policy(
+            session_id, user_id=user_id, agent_policy=self._agent_policy
+        )
+        if (
+            session.get("agent_restricted")
+            or session["_scope_versions"] != granted_scope
+        ):
+            return
+        # Bind cached targets to the invocation that was evaluated. Current
+        # session details may name a different directory; the audit snapshot
+        # already includes per-call context and shell workdir resolution.
+        context = record.get("evaluation_context")
+        if not isinstance(context, dict):
+            return
+        working_directory = context.get("__intaris_evaluation_directory")
+        if not isinstance(working_directory, str) or not os.path.isabs(
+            working_directory
+        ):
+            # Legacy/unknown directories remain reviewable but cannot create
+            # a reusable path grant by guessing the session default.
             return
 
         # Extract and resolve paths
@@ -1285,6 +1558,7 @@ class Evaluator:
                     session_id,
                     prefix,
                     approval_call_id=record["call_id"],
+                    scope_versions=granted_scope,
                 )
                 logger.info(
                     "Learned path prefix from user approval: %s (session %s)",
@@ -1307,6 +1581,7 @@ class Evaluator:
             self._approved_paths.pop(key, None)
             self._approved_path_sources.pop(key, None)
             self._approved_path_versions.pop(key, None)
+            self._approved_path_scopes.pop(key, None)
 
     def sweep_approved_paths(self, active_keys: set[tuple[str, str]]) -> int:
         """Remove approved paths for sessions no longer active.
@@ -1327,6 +1602,7 @@ class Evaluator:
                 del self._approved_paths[k]
                 self._approved_path_sources.pop(k, None)
                 self._approved_path_versions.pop(k, None)
+                self._approved_path_scopes.pop(k, None)
         return len(stale)
 
     def _llm_evaluate(
@@ -1338,6 +1614,7 @@ class Evaluator:
         agent_id: str | None,
         context: dict[str, Any] | None = None,
         parent_intention: str | None = None,
+        allow_legacy_precedent: bool = True,
     ) -> Decision:
         """Run LLM safety evaluation and apply decision matrix.
 
@@ -1348,6 +1625,8 @@ class Evaluator:
             agent_id: Agent identity.
             context: Optional additional context for evaluation.
             parent_intention: Parent session intention for sub-sessions.
+            allow_legacy_precedent: Whether the old similarity fallback may
+                replace model scope assessment. False for scope-gated reads.
 
         Returns:
             Decision from the decision matrix.
@@ -1368,6 +1647,7 @@ class Evaluator:
         )
 
         effective_policy = effective_policy_for_evaluator(session.get("policy"))
+        intent_evidence = collect_intent_evidence(session, self._audit)
         session_stats = {
             "total_calls": session.get("total_calls", 0),
             "approved_count": session.get("approved_count", 0),
@@ -1386,6 +1666,7 @@ class Evaluator:
             agent_id=agent_id,
             context=context,
             parent_intention=parent_intention,
+            intent_evidence=intent_evidence,
         )
 
         messages = [
@@ -1403,6 +1684,7 @@ class Evaluator:
                 evaluation = self._jev.evaluate_tool_call(
                     state={
                         "intention": session["intention"],
+                        "intent_evidence": intent_evidence,
                         "effective_policy": effective_policy,
                         "parent_intention": parent_intention,
                         "recent_history": recent_history,
@@ -1441,12 +1723,34 @@ class Evaluator:
                 user_decisions = self._audit.get_user_decisions(
                     session_id, user_id=user_id, limit=5
                 )
-            evaluation = _apply_authoritative_user_precedent(
-                evaluation,
-                tool=tool,
-                args_redacted=args_redacted,
-                user_decisions=user_decisions,
+            if (
+                allow_legacy_precedent
+                and tool != "skill_view_raw"
+                and allows_legacy_precedent(
+                    intent_evidence, policy=session.get("policy")
+                )
+            ):
+                evaluation = _apply_authoritative_user_precedent(
+                    evaluation,
+                    tool=tool,
+                    args_redacted=args_redacted,
+                    user_decisions=user_decisions,
+                    intent_evidence=intent_evidence,
+                )
+            current_session = self._sessions.get_with_parent_policy(
+                session_id, user_id=user_id, agent_policy=self._agent_policy
             )
+            current_evidence = collect_intent_evidence(current_session, self._audit)
+            if current_evidence["fingerprint"] != intent_evidence["fingerprint"]:
+                return Decision(
+                    decision="escalate",
+                    risk=evaluation.risk,
+                    reasoning="User scope or policy changed during evaluation; review current evidence.",
+                    path="llm",
+                    metadata=evaluation.metadata,
+                    intent_evidence=intent_evidence,
+                    evidence_changed=True,
+                )
             if self._jev is not None and evaluation.decision == "escalate":
                 return Decision(
                     decision="escalate",
@@ -1454,11 +1758,13 @@ class Evaluator:
                     reasoning=evaluation.reasoning,
                     path="llm",
                     metadata=evaluation.metadata,
+                    intent_evidence=intent_evidence,
                 )
 
             decision = apply_decision_matrix(evaluation)
             decision.metadata = evaluation.metadata
             decision.approval_call_id = evaluation.approval_call_id
+            decision.intent_evidence = intent_evidence
             return decision
 
         except Exception:

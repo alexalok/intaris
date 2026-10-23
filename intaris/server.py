@@ -96,6 +96,9 @@ def _get_db():
         from intaris.db import Database
 
         _db = Database(_get_config().db)
+        from intaris.audit import AuditStore
+
+        AuditStore.set_agent_policy(_db, _get_config().server.agent_policy)
     return _db
 
 

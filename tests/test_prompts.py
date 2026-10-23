@@ -322,12 +322,13 @@ class TestEvaluatorScopeRules:
         assert "No legality assessment" in SAFETY_EVALUATION_SYSTEM_PROMPT
         assert "Owner-operations on owner-property" in SAFETY_EVALUATION_SYSTEM_PROMPT
 
-    def test_prompt_forbids_arg_ambiguity_as_risk(self):
+    def test_prompt_distinguishes_tool_quality_from_authorization_scope(self):
         assert "Tool-argument quality is not safety" in SAFETY_EVALUATION_SYSTEM_PROMPT
         assert (
-            "Tool-argument ambiguity is never the risk"
+            "Tool correctness is distinct from authorization"
             in SAFETY_EVALUATION_SYSTEM_PROMPT
         )
+        assert "unknown authorization target" in SAFETY_EVALUATION_SYSTEM_PROMPT
 
     def test_prompt_critical_requires_operational_action(self):
         assert (
@@ -359,7 +360,8 @@ class TestJudgeScopeRules:
 
     def test_judge_system_prompt_has_operational_safety_scope(self):
         assert "operational safety only" in JUDGE_SYSTEM_PROMPT
-        assert "Tool-argument ambiguity is not a safety signal" in JUDGE_SYSTEM_PROMPT
+        assert "Tool correctness is distinct from authorization" in JUDGE_SYSTEM_PROMPT
+        assert "permission depends on an unknown target" in JUDGE_SYSTEM_PROMPT
 
     def test_judge_auto_decision_rules_forbid_topic_moderation(self):
         from intaris.judge import _DECISION_RULES_AUTO

@@ -238,6 +238,7 @@ function approvalsTab() {
       try {
         const params = {
           decision: 'deny',
+          overridable_denials: true,
           record_type: 'tool_call',
           resolved: false,
           limit: 20,
@@ -245,10 +246,9 @@ function approvalsTab() {
         const agentFilter = Alpine.store('nav').selectedAgent;
         if (agentFilter) params.agent_id = agentFilter;
         const result = await IntarisAPI.listAudit(params);
-        // Filter out session-status denials (evaluation_path='fast')
-        // which cannot benefit from the denial override retry mechanism.
+        // Lifecycle denials and deterministic prohibitions cannot be approved.
         const items = this._filterResolved((result.items || []).map(mergeApprovalExpiration)).filter(
-          item => item.evaluation_path !== 'fast'
+          item => item.evaluation_path !== 'fast' && !isHardProhibition(item)
         );
         this.denials = items;
         this.denialsTotal = items.length;

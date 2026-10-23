@@ -73,6 +73,8 @@ class Decision:
     metadata: dict[str, Any] | None = None
     # Internal provenance for cached permissions; never serialized as API metadata.
     approval_call_id: str | None = None
+    intent_evidence: dict[str, Any] | None = None
+    evidence_changed: bool = False
 
     @property
     def is_approved(self) -> bool:

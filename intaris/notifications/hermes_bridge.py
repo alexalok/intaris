@@ -453,9 +453,19 @@ class HermesApprovalBridge:
         # Claim before any asynchronous side effects; failure is never retried as
         # an approval. The audit's pending-only SQL guard arbitrates UI/judge races.
         self._state(lease, "resolving")
-        await self._resolve(
-            lease, decision, f"Telegram user {actor}; native call-specific approval"
-        )
+        try:
+            await self._resolve(
+                lease, decision, f"Telegram user {actor}; native call-specific approval"
+            )
+        except ValueError:
+            # A current-policy refusal leaves the invocation pending. Keep its
+            # Deny action usable instead of stranding the lease in "resolving".
+            current = self._audit.get_by_call_id(
+                lease["call_id"], user_id=lease["user_id"]
+            )
+            if current.get("user_decision") is None and not current.get("expired_at"):
+                self._state(lease, "pending")
+            raise
         self._state(lease, decision)
         return {"ok": True, "status": decision}
 

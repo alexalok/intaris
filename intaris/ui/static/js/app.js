@@ -23,6 +23,11 @@ function isApprovalExpired(record) {
   return !!approvalExpiration(record);
 }
 
+/** Deterministic prohibitions are outside human and Judge approval authority. */
+function isHardProhibition(record) {
+  return record?.classification === 'critical' || record?.evaluation_path === 'critical';
+}
+
 /** Remember terminal state so an older REST response cannot restore actions. */
 function mergeApprovalExpiration(record) {
   if (!record) return record;
@@ -55,7 +60,7 @@ function approvalExpirationReason(record) {
 
 function canResolveApproval(record) {
   return record?.decision === 'escalate' && !record?.user_decision
-    && !isApprovalExpired(record);
+    && !isHardProhibition(record) && !isApprovalExpired(record);
 }
 
 /** Apply lifecycle events without treating expiration as a human resolution. */

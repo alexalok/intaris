@@ -107,12 +107,21 @@ def test_expiration_requires_matching_tenant_and_session(store, scope):
     assert store.query(user_id="tenant", resolved=False)["total"] == 1
 
 
-def test_old_and_completed_session_approvals_do_not_expire_without_signal(store):
+def test_completed_session_cannot_approve_but_does_not_expire_without_signal(store):
     with store._db.cursor() as cur:
         cur.execute("UPDATE audit_log SET timestamp = '2000-01-01'")
         cur.execute("UPDATE sessions SET status = 'completed'")
     assert (
         store.query(user_id="tenant", decision="escalate", resolved=False)["total"] == 1
+    )
+    with pytest.raises(ValueError, match="Session is completed"):
+        store.resolve_escalation("call", "approve", user_id="tenant")
+    record = store.get_by_call_id("call", user_id="tenant")
+    assert record.get("expired_at") is None
+    assert record.get("user_decision") is None
+    # Age itself does not invalidate a waiting invocation after explicit resume.
+    SessionStore(store._db).update_status(
+        record["session_id"], "active", user_id="tenant"
     )
     assert (
         store.resolve_escalation("call", "approve", user_id="tenant")["user_decision"]
@@ -485,7 +494,13 @@ def test_expired_approval_cannot_survive_as_a_cached_path_permission(store, lear
         assert evaluate(filename)["decision"] == "approve"
     if learning != "late":
         assert evaluator._check_approved_paths(
-            "tenant", "paths", ["/outside/file.txt"], "/workspace/project"
+            "tenant",
+            "paths",
+            ["/outside/file.txt"],
+            "/workspace/project",
+            scope_versions=sessions.get_with_parent_policy(
+                "paths", user_id="tenant", agent_policy=None
+            )["_scope_versions"],
         )
     store.expire_escalation(
         first["call_id"], user_id="tenant", session_id="paths", reason="cancelled"

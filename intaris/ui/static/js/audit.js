@@ -262,11 +262,13 @@ function auditTab() {
     canOverrideDenial(record) {
       return record?.decision === 'deny'
         && !record?.user_decision
+        && !isHardProhibition(record)
         && record?.evaluation_path !== 'fast' && !isApprovalExpired(record);
     },
 
     canOverrideJudge(record) {
-      return record?.resolved_by === 'judge' && !isApprovalExpired(record);
+      return record?.resolved_by === 'judge'
+        && !isHardProhibition(record) && !isApprovalExpired(record);
     },
 
     decisionBadgeClass(decision) {

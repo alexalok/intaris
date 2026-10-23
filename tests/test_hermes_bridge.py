@@ -973,3 +973,22 @@ def test_retention_preserves_unexpired_pending_lease(bridge):
     assert open_call(bridge)["lease_id"] == lease["lease_id"]
     assert bind(bridge, lease)["ok"]
     assert decide(bridge, lease)["ok"]
+
+
+def test_policy_refused_native_approval_preserves_pending_deny_action(bridge):
+    lease = open_call(bridge)
+    bind(bridge, lease)
+    bridge.sessions.update_session(
+        "s", user_id="owner", policy={"deny_tools": ["terminal"]}
+    )
+    assert decide(bridge, lease)["ok"] is False
+    with bridge.db.cursor() as cur:
+        cur.execute(
+            "SELECT state FROM hermes_approval_leases WHERE lease_id = ?",
+            (lease["lease_id"],),
+        )
+        assert cur.fetchone()["state"] == "pending"
+    record = bridge.audit.get_by_call_id("call-owner", user_id="owner")
+    assert record["user_decision"] is None
+    assert record["expired_at"] is None
+    assert decide(bridge, lease, decision="deny")["status"] == "deny"
